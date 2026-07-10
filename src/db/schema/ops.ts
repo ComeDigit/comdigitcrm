@@ -1,0 +1,186 @@
+import { sql } from "drizzle-orm";
+import {
+  pgTable,
+  uuid,
+  text,
+  timestamp,
+  jsonb,
+  integer,
+  index,
+  uniqueIndex,
+  pgEnum,
+} from "drizzle-orm/pg-core";
+import { organizations, workspaces } from "./tenancy";
+
+/**
+ * Operational core: integration connections, job queue, sync cursors,
+ * webhook inbox, audit log. These tables power reliability features
+ * (API-failure alerts, resumable sync) — they are product surface, not
+ * just plumbing.
+ *
+ * SECURITY: integration_secrets has NO RLS grants (service-role only) —
+ * see migration. Connection *metadata* is tenant-visible; tokens never are.
+ */
+
+export const providerEnum = pgEnum("provider", [
+  "shopify",
+  "meta",
+  "google_ads",
+  "ga4",
+  "tiktok",
+  "search_console",
+  "merchant_center",
+  "whatsapp",
+]);
+
+export const connectionStatusEnum = pgEnum("connection_status", [
+  "active",
+  "paused",
+  "reauth_required",
+  "error",
+  "disconnected",
+]);
+
+export const integrationConnections = pgTable(
+  "integration_connections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    provider: providerEnum("provider").notNull(),
+    /** Provider-side account identifier (ad account id, shop domain…). */
+    externalAccountId: text("external_account_id").notNull(),
+    displayName: text("display_name").notNull(),
+    status: connectionStatusEnum("status").notNull().default("active"),
+    /** OAuth scopes actually granted — feature-gate on these. */
+    grantedScopes: jsonb("granted_scopes").$type<string[]>().default([]),
+    /** Provider account currency (may differ from workspace currency). */
+    currencyCode: text("currency_code"),
+    /** Provider account timezone — daily facts aggregate in THIS zone. */
+    timezone: text("timezone"),
+    lastSyncAt: timestamp("last_sync_at", { withTimezone: true }),
+    lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("connections_ws_provider_account_uq").on(
+      t.workspaceId,
+      t.provider,
+      t.externalAccountId,
+    ),
+    index("connections_org_idx").on(t.orgId),
+  ],
+);
+
+/**
+ * Encrypted credentials, separated from metadata. Values are encrypted
+ * with Supabase Vault before insert; this table gets NO RLS SELECT grant
+ * for authenticated users. Service-role only.
+ */
+export const integrationSecrets = pgTable("integration_secrets", {
+  connectionId: uuid("connection_id")
+    .primaryKey()
+    .references(() => integrationConnections.id, { onDelete: "cascade" }),
+  /** Vault secret id holding the access/refresh token bundle. */
+  vaultSecretId: uuid("vault_secret_id"),
+  /** Fallback envelope-encrypted payload when Vault is unavailable locally. */
+  encryptedPayload: text("encrypted_payload"),
+  rotatedAt: timestamp("rotated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const jobStatusEnum = pgEnum("job_status", [
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+
+export const jobQueue = pgTable(
+  "job_queue",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    /** e.g. "sync.meta.insights", "report.weekly", "automation.evaluate" */
+    type: text("type").notNull(),
+    orgId: uuid("org_id").notNull(),
+    workspaceId: uuid("workspace_id"),
+    connectionId: uuid("connection_id"),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
+    status: jobStatusEnum("status").notNull().default("queued"),
+    runAt: timestamp("run_at", { withTimezone: true }).notNull().defaultNow(),
+    attempts: integer("attempts").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(5),
+    lockedBy: text("locked_by"),
+    lockedAt: timestamp("locked_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    /** Dedupe key: identical queued job is not enqueued twice. */
+    dedupeKey: text("dedupe_key"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("job_queue_claim_idx").on(t.status, t.runAt),
+    index("job_queue_ws_idx").on(t.workspaceId),
+    uniqueIndex("job_queue_dedupe_uq")
+      .on(t.dedupeKey)
+      .where(sql`status = 'queued'`),
+  ],
+);
+
+/** Resumable incremental sync position per connection+resource. */
+export const syncCursors = pgTable(
+  "sync_cursors",
+  {
+    connectionId: uuid("connection_id")
+      .notNull()
+      .references(() => integrationConnections.id, { onDelete: "cascade" }),
+    /** e.g. "orders", "insights.daily", "campaigns" */
+    resource: text("resource").notNull(),
+    cursor: jsonb("cursor").$type<Record<string, unknown>>().notNull().default({}),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("sync_cursors_uq").on(t.connectionId, t.resource)],
+);
+
+/** Raw webhook inbox: verify → insert → 200 → process async. */
+export const webhookInbox = pgTable(
+  "webhook_inbox",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    provider: providerEnum("provider").notNull(),
+    /** Provider idempotency/event id — duplicates are ignored. */
+    eventId: text("event_id").notNull(),
+    topic: text("topic").notNull(),
+    connectionId: uuid("connection_id"),
+    payload: jsonb("payload").notNull(),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("webhook_inbox_event_uq").on(t.provider, t.eventId)],
+);
+
+/** Append-only audit log, written by mutation helpers — never by hand. */
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id").notNull(),
+    workspaceId: uuid("workspace_id"),
+    actorId: uuid("actor_id"),
+    action: text("action").notNull(),
+    resourceType: text("resource_type").notNull(),
+    resourceId: text("resource_id"),
+    before: jsonb("before"),
+    after: jsonb("after"),
+    ip: text("ip"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("audit_org_created_idx").on(t.orgId, t.createdAt),
+  ],
+);

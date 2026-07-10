@@ -1,36 +1,94 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ComeDigit CRM
 
-## Getting Started
+AI-powered marketing CRM for agencies and D2C brands — Shopify, Meta Ads,
+Google Ads, TikTok, GA4 and client management in one dashboard.
 
-First, run the development server:
+**Stack:** Next.js (App Router, Server Components) · TypeScript strict ·
+Tailwind CSS · Drizzle ORM · Supabase (Postgres, Auth, RLS, Storage) ·
+TanStack Query/Table · Recharts · Zod · deployed on Vercel.
+
+## Run it now (zero keys)
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000 — the app boots in **demo mode**: deterministic
+sample data (seeded PRNG — same numbers every reload), no Supabase project
+required. Every dashboard, chart and insight works.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Go live
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Create a Supabase project (free tier is fine) at supabase.com.
+2. `cp .env.example .env.local` and fill in:
+   `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`,
+   `SUPABASE_SECRET_KEY`, `DATABASE_URL`, `APP_ENCRYPTION_KEY`, `CRON_SECRET`.
+3. Push the schema: `npm run db:push`
+4. Apply RLS + auth hook: run `supabase/migrations/0002_rls.sql` in the
+   Supabase SQL editor, then enable the `custom_access_token_hook` under
+   **Auth → Hooks**.
+5. Deploy to Vercel (`vercel.json` already schedules the sync cron).
 
-## Learn More
+## Architecture (Phase 1 doc has the full rationale)
 
-To learn more about Next.js, take a look at the following resources:
+- **One Next.js app** — Server Components read, Server Actions/Route
+  Handlers write; no separate backend. Long work runs via a Postgres job
+  queue (`job_queue`, FOR UPDATE SKIP LOCKED) drained by workers.
+- **Tenancy** — Organization (agency) → Workspace (client brand). RLS on
+  every table via JWT claims + `has_workspace_access()`; app code also
+  scopes queries explicitly (defense in depth). Integration tokens live in
+  a no-RLS-grant table, encrypted, service-role only.
+- **Metrics** — typed daily fact tables; money as integer minor units;
+  ROAS/CTR/CPA/AOV/MER computed ONLY in `src/lib/metrics/definitions.ts`
+  (never stored, never duplicated).
+- **Integrations** — every provider implements the `AdsProvider` contract
+  (`src/features/integrations/types.ts`). A deterministic mock satisfies
+  the same contract, so the entire product is developable and testable
+  with zero API keys; real clients slot in per phase without upstream
+  changes.
+- **Demo mode** — missing Supabase env = demo mode (`src/lib/env.ts`).
+  One facade (`src/features/metrics/queries.ts`) switches between the
+  seeded generator and real fact tables; pages never know which ran.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```
+src/
+├─ app/                 # routes only — thin, delegate to features
+│  ├─ dashboard/        # overview, clients, tasks, shopify, ads/*, ai, settings
+│  └─ api/              # v1/health, cron/tick, webhooks/shopify
+├─ features/            # feature-based modules (ads, metrics, integrations, demo-data)
+├─ components/          # ui primitives, shell, charts
+├─ db/schema/           # Drizzle schema: tenancy, ops, crm, metrics
+├─ lib/                 # env, db, supabase, authorize, jobs, metrics definitions
+└─ proxy.ts             # session refresh + route protection (Next 16)
+supabase/migrations/    # RLS policies + auth claims hook
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Scripts
 
-## Deploy on Vercel
+| Command | What it does |
+|---|---|
+| `npm run dev` | Dev server (demo mode without env) |
+| `npm run build` | Production build |
+| `npm run lint` | ESLint (zero warnings policy) |
+| `npm run typecheck` | `tsc --noEmit` (strict) |
+| `npm run db:generate` | Generate SQL migration from Drizzle schema |
+| `npm run db:push` | Push schema to the database in `DATABASE_URL` |
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Phase status
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Phase | Status |
+|---|---|
+| 1 Architecture | ✅ (`ComeDigit_Phase1_Architecture.md`) |
+| 2 Database | ✅ schema + RLS + queue + cursors |
+| 3 Authentication | ✅ Supabase Auth wiring + demo mode (OAuth/invites: next) |
+| 4 Organizations & workspaces | ✅ model + switcher (management UI: next) |
+| 5 Client CRM | ◐ roster + contacts + tasks (deals/invoices UI: next) |
+| 6–9 Integrations | ◐ provider contract + mock + queue + webhook receiver (live OAuth per phase) |
+| 10 Analytics | ◐ metric definitions + facts (GA4/GSC sync: next) |
+| 11 AI Engine | ◐ statistical insight engine v0 (LLM tool-calling: next) |
+| 12–15 Reporting/Automations/Billing/Deploy | queue + cron scaffolding in place |
+
+Security notes: HMAC-verified webhooks (timing-safe), CRON_SECRET-guarded
+cron, generic auth errors, no secrets client-side, RLS everywhere,
+`integration_secrets` unreachable from user sessions by construction.

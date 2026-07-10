@@ -1,26 +1,83 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ─── Design tokens: Linear × Vercel × Notion. Minimal, spacious. ─── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --border: #e4e4e7;
+  --foreground: #18181b;
+  --muted: #71717a;
+  --accent: #18181b;
+  --accent-foreground: #fafafa;
+  --positive: #059669;
+  --negative: #dc2626;
+  --chart-1: #18181b;
+  --chart-2: #71717a;
+  --chart-3: #a1a1aa;
+  --ring: #a1a1aa;
+}
+
+.dark {
+  --background: #09090b;
+  --surface: #101012;
+  --surface-2: #18181b;
+  --border: #26262a;
+  --foreground: #f4f4f5;
+  --muted: #8b8b93;
+  --accent: #fafafa;
+  --accent-foreground: #18181b;
+  --positive: #34d399;
+  --negative: #f87171;
+  --chart-1: #e4e4e7;
+  --chart-2: #8b8b93;
+  --chart-3: #52525b;
+  --ring: #52525b;
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
   --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-positive: var(--positive);
+  --color-negative: var(--negative);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-ring: var(--ring);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--foreground);
+  color: var(--background);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
 }
