@@ -2,11 +2,12 @@ import { NextResponse, type NextRequest } from "next/server";
 import { env, isDemoMode } from "@/lib/env";
 
 /**
- * Vercel Cron tick (vercel.json → every 30 min). Enqueues due sync jobs
- * for active connections; workers drain the queue. Guarded by CRON_SECRET
- * so it cannot be triggered by strangers.
+ * Vercel Cron tick. Enqueues due sync jobs for active connections;
+ * the /api/jobs/run worker drains the queue. Guarded by CRON_SECRET
+ * (Vercel sends it as the Authorization bearer automatically).
+ * Vercel Cron invokes with GET; POST kept for manual triggering.
  */
-export async function POST(request: NextRequest) {
+async function handle(request: NextRequest) {
   const auth = request.headers.get("authorization");
   if (!env.CRON_SECRET || auth !== `Bearer ${env.CRON_SECRET}`) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -42,3 +43,6 @@ export async function POST(request: NextRequest) {
 
   return NextResponse.json({ enqueued: connections.length });
 }
+
+export const GET = handle;
+export const POST = handle;

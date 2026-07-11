@@ -1,59 +1,122 @@
+import { redirect } from "next/navigation";
 import { Topbar } from "@/components/shell/topbar";
-import { Card, CardHeader, Badge } from "@/components/ui/primitives";
+import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
 import { isDemoMode } from "@/lib/env";
+import { getPrincipal } from "@/lib/auth/principal";
+import { getActiveWorkspaceId } from "@/lib/workspace";
+import { signOut } from "@/features/auth/actions";
 
 export const metadata = { title: "Settings" };
 
-const PROVIDERS = [
+const PROVIDERS: Array<{
+  key: string;
+  label: string;
+  phase: string;
+  envVar?: string;
+}> = [
   { key: "shopify", label: "Shopify", phase: "Phase 6" },
-  { key: "meta", label: "Meta Ads", phase: "Phase 7" },
+  { key: "meta", label: "Meta Ads", phase: "Phase 7", envVar: "META_APP_ID" },
   { key: "google_ads", label: "Google Ads", phase: "Phase 8" },
   { key: "tiktok", label: "TikTok Ads", phase: "Phase 9" },
   { key: "ga4", label: "Google Analytics 4", phase: "Phase 10" },
   { key: "search_console", label: "Search Console", phase: "Phase 10" },
 ];
 
-export default function SettingsPage() {
+async function getConnections(orgId: string) {
+  if (isDemoMode) return [];
+  const { getDb } = await import("@/lib/db");
+  return getDb().query.integrationConnections.findMany({
+    where: (c, { eq }) => eq(c.orgId, orgId),
+  });
+}
+
+export default async function SettingsPage() {
+  const principal = await getPrincipal();
+  if (!principal) redirect("/login");
+
+  const workspaceId = await getActiveWorkspaceId();
+  const connections = await getConnections(principal.orgId);
+  const metaConfigured = Boolean(process.env.META_APP_ID);
+
   return (
     <>
       <Topbar title="Settings" />
       <main className="space-y-6 px-6 py-6">
         <Card>
-          <CardHeader
-            title="Environment"
-            subtitle="How this deployment is configured"
-          />
+          <CardHeader title="Environment" subtitle="How this deployment is configured" />
           <div className="space-y-2 px-5 pb-5 pt-2 text-[13px]">
             <div className="flex items-center justify-between rounded-lg border border-border px-4 py-3">
               <span>Mode</span>
               <Badge tone={isDemoMode ? "outline" : "positive"}>
-                {isDemoMode ? "Demo (deterministic data, zero keys)" : "Live (Supabase connected)"}
+                {isDemoMode
+                  ? "Demo (deterministic data, zero keys)"
+                  : "Live (Supabase connected)"}
               </Badge>
             </div>
-            <p className="text-xs leading-relaxed text-muted">
-              To go live: create a Supabase project, copy .env.example to
-              .env.local, fill in the Supabase URL, publishable key and database
-              URL, run <code className="rounded bg-surface-2 px-1">npm run db:push</code>{" "}
-              and apply <code className="rounded bg-surface-2 px-1">supabase/migrations/0002_rls.sql</code>.
-            </p>
+            {isDemoMode ? (
+              <p className="text-xs leading-relaxed text-muted">
+                To go live, follow <code className="rounded bg-surface-2 px-1">GO_LIVE.md</code>{" "}
+                in the repo — create a free Supabase project, paste the keys
+                into Vercel, run one SQL file. Everything else is already wired.
+              </p>
+            ) : (
+              <form action={signOut} className="pt-1">
+                <Button variant="outline" type="submit">
+                  Sign out
+                </Button>
+              </form>
+            )}
           </div>
         </Card>
 
         <Card>
           <CardHeader
             title="Integrations"
-            subtitle="OAuth connection flows land with each integration phase; every module already runs on the shared provider contract"
+            subtitle="Each connector activates the moment its keys are added — the data pipeline behind them is already built"
           />
           <div className="space-y-2 px-5 pb-5 pt-2">
-            {PROVIDERS.map((p) => (
-              <div
-                key={p.key}
-                className="flex items-center justify-between rounded-lg border border-border px-4 py-3 text-[13px]"
-              >
-                <span className="font-medium">{p.label}</span>
-                <Badge tone="outline">Mock active · live in {p.phase}</Badge>
-              </div>
-            ))}
+            {PROVIDERS.map((p) => {
+              const existing = connections.filter((c) => c.provider === p.key);
+              const canConnect = p.key === "meta" && metaConfigured && !isDemoMode;
+              return (
+                <div
+                  key={p.key}
+                  className="flex items-center justify-between rounded-lg border border-border px-4 py-3 text-[13px]"
+                >
+                  <div>
+                    <span className="font-medium">{p.label}</span>
+                    {existing.map((c) => (
+                      <p key={c.id} className="text-xs text-muted">
+                        {c.displayName} ·{" "}
+                        <span
+                          className={
+                            c.status === "active" ? "text-positive" : "text-muted"
+                          }
+                        >
+                          {c.status}
+                        </span>
+                        {c.lastSyncAt
+                          ? ` · synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
+                          : ""}
+                      </p>
+                    ))}
+                  </div>
+                  {canConnect ? (
+                    <a href={`/api/integrations/meta/start?workspace=${workspaceId}`}>
+                      <Button>Connect</Button>
+                    </a>
+                  ) : (
+                    <Badge tone="outline">
+                      {existing.length > 0
+                        ? `${existing.length} connected`
+                        : p.envVar && !isDemoMode
+                          ? `Set ${p.envVar} to enable`
+                          : `Ready · live in ${p.phase}`}
+                    </Badge>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </Card>
       </main>
