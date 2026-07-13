@@ -3,7 +3,7 @@ import { KpiCard } from "@/components/charts/kpi-card";
 import { MoneyAreaChart } from "@/components/charts/charts";
 import { Card, CardHeader, Badge } from "@/components/ui/primitives";
 import { getAdDaily, lastNDays, previousPeriod } from "@/features/metrics/queries";
-import { adMetrics, sumAdFacts } from "@/lib/metrics/definitions";
+import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
 import { demoCampaigns, type DemoProvider } from "@/features/demo-data/generator";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
 import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
@@ -11,7 +11,8 @@ import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
 /**
  * One shared, reusable channel page for every ads provider — Meta, Google
  * and TikTok differ only in provider key and label. Never duplicated per
- * channel.
+ * channel. Full KPI grid + campaign-level table, all computed from the
+ * single metric-definition module.
  */
 export async function AdsChannelPage({
   provider,
@@ -29,6 +30,10 @@ export async function AdsChannelPage({
   const totals = sumAdFacts(rows);
   const prev = sumAdFacts(prevRows);
   const deltaOf = (curr: number, p: number) => (p > 0 ? (curr - p) / p : 0);
+  const metricDelta = (fn: (f: AdFacts) => number, invert = false) => {
+    const d = deltaOf(fn(totals), fn(prev));
+    return invert ? -d : d;
+  };
 
   const trend = rows
     .map((r) => ({ date: r.date, spend: r.spendMinor, revenue: r.revenueMinor }))
@@ -38,32 +43,40 @@ export async function AdsChannelPage({
     (a, b) => b.facts.spendMinor - a.facts.spendMinor,
   );
 
+  /** The important KPI set, one small card each. vs previous 30 days. */
+  const kpis: Array<{ label: string; value: string; delta?: number; hint?: string }> = [
+    { label: "Spend", value: formatMoney(totals.spendMinor), delta: deltaOf(totals.spendMinor, prev.spendMinor) },
+    { label: "Revenue", value: formatMoney(totals.revenueMinor), delta: deltaOf(totals.revenueMinor, prev.revenueMinor) },
+    { label: "ROAS", value: `${adMetrics.roas(totals).toFixed(2)}x`, delta: metricDelta(adMetrics.roas) },
+    { label: "Purchases", value: formatNumber(totals.purchases), delta: deltaOf(totals.purchases, prev.purchases) },
+    { label: "CPA", value: formatMoney(adMetrics.cpa(totals)), delta: metricDelta(adMetrics.cpa, true), hint: "Lower is better" },
+    { label: "CPC", value: formatMoney(adMetrics.cpc(totals)), delta: metricDelta(adMetrics.cpc, true), hint: "Lower is better" },
+    { label: "CPM", value: formatMoney(adMetrics.cpm(totals)), delta: metricDelta(adMetrics.cpm, true), hint: "Lower is better" },
+    { label: "CTR", value: formatPercent(adMetrics.ctr(totals), 2), delta: metricDelta(adMetrics.ctr) },
+    { label: "Impressions", value: formatNumber(totals.impressions), delta: deltaOf(totals.impressions, prev.impressions) },
+    { label: "Clicks", value: formatNumber(totals.clicks), delta: deltaOf(totals.clicks, prev.clicks) },
+    { label: "Reach", value: formatNumber(totals.reach), delta: deltaOf(totals.reach, prev.reach) },
+    { label: "Frequency", value: adMetrics.frequency(totals).toFixed(2), delta: metricDelta(adMetrics.frequency), hint: "Impressions ÷ reach" },
+    { label: "Hook rate", value: formatPercent(adMetrics.hookRate(totals)), delta: metricDelta(adMetrics.hookRate), hint: "3s video views ÷ impressions" },
+    { label: "Video views (3s)", value: formatNumber(totals.videoViews3s), delta: deltaOf(totals.videoViews3s, prev.videoViews3s) },
+  ];
+
+  const th = "px-3 py-2 text-right font-medium whitespace-nowrap";
+  const td = "px-3 py-2.5 text-right tabular-nums whitespace-nowrap";
+
   return (
     <>
       <Topbar title={`${label} — ${getWorkspaceName(workspaceId)}`} />
       <main className="space-y-6 px-6 py-6">
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <KpiCard
-            label="Spend (30d)"
-            value={formatMoney(totals.spendMinor)}
-            delta={deltaOf(totals.spendMinor, prev.spendMinor)}
-          />
-          <KpiCard
-            label="ROAS"
-            value={`${adMetrics.roas(totals).toFixed(2)}x`}
-            delta={deltaOf(adMetrics.roas(totals), adMetrics.roas(prev))}
-          />
-          <KpiCard
-            label="CPA"
-            value={formatMoney(adMetrics.cpa(totals))}
-            delta={-deltaOf(adMetrics.cpa(totals), adMetrics.cpa(prev))}
-            hint="Lower is better"
-          />
-          <KpiCard
-            label="CTR"
-            value={formatPercent(adMetrics.ctr(totals), 2)}
-            delta={deltaOf(adMetrics.ctr(totals), adMetrics.ctr(prev))}
-          />
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
+            Last 30 days · vs previous 30 days
+          </p>
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-7">
+            {kpis.map((k) => (
+              <KpiCard key={k.label} label={k.label} value={k.value} delta={k.delta} hint={k.hint} />
+            ))}
+          </div>
         </div>
 
         <Card>
@@ -82,49 +95,54 @@ export async function AdsChannelPage({
         <Card>
           <CardHeader
             title="Campaigns"
-            subtitle="Last 30 days · sorted by spend"
+            subtitle="Last 30 days · all key KPIs per campaign · sorted by spend"
           />
           <div className="overflow-x-auto px-2 pb-3">
             <table className="w-full text-[13px]">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted">
                   <th className="px-3 py-2 font-medium">Campaign</th>
-                  <th className="px-3 py-2 text-right font-medium">Spend</th>
-                  <th className="px-3 py-2 text-right font-medium">Revenue</th>
-                  <th className="px-3 py-2 text-right font-medium">ROAS</th>
-                  <th className="px-3 py-2 text-right font-medium">CTR</th>
-                  <th className="px-3 py-2 text-right font-medium">CPA</th>
-                  <th className="px-3 py-2 text-right font-medium">Status</th>
+                  <th className={th}>Spend</th>
+                  <th className={th}>Revenue</th>
+                  <th className={th}>ROAS</th>
+                  <th className={th}>Purchases</th>
+                  <th className={th}>CPA</th>
+                  <th className={th}>CPC</th>
+                  <th className={th}>CPM</th>
+                  <th className={th}>CTR</th>
+                  <th className={th}>Impressions</th>
+                  <th className={th}>Clicks</th>
+                  <th className={th}>Freq</th>
+                  <th className={th}>Status</th>
                 </tr>
               </thead>
               <tbody>
                 {campaigns.map((c) => {
-                  const roas = adMetrics.roas(c.facts);
+                  const f = c.facts;
+                  const roas = adMetrics.roas(f);
                   return (
                     <tr
                       key={c.id}
                       className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
                     >
-                      <td className="max-w-[280px] truncate px-3 py-2.5 font-medium">
+                      <td className="max-w-[260px] truncate px-3 py-2.5 font-medium">
                         {c.name}
                       </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums">
-                        {formatMoney(c.facts.spendMinor)}
-                      </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums">
-                        {formatMoney(c.facts.revenueMinor)}
-                      </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums">
+                      <td className={td}>{formatMoney(f.spendMinor)}</td>
+                      <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                      <td className={td}>
                         <span className={roas >= 2 ? "text-positive" : "text-negative"}>
                           {roas.toFixed(2)}x
                         </span>
                       </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums">
-                        {formatPercent(adMetrics.ctr(c.facts), 2)}
-                      </td>
-                      <td className="px-3 py-2.5 text-right tabular-nums">
-                        {formatMoney(adMetrics.cpa(c.facts))}
-                      </td>
+                      <td className={td}>{formatNumber(f.purchases)}</td>
+                      <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                      <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
+                      <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
+                      <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                      <td className={td}>{formatNumber(f.impressions)}</td>
+                      <td className={td}>{formatNumber(f.clicks)}</td>
+                      <td className={td}>{adMetrics.frequency(f).toFixed(2)}</td>
                       <td className="px-3 py-2.5 text-right">
                         <Badge tone={c.status === "active" ? "positive" : "outline"}>
                           {c.status}
@@ -137,13 +155,6 @@ export async function AdsChannelPage({
             </table>
           </div>
         </Card>
-
-        <p className="text-xs text-muted">
-          Impressions {formatNumber(totals.impressions)} · Reach{" "}
-          {formatNumber(totals.reach)} · Frequency{" "}
-          {adMetrics.frequency(totals).toFixed(2)} · Hook rate{" "}
-          {formatPercent(adMetrics.hookRate(totals))}
-        </p>
       </main>
     </>
   );

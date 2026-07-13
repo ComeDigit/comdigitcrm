@@ -3,7 +3,7 @@ import { KpiCard } from "@/components/charts/kpi-card";
 import { MoneyAreaChart, CountBarChart } from "@/components/charts/charts";
 import { Card, CardHeader } from "@/components/ui/primitives";
 import { getShopDaily, lastNDays, previousPeriod } from "@/features/metrics/queries";
-import { shopMetrics, sumShopFacts } from "@/lib/metrics/definitions";
+import { shopMetrics, sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
 import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
 
@@ -19,6 +19,10 @@ export default async function ShopifyPage() {
   const totals = sumShopFacts(rows);
   const prev = sumShopFacts(prevRows);
   const deltaOf = (c: number, p: number) => (p > 0 ? (c - p) / p : 0);
+  const metricDelta = (fn: (f: ShopFacts) => number, invert = false) => {
+    const d = deltaOf(fn(totals), fn(prev));
+    return invert ? -d : d;
+  };
 
   const salesTrend = rows.map((r) => ({
     date: r.date,
@@ -31,32 +35,35 @@ export default async function ShopifyPage() {
     returning: r.returningCustomers,
   }));
 
+  /** The important store KPIs, one small card each. vs previous 30 days. */
+  const kpis: Array<{ label: string; value: string; delta?: number; hint?: string }> = [
+    { label: "Gross sales", value: formatMoney(totals.grossSalesMinor), delta: deltaOf(totals.grossSalesMinor, prev.grossSalesMinor) },
+    { label: "Net sales", value: formatMoney(totals.netSalesMinor), delta: deltaOf(totals.netSalesMinor, prev.netSalesMinor) },
+    { label: "Orders", value: formatNumber(totals.orders), delta: deltaOf(totals.orders, prev.orders) },
+    { label: "AOV", value: formatMoney(shopMetrics.aov(totals)), delta: metricDelta(shopMetrics.aov) },
+    { label: "Conversion rate", value: formatPercent(shopMetrics.conversionRate(totals), 2), delta: metricDelta(shopMetrics.conversionRate) },
+    { label: "Sessions", value: formatNumber(totals.sessions), delta: deltaOf(totals.sessions, prev.sessions) },
+    { label: "Refunds", value: formatMoney(totals.refundsMinor), delta: -deltaOf(totals.refundsMinor, prev.refundsMinor), hint: "Lower is better" },
+    { label: "Refund rate", value: formatPercent(shopMetrics.refundRate(totals)), delta: metricDelta(shopMetrics.refundRate, true), hint: "Of gross sales" },
+    { label: "New customers", value: formatNumber(totals.newCustomers), delta: deltaOf(totals.newCustomers, prev.newCustomers) },
+    { label: "Returning customers", value: formatNumber(totals.returningCustomers), delta: deltaOf(totals.returningCustomers, prev.returningCustomers) },
+    { label: "Returning share", value: formatPercent(shopMetrics.returningShare(totals)), delta: metricDelta(shopMetrics.returningShare), hint: "Of all customers" },
+    { label: "Revenue / session", value: formatMoney(totals.sessions > 0 ? totals.netSalesMinor / totals.sessions : 0), delta: deltaOf(totals.sessions > 0 ? totals.netSalesMinor / totals.sessions : 0, prev.sessions > 0 ? prev.netSalesMinor / prev.sessions : 0) },
+  ];
+
   return (
     <>
       <Topbar title={`Shopify — ${getWorkspaceName(workspaceId)}`} />
       <main className="space-y-6 px-6 py-6">
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <KpiCard
-            label="Gross sales (30d)"
-            value={formatMoney(totals.grossSalesMinor)}
-            delta={deltaOf(totals.grossSalesMinor, prev.grossSalesMinor)}
-          />
-          <KpiCard
-            label="Net sales (30d)"
-            value={formatMoney(totals.netSalesMinor)}
-            delta={deltaOf(totals.netSalesMinor, prev.netSalesMinor)}
-          />
-          <KpiCard
-            label="Orders"
-            value={formatNumber(totals.orders)}
-            delta={deltaOf(totals.orders, prev.orders)}
-          />
-          <KpiCard
-            label="Refunds"
-            value={formatMoney(totals.refundsMinor)}
-            delta={-deltaOf(totals.refundsMinor, prev.refundsMinor)}
-            hint={`${formatPercent(shopMetrics.refundRate(totals))} of gross`}
-          />
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
+            Last 30 days · vs previous 30 days
+          </p>
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6">
+            {kpis.map((k) => (
+              <KpiCard key={k.label} label={k.label} value={k.value} delta={k.delta} hint={k.hint} />
+            ))}
+          </div>
         </div>
 
         <Card>
@@ -79,34 +86,12 @@ export default async function ShopifyPage() {
               <CountBarChart data={customerTrend} dataKey="new" label="New customers" />
             </div>
           </Card>
-          <div className="grid grid-cols-2 gap-3">
-            <KpiCard
-              label="AOV"
-              value={formatMoney(shopMetrics.aov(totals))}
-              delta={deltaOf(shopMetrics.aov(totals), shopMetrics.aov(prev))}
-            />
-            <KpiCard
-              label="Conversion rate"
-              value={formatPercent(shopMetrics.conversionRate(totals), 2)}
-              delta={deltaOf(
-                shopMetrics.conversionRate(totals),
-                shopMetrics.conversionRate(prev),
-              )}
-            />
-            <KpiCard
-              label="Sessions"
-              value={formatNumber(totals.sessions)}
-              delta={deltaOf(totals.sessions, prev.sessions)}
-            />
-            <KpiCard
-              label="Returning share"
-              value={formatPercent(shopMetrics.returningShare(totals))}
-              delta={deltaOf(
-                shopMetrics.returningShare(totals),
-                shopMetrics.returningShare(prev),
-              )}
-            />
-          </div>
+          <Card>
+            <CardHeader title="Returning customers" subtitle="Daily, last 30 days" />
+            <div className="px-3 pb-4">
+              <CountBarChart data={customerTrend} dataKey="returning" label="Returning customers" />
+            </div>
+          </Card>
         </div>
       </main>
     </>

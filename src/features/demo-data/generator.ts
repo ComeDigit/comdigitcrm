@@ -42,9 +42,9 @@ export const demoOrg = {
 } as const;
 
 export const demoWorkspaces: DemoWorkspace[] = [
-  { id: "ws-makhana", name: "Makhanix Foods", slug: "makhanix", vertical: "D2C Snacks" },
-  { id: "ws-green", name: "EatYourGreen", slug: "eatyourgreen", vertical: "Health Foods" },
-  { id: "ws-aura", name: "Aura Skincare", slug: "aura", vertical: "Beauty" },
+  { id: "ws-acme", name: "Acme Apparel", slug: "acme-apparel", vertical: "D2C Fashion" },
+  { id: "ws-bloom", name: "Bloom Cosmetics", slug: "bloom-cosmetics", vertical: "Beauty" },
+  { id: "ws-nova", name: "Nova Electronics", slug: "nova-electronics", vertical: "Consumer Tech" },
 ];
 
 export type DemoProvider = "meta" | "google_ads" | "tiktok";
@@ -213,10 +213,10 @@ export interface DemoContact {
 
 export function demoContacts(): DemoContact[] {
   return [
-    { id: "ct-1", fullName: "Riya Sharma", title: "Founder", email: "riya@makhanix.in", phone: "+91 98100 11223", workspaceId: "ws-makhana" },
-    { id: "ct-2", fullName: "Arjun Mehta", title: "Marketing Head", email: "arjun@makhanix.in", phone: "+91 98100 44556", workspaceId: "ws-makhana" },
-    { id: "ct-3", fullName: "Sneha Patel", title: "CEO", email: "sneha@eatyourgreen.com", phone: "+91 99870 77889", workspaceId: "ws-green" },
-    { id: "ct-4", fullName: "Kabir Rao", title: "Ecom Manager", email: "kabir@aura.co.in", phone: "+91 90040 33221", workspaceId: "ws-aura" },
+    { id: "ct-1", fullName: "Aarav Kapoor", title: "Founder", email: "aarav@acmeapparel.example.com", phone: "+91 90000 10001", workspaceId: "ws-acme" },
+    { id: "ct-2", fullName: "Diya Nair", title: "Marketing Head", email: "diya@acmeapparel.example.com", phone: "+91 90000 10002", workspaceId: "ws-acme" },
+    { id: "ct-3", fullName: "Ishaan Verma", title: "CEO", email: "ishaan@bloomcosmetics.example.com", phone: "+91 90000 10003", workspaceId: "ws-bloom" },
+    { id: "ct-4", fullName: "Meera Iyer", title: "Ecommerce Manager", email: "meera@novaelectronics.example.com", phone: "+91 90000 10004", workspaceId: "ws-nova" },
   ];
 }
 
@@ -236,11 +236,11 @@ export function demoTasks(): DemoTask[] {
     return x.toISOString().slice(0, 10);
   };
   return [
-    { id: "t-1", title: "Launch Diwali gifting campaign", status: "in_progress", workspaceId: "ws-makhana", dueDate: d(3), assignee: "Priya" },
-    { id: "t-2", title: "Refresh UGC creatives (fatigue on batch 2)", status: "todo", workspaceId: "ws-makhana", dueDate: d(5), assignee: "Dev" },
-    { id: "t-3", title: "Monthly report — EatYourGreen", status: "review", workspaceId: "ws-green", dueDate: d(1), assignee: "Priya" },
-    { id: "t-4", title: "Set up GA4 purchase event audit", status: "todo", workspaceId: "ws-green", dueDate: d(7), assignee: "Rahul" },
-    { id: "t-5", title: "Negotiate Q3 retainer renewal", status: "in_progress", workspaceId: "ws-aura", dueDate: d(2), assignee: "Ankit" },
-    { id: "t-6", title: "PMax asset group restructure", status: "done", workspaceId: "ws-aura", dueDate: d(-1), assignee: "Rahul" },
+    { id: "t-1", title: "Launch festive sale campaign", status: "in_progress", workspaceId: "ws-acme", dueDate: d(3), assignee: "Sam" },
+    { id: "t-2", title: "Refresh UGC creatives (fatigue on batch 2)", status: "todo", workspaceId: "ws-acme", dueDate: d(5), assignee: "Alex" },
+    { id: "t-3", title: "Monthly report — Bloom Cosmetics", status: "review", workspaceId: "ws-bloom", dueDate: d(1), assignee: "Sam" },
+    { id: "t-4", title: "Set up GA4 purchase event audit", status: "todo", workspaceId: "ws-bloom", dueDate: d(7), assignee: "Jordan" },
+    { id: "t-5", title: "Negotiate Q3 retainer renewal", status: "in_progress", workspaceId: "ws-nova", dueDate: d(2), assignee: "Casey" },
+    { id: "t-6", title: "PMax asset group restructure", status: "done", workspaceId: "ws-nova", dueDate: d(-1), assignee: "Jordan" },
   ];
 }
