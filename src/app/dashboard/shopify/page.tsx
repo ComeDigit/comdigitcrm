@@ -51,9 +51,11 @@ export default async function ShopifyPage() {
     { label: "Revenue / session", value: formatMoney(totals.sessions > 0 ? totals.netSalesMinor / totals.sessions : 0), delta: deltaOf(totals.sessions > 0 ? totals.netSalesMinor / totals.sessions : 0, prev.sessions > 0 ? prev.netSalesMinor / prev.sessions : 0), info: "On average, how much revenue each store visit generated — combines traffic quality and conversion into one number." },
   ];
 
+  const workspaceName = await getWorkspaceName(workspaceId);
+
   return (
     <>
-      <Topbar title={`Shopify — ${getWorkspaceName(workspaceId)}`} />
+      <Topbar title={`Shopify — ${workspaceName}`} />
       <main className="space-y-6 px-6 py-6">
         <div>
           <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">

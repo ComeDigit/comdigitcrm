@@ -86,10 +86,11 @@ async function computeInsights(workspaceId: string): Promise<Insight[]> {
 export default async function AiPage() {
   const workspaceId = await getActiveWorkspaceId();
   const insights = await computeInsights(workspaceId);
+  const workspaceName = await getWorkspaceName(workspaceId);
 
   return (
     <>
-      <Topbar title={`AI Copilot — ${getWorkspaceName(workspaceId)}`} />
+      <Topbar title={`AI Copilot — ${workspaceName}`} />
       <main className="space-y-6 px-6 py-6">
         <Card>
           <CardHeader

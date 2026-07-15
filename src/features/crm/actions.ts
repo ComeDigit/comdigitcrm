@@ -6,7 +6,7 @@ import { isDemoMode } from "@/lib/env";
 import { getDb } from "@/lib/db";
 import { contacts, tasks, auditLog } from "@/db/schema";
 import { authorize, AuthorizationError } from "@/lib/auth/authorize";
-import { getPrincipal } from "@/lib/auth/principal";
+import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
 import { and, eq } from "drizzle-orm";
 
 /**
@@ -76,7 +76,7 @@ export async function createContact(
   await db.insert(auditLog).values({
     orgId: principal.orgId,
     workspaceId: parsed.data.workspaceId,
-    actorId: principal.userId === "demo-user" ? null : principal.userId,
+    actorId: actorIdOrNull(principal.userId),
     action: "contact.create",
     resourceType: "contact",
     resourceId: row.id,
@@ -130,14 +130,14 @@ export async function createTask(
       workspaceId: parsed.data.workspaceId,
       title: parsed.data.title,
       dueDate: parsed.data.dueDate || null,
-      createdBy: principal.userId === "demo-user" ? null : principal.userId,
+      createdBy: actorIdOrNull(principal.userId),
     })
     .returning({ id: tasks.id });
 
   await db.insert(auditLog).values({
     orgId: principal.orgId,
     workspaceId: parsed.data.workspaceId,
-    actorId: principal.userId === "demo-user" ? null : principal.userId,
+    actorId: actorIdOrNull(principal.userId),
     action: "task.create",
     resourceType: "task",
     resourceId: row.id,
@@ -194,7 +194,7 @@ export async function updateTaskStatus(
   await db.insert(auditLog).values({
     orgId: principal.orgId,
     workspaceId: row.workspaceId,
-    actorId: principal.userId === "demo-user" ? null : principal.userId,
+    actorId: actorIdOrNull(principal.userId),
     action: "task.status",
     resourceType: "task",
     resourceId: row.id,

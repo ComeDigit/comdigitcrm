@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/primitives";
+import { isDemoMode } from "@/lib/env";
 
 export default function LandingPage() {
   return (
@@ -29,14 +30,12 @@ export default function LandingPage() {
             Open dashboard <ArrowRight size={14} />
           </Button>
         </Link>
-        <Link href="/login">
-          <Button variant="outline">Sign in</Button>
-        </Link>
       </div>
 
       <p className="mt-16 text-xs text-muted">
-        Running in demo mode with deterministic sample data — connect Supabase
-        to go live.
+        {isDemoMode
+          ? "Running in demo mode with deterministic sample data — connect Supabase to go live."
+          : "Live — connected to Supabase. No login wall; anyone with this URL can open the dashboard."}
       </p>
     </main>
   );

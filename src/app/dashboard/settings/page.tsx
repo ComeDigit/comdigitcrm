@@ -1,10 +1,8 @@
-import { redirect } from "next/navigation";
 import { Topbar } from "@/components/shell/topbar";
 import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
 import { isDemoMode } from "@/lib/env";
 import { getPrincipal } from "@/lib/auth/principal";
 import { getActiveWorkspaceId } from "@/lib/workspace";
-import { signOut } from "@/features/auth/actions";
 
 export const metadata = { title: "Settings" };
 
@@ -32,8 +30,6 @@ async function getConnections(orgId: string) {
 
 export default async function SettingsPage() {
   const principal = await getPrincipal();
-  if (!principal) redirect("/login");
-
   const workspaceId = await getActiveWorkspaceId();
   const connections = await getConnections(principal.orgId);
   const metaConfigured = Boolean(process.env.META_APP_ID);
@@ -60,11 +56,10 @@ export default async function SettingsPage() {
                 into Vercel, run one SQL file. Everything else is already wired.
               </p>
             ) : (
-              <form action={signOut} className="pt-1">
-                <Button variant="outline" type="submit">
-                  Sign out
-                </Button>
-              </form>
+              <p className="text-xs leading-relaxed text-muted">
+                This deployment has no login wall — anyone with the URL sees
+                this dashboard directly.
+              </p>
             )}
           </div>
         </Card>

@@ -50,6 +50,7 @@ export default async function OverviewPage() {
   const mer = blendedMetrics.mer(s, a);
   const netAfterAds = blendedMetrics.netAfterAdSpendMinor(s, a);
   const isProfitable = netAfterAds >= 0;
+  const workspaceName = await getWorkspaceName(workspaceId);
 
   const blendedKpis: Kpi[] = [
     { label: "Net revenue", value: formatMoney(s.netSalesMinor), delta: deltaOf(s.netSalesMinor, ps.netSalesMinor), info: "Total money from orders, after refunds — your actual store revenue for the period." },
@@ -97,7 +98,7 @@ export default async function OverviewPage() {
 
   return (
     <>
-      <Topbar title={`Overview — ${getWorkspaceName(workspaceId)}`} />
+      <Topbar title={`Overview — ${workspaceName}`} />
       <main className="space-y-6 px-6 py-6">
         <Card
           className={
@@ -107,7 +108,7 @@ export default async function OverviewPage() {
           }
         >
           <p className="text-[13px] leading-relaxed">
-            In the last 30 days, <span className="font-semibold">{getWorkspaceName(workspaceId)}</span>{" "}
+            In the last 30 days, <span className="font-semibold">{workspaceName}</span>{" "}
             made <span className="font-semibold">{formatMoney(s.netSalesMinor)}</span> in
             revenue from <span className="font-semibold">{s.orders}</span> orders,
             and spent <span className="font-semibold">{formatMoney(a.spendMinor)}</span> on
