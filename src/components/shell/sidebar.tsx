@@ -15,6 +15,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { isDemoMode } from "@/lib/env";
 
 interface NavItem {
   href: string;
@@ -96,7 +97,9 @@ export function Sidebar() {
         ))}
       </nav>
       <div className="border-t border-border px-5 py-3">
-        <p className="text-[11px] text-muted">Demo mode · no keys needed</p>
+        <p className="text-[11px] text-muted">
+          {isDemoMode ? "Demo mode · no keys needed" : "Live · connected to Supabase"}
+        </p>
       </div>
     </aside>
   );

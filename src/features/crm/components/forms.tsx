@@ -5,6 +5,7 @@ import { Plus, X } from "lucide-react";
 import {
   createContact,
   createTask,
+  createWorkspace,
   updateTaskStatus,
   type ActionResult,
 } from "@/features/crm/actions";
@@ -36,6 +37,24 @@ function Popover({
         </div>
       ) : null}
     </div>
+  );
+}
+
+export function NewWorkspaceForm() {
+  const [state, formAction, pending] = useActionState(createWorkspace, initial);
+  return (
+    <Popover label="Add client">
+      {() => (
+        <form action={formAction} className="space-y-2.5">
+          <input name="name" required placeholder="Client / brand name" className={inputCls} />
+          {state.error ? <p className="text-xs text-negative">{state.error}</p> : null}
+          {state.ok ? <p className="text-xs text-positive">Client added.</p> : null}
+          <Button type="submit" className="w-full" disabled={pending}>
+            {pending ? "Adding…" : "Add client"}
+          </Button>
+        </form>
+      )}
+    </Popover>
   );
 }
 

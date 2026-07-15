@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import { isDemoMode } from "@/lib/env";
 import { getDb } from "@/lib/db";
-import { contacts, tasks, auditLog } from "@/db/schema";
+import { contacts, tasks, auditLog, workspaces } from "@/db/schema";
 import { authorize, AuthorizationError } from "@/lib/auth/authorize";
 import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
 import { and, eq } from "drizzle-orm";
@@ -84,6 +84,71 @@ export async function createContact(
   });
 
   revalidatePath("/dashboard/clients");
+  return { ok: true };
+}
+
+const workspaceSchema = z.object({
+  name: z.string().trim().min(2, "Client name is too short").max(80),
+});
+
+function slugify(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48) || "client"
+  );
+}
+
+/** Adds a new client brand (workspace) to the agency's one organization. */
+export async function createWorkspace(
+  _prev: ActionResult,
+  formData: FormData,
+): Promise<ActionResult> {
+  if (isDemoMode) return { error: DEMO_ERROR };
+
+  const parsed = workspaceSchema.safeParse({ name: formData.get("name") });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+
+  const principal = await getPrincipal();
+  try {
+    authorize(principal, "workspace.manage");
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    throw e;
+  }
+
+  const db = getDb();
+  const baseSlug = slugify(parsed.data.name);
+  let slug = baseSlug;
+  for (let i = 2; i <= 20; i++) {
+    const clash = await db.query.workspaces.findFirst({
+      where: (w, { and, eq }) => and(eq(w.orgId, principal.orgId), eq(w.slug, slug)),
+    });
+    if (!clash) break;
+    slug = `${baseSlug}-${i}`;
+  }
+
+  const [row] = await db
+    .insert(workspaces)
+    .values({ orgId: principal.orgId, name: parsed.data.name, slug })
+    .returning({ id: workspaces.id });
+
+  await db.insert(auditLog).values({
+    orgId: principal.orgId,
+    workspaceId: row.id,
+    actorId: actorIdOrNull(principal.userId),
+    action: "workspace.create",
+    resourceType: "workspace",
+    resourceId: row.id,
+    after: parsed.data,
+  });
+
+  revalidatePath("/dashboard/clients");
+  revalidatePath("/dashboard");
   return { ok: true };
 }
 

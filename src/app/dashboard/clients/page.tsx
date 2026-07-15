@@ -1,10 +1,9 @@
 import Link from "next/link";
-import { redirect } from "next/navigation";
 import { Topbar } from "@/components/shell/topbar";
 import { Card, CardHeader, Badge } from "@/components/ui/primitives";
 import { getPrincipal } from "@/lib/auth/principal";
 import { getContacts, getWorkspaces } from "@/features/crm/queries";
-import { NewContactForm } from "@/features/crm/components/forms";
+import { NewContactForm, NewWorkspaceForm } from "@/features/crm/components/forms";
 import { getShopDaily, lastNDays } from "@/features/metrics/queries";
 import { sumShopFacts } from "@/lib/metrics/definitions";
 import { formatMoney } from "@/lib/utils";
@@ -14,7 +13,6 @@ export const metadata = { title: "Clients" };
 /** Agency client roster: every workspace is one client brand. */
 export default async function ClientsPage() {
   const principal = await getPrincipal();
-  if (!principal) redirect("/login");
 
   const [workspaces, contacts] = await Promise.all([
     getWorkspaces(principal.orgId),
@@ -32,7 +30,8 @@ export default async function ClientsPage() {
     <>
       <Topbar title="Clients" />
       <main className="space-y-6 px-6 py-6">
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
+          <NewWorkspaceForm />
           <NewContactForm workspaces={workspaces} />
         </div>
         <div className="grid gap-4 lg:grid-cols-3">
