@@ -12,7 +12,8 @@ import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
  * One shared, reusable channel page for every ads provider — Meta, Google
  * and TikTok differ only in provider key and label. Never duplicated per
  * channel. Full KPI grid + campaign-level table, all computed from the
- * single metric-definition module.
+ * single metric-definition module. Every KPI carries a plain-language
+ * explanation (hover the ⓘ) so non-marketers can read the dashboard.
  */
 export async function AdsChannelPage({
   provider,
@@ -43,22 +44,22 @@ export async function AdsChannelPage({
     (a, b) => b.facts.spendMinor - a.facts.spendMinor,
   );
 
-  /** The important KPI set, one small card each. vs previous 30 days. */
-  const kpis: Array<{ label: string; value: string; delta?: number; hint?: string }> = [
-    { label: "Spend", value: formatMoney(totals.spendMinor), delta: deltaOf(totals.spendMinor, prev.spendMinor) },
-    { label: "Revenue", value: formatMoney(totals.revenueMinor), delta: deltaOf(totals.revenueMinor, prev.revenueMinor) },
-    { label: "ROAS", value: `${adMetrics.roas(totals).toFixed(2)}x`, delta: metricDelta(adMetrics.roas) },
-    { label: "Purchases", value: formatNumber(totals.purchases), delta: deltaOf(totals.purchases, prev.purchases) },
-    { label: "CPA", value: formatMoney(adMetrics.cpa(totals)), delta: metricDelta(adMetrics.cpa, true), hint: "Lower is better" },
-    { label: "CPC", value: formatMoney(adMetrics.cpc(totals)), delta: metricDelta(adMetrics.cpc, true), hint: "Lower is better" },
-    { label: "CPM", value: formatMoney(adMetrics.cpm(totals)), delta: metricDelta(adMetrics.cpm, true), hint: "Lower is better" },
-    { label: "CTR", value: formatPercent(adMetrics.ctr(totals), 2), delta: metricDelta(adMetrics.ctr) },
-    { label: "Impressions", value: formatNumber(totals.impressions), delta: deltaOf(totals.impressions, prev.impressions) },
-    { label: "Clicks", value: formatNumber(totals.clicks), delta: deltaOf(totals.clicks, prev.clicks) },
-    { label: "Reach", value: formatNumber(totals.reach), delta: deltaOf(totals.reach, prev.reach) },
-    { label: "Frequency", value: adMetrics.frequency(totals).toFixed(2), delta: metricDelta(adMetrics.frequency), hint: "Impressions ÷ reach" },
-    { label: "Hook rate", value: formatPercent(adMetrics.hookRate(totals)), delta: metricDelta(adMetrics.hookRate), hint: "3s video views ÷ impressions" },
-    { label: "Video views (3s)", value: formatNumber(totals.videoViews3s), delta: deltaOf(totals.videoViews3s, prev.videoViews3s) },
+  /** The important KPI set, one small card each, with plain-language info. vs previous 30 days. */
+  const kpis: Array<{ label: string; value: string; delta?: number; hint?: string; info: string }> = [
+    { label: "Spend", value: formatMoney(totals.spendMinor), delta: deltaOf(totals.spendMinor, prev.spendMinor), info: `Total money paid to ${label} to run ads this period.` },
+    { label: "Revenue", value: formatMoney(totals.revenueMinor), delta: deltaOf(totals.revenueMinor, prev.revenueMinor), info: `Revenue ${label} reports as coming from its own ads (its own tracking).` },
+    { label: "ROAS", value: `${adMetrics.roas(totals).toFixed(2)}x`, delta: metricDelta(adMetrics.roas), info: "Return On Ad Spend — revenue earned per ₹1 spent. Above 1x means the ads paid for themselves; higher is better." },
+    { label: "Purchases", value: formatNumber(totals.purchases), delta: deltaOf(totals.purchases, prev.purchases), info: "Number of purchases attributed to these ads." },
+    { label: "CPA", value: formatMoney(adMetrics.cpa(totals)), delta: metricDelta(adMetrics.cpa, true), hint: "Lower is better", info: "Cost Per Acquisition — average ad spend needed to get one purchase." },
+    { label: "CPC", value: formatMoney(adMetrics.cpc(totals)), delta: metricDelta(adMetrics.cpc, true), hint: "Lower is better", info: "Cost Per Click — average amount paid each time someone clicks the ad." },
+    { label: "CPM", value: formatMoney(adMetrics.cpm(totals)), delta: metricDelta(adMetrics.cpm, true), hint: "Lower is better", info: "Cost per 1,000 impressions — what it costs just to show the ad to 1,000 people." },
+    { label: "CTR", value: formatPercent(adMetrics.ctr(totals), 2), delta: metricDelta(adMetrics.ctr), info: "Click-Through Rate — percentage of people who saw the ad and clicked it." },
+    { label: "Impressions", value: formatNumber(totals.impressions), delta: deltaOf(totals.impressions, prev.impressions), info: "Total number of times the ad was shown on screen." },
+    { label: "Clicks", value: formatNumber(totals.clicks), delta: deltaOf(totals.clicks, prev.clicks), info: "Total number of clicks the ad received." },
+    { label: "Reach", value: formatNumber(totals.reach), delta: deltaOf(totals.reach, prev.reach), info: "Number of unique people who saw the ad at least once (not counting repeats)." },
+    { label: "Frequency", value: adMetrics.frequency(totals).toFixed(2), delta: metricDelta(adMetrics.frequency), hint: "Impressions ÷ reach", info: "Average number of times each person saw the ad. If this climbs too high, people may get tired of seeing it (ad fatigue)." },
+    { label: "Hook rate", value: formatPercent(adMetrics.hookRate(totals)), delta: metricDelta(adMetrics.hookRate), hint: "3s video views ÷ impressions", info: "Of everyone who saw the video ad, what share watched at least 3 seconds — a sign the opening is grabbing attention." },
+    { label: "Video views (3s)", value: formatNumber(totals.videoViews3s), delta: deltaOf(totals.videoViews3s, prev.videoViews3s), info: "Number of times the video was watched for at least 3 seconds." },
   ];
 
   const th = "px-3 py-2 text-right font-medium whitespace-nowrap";
@@ -70,11 +71,11 @@ export async function AdsChannelPage({
       <main className="space-y-6 px-6 py-6">
         <div>
           <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
-            Last 30 days · vs previous 30 days
+            Last 30 days · vs previous 30 days · hover the ⓘ on any card for a plain-English explanation
           </p>
           <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-7">
             {kpis.map((k) => (
-              <KpiCard key={k.label} label={k.label} value={k.value} delta={k.delta} hint={k.hint} />
+              <KpiCard key={k.label} label={k.label} value={k.value} delta={k.delta} hint={k.hint} info={k.info} />
             ))}
           </div>
         </div>

@@ -23,6 +23,7 @@ interface Kpi {
   value: string;
   delta?: number;
   hint?: string;
+  info?: string;
 }
 
 /** Agency overview: full blended + ads + store KPI set for the active client. */
@@ -46,33 +47,37 @@ export default async function OverviewPage() {
   const deltaOf = (curr: number, prev: number) =>
     prev > 0 ? (curr - prev) / prev : 0;
 
+  const mer = blendedMetrics.mer(s, a);
+  const netAfterAds = blendedMetrics.netAfterAdSpendMinor(s, a);
+  const isProfitable = netAfterAds >= 0;
+
   const blendedKpis: Kpi[] = [
-    { label: "Net revenue", value: formatMoney(s.netSalesMinor), delta: deltaOf(s.netSalesMinor, ps.netSalesMinor) },
-    { label: "Total ad spend", value: formatMoney(a.spendMinor), delta: deltaOf(a.spendMinor, pa.spendMinor) },
-    { label: "Blended MER", value: `${blendedMetrics.mer(s, a).toFixed(2)}x`, delta: deltaOf(blendedMetrics.mer(s, a), blendedMetrics.mer(ps, pa)), hint: "Net revenue ÷ ad spend" },
-    { label: "Net after ad spend", value: formatMoney(blendedMetrics.netAfterAdSpendMinor(s, a)), delta: deltaOf(blendedMetrics.netAfterAdSpendMinor(s, a), blendedMetrics.netAfterAdSpendMinor(ps, pa)), hint: "Before COGS & shipping" },
+    { label: "Net revenue", value: formatMoney(s.netSalesMinor), delta: deltaOf(s.netSalesMinor, ps.netSalesMinor), info: "Total money from orders, after refunds — your actual store revenue for the period." },
+    { label: "Total ad spend", value: formatMoney(a.spendMinor), delta: deltaOf(a.spendMinor, pa.spendMinor), info: "How much you paid Meta, Google and TikTok combined to run ads." },
+    { label: "Blended MER", value: `${mer.toFixed(2)}x`, delta: deltaOf(mer, blendedMetrics.mer(ps, pa)), hint: "Net revenue ÷ ad spend", info: "For every ₹1 spent on ads (across all platforms), how many ₹ came back in store revenue. Above 1x means ads are paying for themselves." },
+    { label: "Net after ad spend", value: formatMoney(netAfterAds), delta: deltaOf(netAfterAds, blendedMetrics.netAfterAdSpendMinor(ps, pa)), hint: "Before COGS & shipping", info: "Revenue left over once you subtract ad spend — not your final profit yet (product cost and shipping aren't subtracted here), but a quick health check." },
   ];
 
   const adsKpis: Kpi[] = [
-    { label: "Attributed revenue", value: formatMoney(a.revenueMinor), delta: deltaOf(a.revenueMinor, pa.revenueMinor) },
-    { label: "Blended ROAS", value: `${adMetrics.roas(a).toFixed(2)}x`, delta: deltaOf(adMetrics.roas(a), adMetrics.roas(pa)) },
-    { label: "Purchases (ads)", value: formatNumber(a.purchases), delta: deltaOf(a.purchases, pa.purchases) },
-    { label: "CPA", value: formatMoney(adMetrics.cpa(a)), delta: -deltaOf(adMetrics.cpa(a), adMetrics.cpa(pa)), hint: "Lower is better" },
-    { label: "CTR", value: formatPercent(adMetrics.ctr(a), 2), delta: deltaOf(adMetrics.ctr(a), adMetrics.ctr(pa)) },
-    { label: "CPM", value: formatMoney(adMetrics.cpm(a)), delta: -deltaOf(adMetrics.cpm(a), adMetrics.cpm(pa)), hint: "Lower is better" },
-    { label: "Impressions", value: formatNumber(a.impressions), delta: deltaOf(a.impressions, pa.impressions) },
-    { label: "Clicks", value: formatNumber(a.clicks), delta: deltaOf(a.clicks, pa.clicks) },
+    { label: "Attributed revenue", value: formatMoney(a.revenueMinor), delta: deltaOf(a.revenueMinor, pa.revenueMinor), info: "Revenue the ad platforms report as coming from their own ads (their own tracking, not your store's total revenue)." },
+    { label: "Blended ROAS", value: `${adMetrics.roas(a).toFixed(2)}x`, delta: deltaOf(adMetrics.roas(a), adMetrics.roas(pa)), info: "Return On Ad Spend — revenue the ads generated per ₹1 spent, according to the ad platforms themselves. Higher is better." },
+    { label: "Purchases (ads)", value: formatNumber(a.purchases), delta: deltaOf(a.purchases, pa.purchases), info: "Number of purchases the ad platforms say their ads led to." },
+    { label: "CPA", value: formatMoney(adMetrics.cpa(a)), delta: -deltaOf(adMetrics.cpa(a), adMetrics.cpa(pa)), hint: "Lower is better", info: "Cost Per Acquisition — how much you paid in ads, on average, to get one purchase." },
+    { label: "CTR", value: formatPercent(adMetrics.ctr(a), 2), delta: deltaOf(adMetrics.ctr(a), adMetrics.ctr(pa)), info: "Click-Through Rate — the share of people who saw your ad and clicked it. Higher usually means your ad is more appealing." },
+    { label: "CPM", value: formatMoney(adMetrics.cpm(a)), delta: -deltaOf(adMetrics.cpm(a), adMetrics.cpm(pa)), hint: "Lower is better", info: "Cost per 1,000 impressions — what you pay just to show your ad to 1,000 people, before any clicks or sales." },
+    { label: "Impressions", value: formatNumber(a.impressions), delta: deltaOf(a.impressions, pa.impressions), info: "Total number of times your ads were shown on screen." },
+    { label: "Clicks", value: formatNumber(a.clicks), delta: deltaOf(a.clicks, pa.clicks), info: "Total number of times people clicked on your ads." },
   ];
 
   const shopKpis: Kpi[] = [
-    { label: "Orders", value: formatNumber(s.orders), delta: deltaOf(s.orders, ps.orders) },
-    { label: "AOV", value: formatMoney(shopMetrics.aov(s)), delta: deltaOf(shopMetrics.aov(s), shopMetrics.aov(ps)) },
-    { label: "Conversion rate", value: formatPercent(shopMetrics.conversionRate(s), 2), delta: deltaOf(shopMetrics.conversionRate(s), shopMetrics.conversionRate(ps)) },
-    { label: "Sessions", value: formatNumber(s.sessions), delta: deltaOf(s.sessions, ps.sessions) },
-    { label: "Gross sales", value: formatMoney(s.grossSalesMinor), delta: deltaOf(s.grossSalesMinor, ps.grossSalesMinor) },
-    { label: "Refund rate", value: formatPercent(shopMetrics.refundRate(s)), delta: -deltaOf(shopMetrics.refundRate(s), shopMetrics.refundRate(ps)), hint: "Lower is better" },
-    { label: "New customers", value: formatNumber(s.newCustomers), delta: deltaOf(s.newCustomers, ps.newCustomers) },
-    { label: "Returning share", value: formatPercent(shopMetrics.returningShare(s)), delta: deltaOf(shopMetrics.returningShare(s), shopMetrics.returningShare(ps)) },
+    { label: "Orders", value: formatNumber(s.orders), delta: deltaOf(s.orders, ps.orders), info: "Number of orders placed on your store." },
+    { label: "AOV", value: formatMoney(shopMetrics.aov(s)), delta: deltaOf(shopMetrics.aov(s), shopMetrics.aov(ps)), info: "Average Order Value — the typical amount a customer spends per order." },
+    { label: "Conversion rate", value: formatPercent(shopMetrics.conversionRate(s), 2), delta: deltaOf(shopMetrics.conversionRate(s), shopMetrics.conversionRate(ps)), info: "Of everyone who visited your store, what percentage actually placed an order." },
+    { label: "Sessions", value: formatNumber(s.sessions), delta: deltaOf(s.sessions, ps.sessions), info: "Number of visits to your store." },
+    { label: "Gross sales", value: formatMoney(s.grossSalesMinor), delta: deltaOf(s.grossSalesMinor, ps.grossSalesMinor), info: "Total sales before refunds are subtracted." },
+    { label: "Refund rate", value: formatPercent(shopMetrics.refundRate(s)), delta: -deltaOf(shopMetrics.refundRate(s), shopMetrics.refundRate(ps)), hint: "Lower is better", info: "What share of your gross sales came back as refunds." },
+    { label: "New customers", value: formatNumber(s.newCustomers), delta: deltaOf(s.newCustomers, ps.newCustomers), info: "Customers who bought from you for the first time in this period." },
+    { label: "Returning share", value: formatPercent(shopMetrics.returningShare(s)), delta: deltaOf(shopMetrics.returningShare(s), shopMetrics.returningShare(ps)), info: "What percentage of your customers this period had bought from you before — a sign of loyalty." },
   ];
 
   // Merge ads spend + shop revenue into one daily trend.
@@ -94,6 +99,27 @@ export default async function OverviewPage() {
     <>
       <Topbar title={`Overview — ${getWorkspaceName(workspaceId)}`} />
       <main className="space-y-6 px-6 py-6">
+        <Card
+          className={
+            isProfitable
+              ? "border-positive/30 bg-positive/5 px-5 py-4"
+              : "border-negative/30 bg-negative/5 px-5 py-4"
+          }
+        >
+          <p className="text-[13px] leading-relaxed">
+            In the last 30 days, <span className="font-semibold">{getWorkspaceName(workspaceId)}</span>{" "}
+            made <span className="font-semibold">{formatMoney(s.netSalesMinor)}</span> in
+            revenue from <span className="font-semibold">{s.orders}</span> orders,
+            and spent <span className="font-semibold">{formatMoney(a.spendMinor)}</span> on
+            ads. That means for every ₹1 spent on ads,{" "}
+            <span className="font-semibold">₹{mer.toFixed(2)}</span> came back in
+            revenue —{" "}
+            <span className={isProfitable ? "text-positive font-medium" : "text-negative font-medium"}>
+              {isProfitable ? "ads are paying for themselves." : "ads are currently costing more than they bring in."}
+            </span>
+          </p>
+        </Card>
+
         <section>
           <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
             Blended · last 30 days vs previous 30
