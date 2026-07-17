@@ -13,7 +13,7 @@ import {
   type RangePreset,
   type CampaignWithFacts,
 } from "@/features/metrics/queries";
-import { getLiveMetaReport, getMetaPacing } from "@/features/integrations/meta-live";
+import { getLiveMetaReport, getMetaPacing, type MetaFetchFailure } from "@/features/integrations/meta-live";
 import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
 import type { DemoProvider } from "@/features/demo-data/generator";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
@@ -52,6 +52,7 @@ export async function AdsReport({
   let trend: Array<{ date: string; spend: number; revenue: number }>;
   let campaigns: CampaignWithFacts[];
   let partialFailure = false;
+  let failures: MetaFetchFailure[] = [];
   let pacing: { activeDailyBudgetMinor: number; spendTodayMinor: number } | null = null;
 
   if (provider === "meta" && !isDemoMode) {
@@ -71,6 +72,10 @@ export async function AdsReport({
     trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
     campaigns = current.campaigns;
     partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
+    // Current-range failures are the most relevant to show — the previous-
+    // period pull uses the same connections/credentials, so its failures
+    // would just be duplicates for the same underlying reason.
+    failures = current.failures;
     pacing = pacingResult;
   } else {
     const [rows, prevRows, dbCampaigns] = await Promise.all([
@@ -188,9 +193,20 @@ export async function AdsReport({
 
         {partialFailure ? (
           <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
-            Couldn&apos;t reach one or more connected Meta accounts just now (expired token, rate
-            limit, or Meta API issue) — numbers below may be incomplete. This report is pulled
-            live on every page view, so refreshing may resolve it.
+            <p>
+              Couldn&apos;t reach {failures.length === 1 ? "one connected Meta account" : `${failures.length || "one or more"} connected Meta account(s)`} just now —
+              numbers below may be incomplete. This report is pulled live on every page view, so
+              refreshing may resolve it.
+            </p>
+            {failures.length > 0 ? (
+              <ul className="mt-1 list-inside list-disc space-y-0.5">
+                {failures.map((f, i) => (
+                  <li key={`${f.displayName}-${i}`}>
+                    <span className="font-medium">{f.displayName}:</span> {f.reason}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
           </div>
         ) : null}
 

@@ -3,9 +3,29 @@ import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
 import { env, isDemoMode } from "@/lib/env";
 import { createMetaProvider } from "./meta";
-import type { CampaignRecord, ProviderCredentials } from "./types";
+import { ProviderAuthError, ProviderRateLimitError, type CampaignRecord, type ProviderCredentials } from "./types";
 import { sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
 import type { DateRange } from "@/features/metrics/queries";
+
+/**
+ * Turns a thrown error into a short, human-readable reason — shown in the
+ * UI's partial-failure banner AND logged server-side, so a client's
+ * "couldn't reach this account" isn't a black box. Previously these errors
+ * were swallowed silently (just `partialFailure = true`), which made this
+ * exact situation impossible to diagnose without SSH access to Vercel logs.
+ */
+function reasonFor(e: unknown): string {
+  if (e instanceof ProviderAuthError) return "Meta rejected the token — it's likely expired or was revoked.";
+  if (e instanceof ProviderRateLimitError) return "Meta rate-limited this request — try again in a minute.";
+  if (e instanceof Error) return e.message;
+  return "Unknown error reaching Meta.";
+}
+
+function logMetaFailure(connectionLabel: string, e: unknown): void {
+  // The only signal an operator has when a live Meta pull fails in
+  // production is the Vercel function log — this is deliberate.
+  console.error(`[meta-live] ${connectionLabel}: ${reasonFor(e)}`, e);
+}
 
 /**
  * On-demand Meta reporting — pull-on-demand, not synced. Nothing runs in
@@ -51,12 +71,19 @@ export interface LiveCampaign {
   facts: AdFacts;
 }
 
+export interface MetaFetchFailure {
+  displayName: string;
+  reason: string;
+}
+
 export interface LiveMetaReport {
   totals: AdFacts;
   trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
   campaigns: LiveCampaign[];
   /** True if at least one connected account couldn't be reached (bad token, rate limit, etc). */
   partialFailure: boolean;
+  /** Per-account reason for each failure in partialFailure — shown in the UI banner. */
+  failures: MetaFetchFailure[];
 }
 
 async function resolveCreds(connection: {
@@ -152,7 +179,13 @@ export async function getLiveMetaReport(
   workspaceId: string,
   range: DateRange,
 ): Promise<LiveMetaReport> {
-  const empty: LiveMetaReport = { totals: sumAdFacts([]), trend: [], campaigns: [], partialFailure: false };
+  const empty: LiveMetaReport = {
+    totals: sumAdFacts([]),
+    trend: [],
+    campaigns: [],
+    partialFailure: false,
+    failures: [],
+  };
   if (isDemoMode) return empty;
 
   const db = getDb();
@@ -162,13 +195,16 @@ export async function getLiveMetaReport(
   });
   if (connections.length === 0) return empty;
 
-  let partialFailure = false;
+  const failures: MetaFetchFailure[] = [];
 
   const perConnection = await Promise.all(
     connections.map(async (connection) => {
       const creds = await resolveCreds(connection);
       if (!creds) {
-        partialFailure = true;
+        const reason =
+          "No access token available for this account — connect it in Settings or set META_USER_TOKEN.";
+        failures.push({ displayName: connection.displayName, reason });
+        logMetaFailure(connection.displayName, new Error(reason));
         return null;
       }
       const cacheKey = `meta:${connection.id}:${range.since}:${range.until}`;
@@ -176,8 +212,9 @@ export async function getLiveMetaReport(
         return await cached(cacheKey, INSIGHTS_TTL_MS, () =>
           fetchConnectionReport(creds, connection.externalAccountId, range),
         );
-      } catch {
-        partialFailure = true;
+      } catch (e) {
+        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
+        logMetaFailure(connection.displayName, e);
         return null;
       }
     }),
@@ -201,7 +238,7 @@ export async function getLiveMetaReport(
 
   const totals = sumAdFacts(campaigns.map((c) => c.facts));
 
-  return { totals, trend, campaigns, partialFailure };
+  return { totals, trend, campaigns, partialFailure: failures.length > 0, failures };
 }
 
 export interface PacingResult {
@@ -239,6 +276,7 @@ export async function getMetaPacing(workspaceId: string): Promise<PacingResult> 
       const creds = await resolveCreds(connection);
       if (!creds) {
         partialFailure = true;
+        logMetaFailure(connection.displayName, new Error("No access token available for pacing."));
         return null;
       }
       const cacheKey = `meta-pacing:${connection.id}:${todayIso}`;
@@ -246,8 +284,9 @@ export async function getMetaPacing(workspaceId: string): Promise<PacingResult> 
         return await cached(cacheKey, INSIGHTS_TTL_MS, () =>
           fetchConnectionReport(creds, connection.externalAccountId, range),
         );
-      } catch {
+      } catch (e) {
         partialFailure = true;
+        logMetaFailure(connection.displayName, e);
         return null;
       }
     }),
@@ -302,7 +341,8 @@ export async function checkMetaAccountsHealth(workspaceId: string): Promise<Acco
           const page = await provider.getDailyInsights(creds, connection.externalAccountId, range);
           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
           return spend > 0 ? "live" : "idle";
-        } catch {
+        } catch (e) {
+          logMetaFailure(connection.displayName, e);
           return "no_access";
         }
       });
