@@ -99,32 +99,26 @@ export async function AdsReport({
 
   campaigns.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
 
-  /** The important KPI set, one small card each, with plain-language info. */
+  /**
+   * Trimmed to the 4 most-used cards per group (was ~35 cards across 4
+   * groups) — per client request, less scrolling for the numbers people
+   * actually check day to day. The full set of underlying metrics is still
+   * computed and available in `adMetrics`/`totals` if these need expanding
+   * again later.
+   */
   type Kpi = { label: string; value: string; delta?: number; hint?: string; info: string };
   const overviewKpis: Kpi[] = [
     { label: "Spend", value: formatMoney(totals.spendMinor), delta: deltaOf(totals.spendMinor, prev.spendMinor), info: `Total money paid to ${label} to run ads this period.` },
     { label: "Revenue", value: formatMoney(totals.revenueMinor), delta: deltaOf(totals.revenueMinor, prev.revenueMinor), info: `Revenue ${label} reports as coming from its own ads (its own tracking).` },
     { label: "ROAS", value: `${adMetrics.roas(totals).toFixed(2)}x`, delta: metricDelta(adMetrics.roas), info: "Return On Ad Spend — revenue earned per ₹1 spent. Above 1x means the ads paid for themselves; higher is better." },
     { label: "Purchases", value: formatNumber(totals.purchases), delta: deltaOf(totals.purchases, prev.purchases), info: "Number of purchases attributed to these ads." },
-    { label: "CPA", value: formatMoney(adMetrics.cpa(totals)), delta: metricDelta(adMetrics.cpa, true), hint: "Lower is better", info: "Cost Per Acquisition — average ad spend needed to get one purchase." },
-    { label: "CPC", value: formatMoney(adMetrics.cpc(totals)), delta: metricDelta(adMetrics.cpc, true), hint: "Lower is better", info: "Cost Per Click — average amount paid each time someone clicks the ad." },
-    { label: "CPM", value: formatMoney(adMetrics.cpm(totals)), delta: metricDelta(adMetrics.cpm, true), hint: "Lower is better", info: "Cost per 1,000 impressions — what it costs just to show the ad to 1,000 people." },
-    { label: "CTR", value: formatPercent(adMetrics.ctr(totals), 2), delta: metricDelta(adMetrics.ctr), info: "Click-Through Rate — percentage of people who saw the ad and clicked it." },
-    { label: "Impressions", value: formatNumber(totals.impressions), delta: deltaOf(totals.impressions, prev.impressions), info: "Total number of times the ad was shown on screen." },
-    { label: "Clicks", value: formatNumber(totals.clicks), delta: deltaOf(totals.clicks, prev.clicks), info: "Total number of clicks the ad received." },
-    { label: "Reach", value: formatNumber(totals.reach), delta: deltaOf(totals.reach, prev.reach), info: "Number of unique people who saw the ad at least once (not counting repeats)." },
-    { label: "Frequency", value: adMetrics.frequency(totals).toFixed(2), delta: metricDelta(adMetrics.frequency), hint: "Impressions ÷ reach", info: "Average number of times each person saw the ad. If this climbs too high, people may get tired of seeing it (ad fatigue)." },
   ];
 
   const clicksKpis: Kpi[] = [
-    { label: "Inline link clicks", value: formatNumber(totals.inlineLinkClicks), delta: deltaOf(totals.inlineLinkClicks, prev.inlineLinkClicks), info: "Clicks on links inside the ad itself — excludes reactions, shares, and other engagement." },
     { label: "Outbound clicks", value: formatNumber(totals.outboundClicks), delta: deltaOf(totals.outboundClicks, prev.outboundClicks), info: "Clicks that sent someone away from the platform to the advertiser's website." },
     { label: "Outbound CTR", value: formatPercent(adMetrics.outboundCtr(totals), 2), delta: metricDelta(adMetrics.outboundCtr), info: "Share of impressions that resulted in an outbound click to the website." },
-    { label: "Cost / outbound click", value: formatMoney(adMetrics.costPerOutboundClick(totals)), delta: metricDelta(adMetrics.costPerOutboundClick, true), hint: "Lower is better", info: "Average ad spend needed to send one person to the website." },
-    { label: "Unique clicks", value: formatNumber(totals.uniqueClicks), delta: deltaOf(totals.uniqueClicks, prev.uniqueClicks), info: "Number of distinct people who clicked — unlike Clicks, this doesn't count the same person twice." },
     { label: "Landing page views", value: formatNumber(totals.landingPageViews), delta: deltaOf(totals.landingPageViews, prev.landingPageViews), info: "Number of times the linked page actually finished loading after a click." },
     { label: "Cost / landing page view", value: formatMoney(adMetrics.costPerLandingPageView(totals)), delta: metricDelta(adMetrics.costPerLandingPageView, true), hint: "Lower is better", info: "Average ad spend needed for one person to land on a fully-loaded page." },
-    { label: "Page engagements", value: formatNumber(totals.pageEngagements), delta: deltaOf(totals.pageEngagements, prev.pageEngagements), info: "Likes, comments, shares, and other reactions to the ad's page or post, combined." },
   ];
 
   const videoKpis: Kpi[] = [
@@ -132,23 +126,13 @@ export async function AdsReport({
     { label: "Hook rate", value: formatPercent(adMetrics.hookRate(totals)), delta: metricDelta(adMetrics.hookRate), hint: "3s video views ÷ impressions", info: "Of everyone who saw the video ad, what share watched at least 3 seconds — a sign the opening is grabbing attention." },
     { label: "Thruplays", value: formatNumber(totals.videoThruplays), delta: deltaOf(totals.videoThruplays, prev.videoThruplays), info: "Number of times the video played to completion, or for at least 15 seconds if longer." },
     { label: "Cost / thruplay", value: formatMoney(adMetrics.costPerThruplay(totals)), delta: metricDelta(adMetrics.costPerThruplay, true), hint: "Lower is better", info: "Average ad spend needed for one full (or 15s+) video view." },
-    { label: "Watched 50%", value: formatNumber(totals.videoP50), delta: deltaOf(totals.videoP50, prev.videoP50), info: "Number of views that reached the halfway point of the video." },
-    { label: "Watched 75%", value: formatNumber(totals.videoP75), delta: deltaOf(totals.videoP75, prev.videoP75), info: "Number of views that reached three-quarters of the video." },
-    { label: "Watched 100%", value: formatNumber(totals.videoP100), delta: deltaOf(totals.videoP100, prev.videoP100), info: "Number of views that watched the video all the way to the end." },
   ];
 
   const funnelKpis: Kpi[] = [
-    { label: "View content", value: formatNumber(totals.viewContent), delta: deltaOf(totals.viewContent, prev.viewContent), info: "Number of times someone viewed a product or content page after clicking the ad." },
-    { label: "Cost / view content", value: formatMoney(adMetrics.costPerViewContent(totals)), delta: metricDelta(adMetrics.costPerViewContent, true), hint: "Lower is better", info: "Average ad spend needed for one product-page view." },
     { label: "Add to cart", value: formatNumber(totals.addToCart), delta: deltaOf(totals.addToCart, prev.addToCart), info: "Number of times someone added a product to their cart." },
-    { label: "Cost / add to cart", value: formatMoney(adMetrics.costPerAddToCart(totals)), delta: metricDelta(adMetrics.costPerAddToCart, true), hint: "Lower is better", info: "Average ad spend needed for one add-to-cart." },
     { label: "Initiate checkout", value: formatNumber(totals.initiateCheckout), delta: deltaOf(totals.initiateCheckout, prev.initiateCheckout), info: "Number of times someone started the checkout process." },
-    { label: "Cost / checkout started", value: formatMoney(adMetrics.costPerInitiateCheckout(totals)), delta: metricDelta(adMetrics.costPerInitiateCheckout, true), hint: "Lower is better", info: "Average ad spend needed for one checkout to be started." },
-    { label: "Add payment info", value: formatNumber(totals.addPaymentInfo), delta: deltaOf(totals.addPaymentInfo, prev.addPaymentInfo), info: "Number of times someone entered payment details during checkout." },
-    { label: "Cost / payment info", value: formatMoney(adMetrics.costPerAddPaymentInfo(totals)), delta: metricDelta(adMetrics.costPerAddPaymentInfo, true), hint: "Lower is better", info: "Average ad spend needed for one payment-info entry." },
     { label: "Leads", value: formatNumber(totals.leads), delta: deltaOf(totals.leads, prev.leads), info: "Number of leads (form fills, sign-ups, etc.) attributed to these ads." },
     { label: "Cost / lead", value: formatMoney(adMetrics.costPerLead(totals)), delta: metricDelta(adMetrics.costPerLead, true), hint: "Lower is better", info: "Average ad spend needed for one lead." },
-    { label: "Cost / purchase", value: formatMoney(adMetrics.costPerPurchase(totals)), delta: metricDelta(adMetrics.costPerPurchase, true), hint: "Lower is better", info: "Same as CPA — average ad spend needed for one purchase, shown alongside the rest of the funnel." },
   ];
 
   const kpiGroups: Array<{ title: string; subtitle: string; items: Kpi[] }> = [

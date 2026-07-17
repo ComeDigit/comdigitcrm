@@ -79,7 +79,6 @@ interface MetaInsightRow {
   actions?: Array<{ action_type: string; value: string }>;
   action_values?: Array<{ action_type: string; value: string }>;
   outbound_clicks?: Array<{ action_type: string; value: string }>;
-  video_3_sec_watched_actions?: Array<{ action_type: string; value: string }>;
   video_thruplay_watched_actions?: Array<{ action_type: string; value: string }>;
   video_p50_watched_actions?: Array<{ action_type: string; value: string }>;
   video_p75_watched_actions?: Array<{ action_type: string; value: string }>;
@@ -98,7 +97,6 @@ const INSIGHT_FIELDS = [
   "actions",
   "action_values",
   "outbound_clicks",
-  "video_3_sec_watched_actions",
   "video_thruplay_watched_actions",
   "video_p50_watched_actions",
   "video_p75_watched_actions",
@@ -116,8 +114,13 @@ function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord 
     clicks: parseInt(r.clicks ?? "0", 10) || 0,
     purchases: actionValue(r.actions, "omni_purchase", "purchase"),
     reach: parseInt(r.reach ?? "0", 10) || 0,
-    videoViews3s: actionValue(r.video_3_sec_watched_actions, "video_view"),
-    videoPlays: actionValue(r.video_3_sec_watched_actions, "video_view"),
+    // Meta rejects "video_3_sec_watched_actions" as of API v21 (error #100 —
+    // "not valid for fields param"), so 3s-video-view counts are read from
+    // the general `actions` array's own "video_view" entry instead of the
+    // now-invalid dedicated field. `actions` is already fetched for every
+    // other conversion metric, so this adds no extra API surface.
+    videoViews3s: actionValue(r.actions, "video_view"),
+    videoPlays: actionValue(r.actions, "video_view"),
     inlineLinkClicks: parseInt(r.inline_link_clicks ?? "0", 10) || 0,
     outboundClicks: actionValue(r.outbound_clicks, "outbound_click"),
     uniqueClicks: parseInt(r.unique_clicks ?? "0", 10) || 0,
