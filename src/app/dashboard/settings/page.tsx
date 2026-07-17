@@ -3,6 +3,8 @@ import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
 import { isDemoMode } from "@/lib/env";
 import { getPrincipal } from "@/lib/auth/principal";
 import { getActiveWorkspaceId } from "@/lib/workspace";
+import { getWorkspaces } from "@/features/crm/queries";
+import { ConnectMetaTokenForm } from "@/features/integrations/components/forms";
 
 export const metadata = { title: "Settings" };
 
@@ -32,6 +34,7 @@ export default async function SettingsPage() {
   const principal = await getPrincipal();
   const workspaceId = await getActiveWorkspaceId();
   const connections = await getConnections(principal.orgId);
+  const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
   const metaConfigured = Boolean(process.env.META_APP_ID);
 
   return (
@@ -96,19 +99,25 @@ export default async function SettingsPage() {
                       </p>
                     ))}
                   </div>
-                  {canConnect ? (
-                    <a href={`/api/integrations/meta/start?workspace=${workspaceId}`}>
-                      <Button>Connect</Button>
-                    </a>
-                  ) : (
+                  <div className="flex items-center gap-2">
                     <Badge tone="outline">
                       {existing.length > 0
                         ? `${existing.length} connected`
-                        : p.envVar && !isDemoMode
-                          ? `Set ${p.envVar} to enable`
-                          : `Ready · live in ${p.phase}`}
+                        : canConnect
+                          ? "Not connected yet"
+                          : p.envVar && !isDemoMode
+                            ? `Set ${p.envVar} to enable`
+                            : `Ready · live in ${p.phase}`}
                     </Badge>
-                  )}
+                    {canConnect ? (
+                      <a href={`/api/integrations/meta/start?workspace=${workspaceId}`}>
+                        <Button>Connect</Button>
+                      </a>
+                    ) : null}
+                    {p.key === "meta" && !isDemoMode ? (
+                      <ConnectMetaTokenForm workspaces={workspaces} />
+                    ) : null}
+                  </div>
                 </div>
               );
             })}
