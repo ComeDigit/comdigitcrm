@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { AdsReport } from "@/features/ads/channel-page";
 import { resolveShareLink } from "@/features/share/actions";
+import { resolveDateRange } from "@/features/metrics/queries";
 import { getWorkspaceName } from "@/lib/workspace";
 import { ThemeToggle } from "@/components/shell/theme";
 import type { DemoProvider } from "@/features/demo-data/generator";
@@ -30,11 +31,14 @@ function isDemoProvider(value: string): value is DemoProvider {
 
 export default async function SharedReportPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ provider: string; token: string }>;
+  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
 }) {
   const { provider, token } = await params;
   if (!isDemoProvider(provider)) notFound();
+  const { range, preset } = resolveDateRange(await searchParams);
 
   const link = await resolveShareLink(provider, token);
   if (!link) {
@@ -63,7 +67,13 @@ export default async function SharedReportPage({
           <ThemeToggle />
         </div>
       </header>
-      <AdsReport workspaceId={link.workspaceId} provider={provider} label={providerLabel} />
+      <AdsReport
+        workspaceId={link.workspaceId}
+        provider={provider}
+        label={providerLabel}
+        range={range}
+        preset={preset}
+      />
     </>
   );
 }

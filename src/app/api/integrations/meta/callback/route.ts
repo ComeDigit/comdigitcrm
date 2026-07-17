@@ -5,13 +5,14 @@ import { authorize } from "@/lib/auth/authorize";
 import { encryptSecret } from "@/lib/crypto";
 import { getDb } from "@/lib/db";
 import { integrationConnections, integrationSecrets } from "@/db/schema";
-import { enqueue } from "@/lib/jobs/queue";
 
 /**
  * Meta OAuth — step 2. Verifies signed state + nonce cookie, exchanges
  * the code for a long-lived token (server-to-server; the token never
- * touches the browser), encrypts it at rest, records the connection,
- * and enqueues the first sync.
+ * touches the browser), encrypts it at rest, and records the connection.
+ * Meta reporting is on-demand (see features/integrations/meta-live.ts) —
+ * nothing is enqueued here; the first report is pulled live the moment
+ * someone opens the Meta Ads page or a share link for this workspace.
  */
 export async function GET(request: NextRequest) {
   const appId = process.env.META_APP_ID;
@@ -143,15 +144,6 @@ export async function GET(request: NextRequest) {
         rotatedAt: new Date(),
       },
     });
-
-  await enqueue({
-    type: "sync.meta.insights",
-    orgId: principal.orgId,
-    workspaceId,
-    connectionId: connection.id,
-    payload: { backfillDays: 90 },
-    dedupeKey: `sync:${connection.id}:initial`,
-  });
 
   const response = NextResponse.redirect(`${origin}/dashboard/settings?meta=connected`);
   response.cookies.delete("meta_oauth_nonce");

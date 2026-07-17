@@ -1,12 +1,14 @@
 import { Topbar } from "@/components/shell/topbar";
 import { KpiCard } from "@/components/charts/kpi-card";
+import { DateRangePicker } from "@/components/charts/date-range-picker";
 import { MoneyAreaChart, CountBarChart } from "@/components/charts/charts";
 import { Card, CardHeader, Badge } from "@/components/ui/primitives";
 import {
   getAdDaily,
   getShopDaily,
-  lastNDays,
   previousPeriod,
+  resolveDateRange,
+  formatRangeLabel,
 } from "@/features/metrics/queries";
 import {
   adMetrics,
@@ -27,9 +29,14 @@ interface Kpi {
 }
 
 /** Agency overview: full blended + ads + store KPI set for the active client. */
-export default async function OverviewPage() {
+export default async function OverviewPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
+}) {
   const workspaceId = await getActiveWorkspaceId();
-  const range = lastNDays(30);
+  const { range, preset } = resolveDateRange(await searchParams);
+  const rangeLabel = formatRangeLabel(range, preset);
   const prevRange = previousPeriod(range);
 
   const [ads, shop, prevAds, prevShop] = await Promise.all([
@@ -100,6 +107,8 @@ export default async function OverviewPage() {
     <>
       <Topbar title={`Overview — ${workspaceName}`} />
       <main className="space-y-6 px-6 py-6">
+        <DateRangePicker preset={preset} range={range} />
+
         <Card
           className={
             isProfitable
@@ -108,7 +117,8 @@ export default async function OverviewPage() {
           }
         >
           <p className="text-[13px] leading-relaxed">
-            In the last 30 days, <span className="font-semibold">{workspaceName}</span>{" "}
+            <span className="font-medium text-muted">{rangeLabel} — </span>
+            <span className="font-semibold">{workspaceName}</span>{" "}
             made <span className="font-semibold">{formatMoney(s.netSalesMinor)}</span> in
             revenue from <span className="font-semibold">{s.orders}</span> orders,
             and spent <span className="font-semibold">{formatMoney(a.spendMinor)}</span> on
@@ -123,7 +133,7 @@ export default async function OverviewPage() {
 
         <section>
           <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
-            Blended · last 30 days vs previous 30
+            Blended · {rangeLabel} vs previous period
           </p>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {blendedKpis.map((k) => (
@@ -157,7 +167,7 @@ export default async function OverviewPage() {
         <Card>
           <CardHeader
             title="Revenue vs ad spend"
-            subtitle="Daily, last 30 days"
+            subtitle={`Daily, ${rangeLabel}`}
             action={<Badge tone="outline">All channels</Badge>}
           />
           <div className="px-3 pb-4">
@@ -173,13 +183,13 @@ export default async function OverviewPage() {
 
         <div className="grid gap-4 lg:grid-cols-2">
           <Card>
-            <CardHeader title="Orders" subtitle="Daily, last 30 days" />
+            <CardHeader title="Orders" subtitle={`Daily, ${rangeLabel}`} />
             <div className="px-3 pb-4">
               <CountBarChart data={ordersTrend} dataKey="orders" label="Orders" />
             </div>
           </Card>
           <Card>
-            <CardHeader title="Channel efficiency" subtitle="Last 30 days" />
+            <CardHeader title="Channel efficiency" subtitle={rangeLabel} />
             <div className="space-y-3 px-5 pb-5 pt-2">
               {(["meta", "google_ads", "tiktok"] as const).map((provider) => {
                 const rows = ads.filter((r) => r.provider === provider);

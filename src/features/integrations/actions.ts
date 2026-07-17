@@ -7,7 +7,6 @@ import { integrationConnections, integrationSecrets } from "@/db/schema";
 import { authorize, AuthorizationError } from "@/lib/auth/authorize";
 import { getPrincipal } from "@/lib/auth/principal";
 import { encryptSecret } from "@/lib/crypto";
-import { enqueue } from "@/lib/jobs/queue";
 import { checkMetaTokenHealth, type MetaTokenHealth } from "./meta";
 
 /**
@@ -184,14 +183,9 @@ export async function connectMetaAccounts(
           },
         });
 
-      await enqueue({
-        type: "sync.meta.insights",
-        orgId: principal.orgId,
-        workspaceId: sel.workspaceId,
-        connectionId: connection.id,
-        payload: { backfillDays: 90 },
-        dedupeKey: `sync:${connection.id}:initial`,
-      });
+      // Meta reporting is on-demand now (see features/integrations/meta-live.ts)
+      // — no background sync job to enqueue. The Meta Ads page and share
+      // links pull live from Graph the moment someone opens them.
     }
   } catch (e) {
     if (e instanceof AuthorizationError) {
@@ -262,7 +256,10 @@ export async function connectAgencyMetaAccounts(
     for (const sel of selections) {
       authorize(principal, "connections.manage", sel.workspaceId);
 
-      const [connection] = await db
+      // Meta reporting is on-demand now (see features/integrations/meta-live.ts)
+      // — no background sync job to enqueue, so the inserted row's id isn't
+      // needed here.
+      await db
         .insert(integrationConnections)
         .values({
           orgId: principal.orgId,
@@ -282,17 +279,7 @@ export async function connectAgencyMetaAccounts(
             integrationConnections.externalAccountId,
           ],
           set: { status: "active", lastError: null, displayName: sel.name },
-        })
-        .returning();
-
-      await enqueue({
-        type: "sync.meta.insights",
-        orgId: principal.orgId,
-        workspaceId: sel.workspaceId,
-        connectionId: connection.id,
-        payload: { backfillDays: 90 },
-        dedupeKey: `sync:${connection.id}:initial`,
-      });
+        });
     }
   } catch (e) {
     if (e instanceof AuthorizationError) {

@@ -1,17 +1,28 @@
 import { Topbar } from "@/components/shell/topbar";
 import { KpiCard } from "@/components/charts/kpi-card";
+import { DateRangePicker } from "@/components/charts/date-range-picker";
 import { MoneyAreaChart, CountBarChart } from "@/components/charts/charts";
 import { Card, CardHeader } from "@/components/ui/primitives";
-import { getShopDaily, lastNDays, previousPeriod } from "@/features/metrics/queries";
+import {
+  getShopDaily,
+  previousPeriod,
+  resolveDateRange,
+  formatRangeLabel,
+} from "@/features/metrics/queries";
 import { shopMetrics, sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
 import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
 
 export const metadata = { title: "Shopify" };
 
-export default async function ShopifyPage() {
+export default async function ShopifyPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
+}) {
   const workspaceId = await getActiveWorkspaceId();
-  const range = lastNDays(30);
+  const { range, preset } = resolveDateRange(await searchParams);
+  const rangeLabel = formatRangeLabel(range, preset);
   const [rows, prevRows] = await Promise.all([
     getShopDaily(workspaceId, range),
     getShopDaily(workspaceId, previousPeriod(range)),
@@ -57,9 +68,11 @@ export default async function ShopifyPage() {
     <>
       <Topbar title={`Shopify — ${workspaceName}`} />
       <main className="space-y-6 px-6 py-6">
+        <DateRangePicker preset={preset} range={range} />
+
         <div>
           <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
-            Last 30 days · vs previous 30 days · hover the ⓘ on any card for a plain-English explanation
+            {rangeLabel} · vs previous period · hover the ⓘ on any card for a plain-English explanation
           </p>
           <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6">
             {kpis.map((k) => (
@@ -83,13 +96,13 @@ export default async function ShopifyPage() {
 
         <div className="grid gap-4 lg:grid-cols-2">
           <Card>
-            <CardHeader title="New customers" subtitle="Daily, last 30 days" />
+            <CardHeader title="New customers" subtitle={`Daily, ${rangeLabel}`} />
             <div className="px-3 pb-4">
               <CountBarChart data={customerTrend} dataKey="new" label="New customers" />
             </div>
           </Card>
           <Card>
-            <CardHeader title="Returning customers" subtitle="Daily, last 30 days" />
+            <CardHeader title="Returning customers" subtitle={`Daily, ${rangeLabel}`} />
             <div className="px-3 pb-4">
               <CountBarChart data={customerTrend} dataKey="returning" label="Returning customers" />
             </div>

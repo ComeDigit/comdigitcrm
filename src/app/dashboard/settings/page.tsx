@@ -9,6 +9,7 @@ import {
   ConnectMetaAgencyForm,
 } from "@/features/integrations/components/forms";
 import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
+import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
 import { ShareLinksManager } from "@/features/share/components/manager";
 
 export const metadata = { title: "Settings" };
@@ -49,6 +50,31 @@ export default async function SettingsPage() {
     agencyTokenHealth?.configured &&
     (!agencyTokenHealth.valid ||
       (agencyTokenHealth.daysUntilExpiry !== null && agencyTokenHealth.daysUntilExpiry <= 7));
+
+  // Meta is reported on-demand now — there's no "last synced" timestamp to
+  // show anymore, so instead probe each connected account live (cached 5min)
+  // and show whether it's actually reachable right now.
+  const metaWorkspaceIds = [
+    ...new Set(connections.filter((c) => c.provider === "meta").map((c) => c.workspaceId)),
+  ];
+  const metaHealthByConnection = new Map<string, AccountHealth>();
+  if (!isDemoMode) {
+    const healthResults = await Promise.all(metaWorkspaceIds.map((wsId) => checkMetaAccountsHealth(wsId)));
+    for (const list of healthResults) {
+      for (const r of list) metaHealthByConnection.set(r.connectionId, r.health);
+    }
+  }
+  const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
+    if (h === "live") return "positive";
+    if (h === "no_access") return "negative";
+    return "outline";
+  };
+  const healthLabel = (h: AccountHealth | undefined): string => {
+    if (h === "live") return "live · spend detected recently";
+    if (h === "idle") return "reachable · no recent spend";
+    if (h === "no_access") return "unreachable — check token";
+    return "checking…";
+  };
 
   return (
     <>
@@ -121,18 +147,20 @@ export default async function SettingsPage() {
                   <div>
                     <span className="font-medium">{p.label}</span>
                     {existing.map((c) => (
-                      <p key={c.id} className="text-xs text-muted">
-                        {c.displayName} ·{" "}
-                        <span
-                          className={
-                            c.status === "active" ? "text-positive" : "text-muted"
-                          }
-                        >
-                          {c.status}
+                      <p key={c.id} className="flex items-center gap-1.5 text-xs text-muted">
+                        <span>
+                          {c.displayName} ·{" "}
+                          <span className={c.status === "active" ? "text-positive" : "text-muted"}>
+                            {c.status}
+                          </span>
                         </span>
-                        {c.lastSyncAt
-                          ? ` · synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
-                          : ""}
+                        {p.key === "meta" && !isDemoMode ? (
+                          <Badge tone={healthTone(metaHealthByConnection.get(c.id))}>
+                            {healthLabel(metaHealthByConnection.get(c.id))}
+                          </Badge>
+                        ) : c.lastSyncAt ? (
+                          `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
+                        ) : null}
                       </p>
                     ))}
                   </div>

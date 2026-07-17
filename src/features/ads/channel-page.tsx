@@ -1,12 +1,26 @@
 import { Topbar } from "@/components/shell/topbar";
 import { KpiCard } from "@/components/charts/kpi-card";
+import { DateRangePicker } from "@/components/charts/date-range-picker";
 import { MoneyAreaChart } from "@/components/charts/charts";
 import { Card, CardHeader, Badge } from "@/components/ui/primitives";
-import { getAdDaily, lastNDays, previousPeriod } from "@/features/metrics/queries";
+import {
+  getAdDaily,
+  getCampaignsWithFacts,
+  previousPeriod,
+  resolveDateRange,
+  formatRangeLabel,
+  type DateRange,
+  type RangePreset,
+  type CampaignWithFacts,
+} from "@/features/metrics/queries";
+import { getLiveMetaReport, getMetaPacing } from "@/features/integrations/meta-live";
 import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
-import { demoCampaigns, type DemoProvider } from "@/features/demo-data/generator";
+import type { DemoProvider } from "@/features/demo-data/generator";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
 import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
+import { isDemoMode } from "@/lib/env";
+
+type ReportSearchParams = Promise<{ preset?: string; since?: string; until?: string }>;
 
 /**
  * The read-only report body — KPI grid + spend/revenue chart + campaign
@@ -22,33 +36,65 @@ export async function AdsReport({
   workspaceId,
   provider,
   label,
+  range,
+  preset,
 }: {
   workspaceId: string;
   provider: DemoProvider;
   label: string;
+  range: DateRange;
+  preset: RangePreset;
 }) {
-  const range = lastNDays(30);
-  const [rows, prevRows] = await Promise.all([
-    getAdDaily(workspaceId, range, [provider]),
-    getAdDaily(workspaceId, previousPeriod(range), [provider]),
-  ]);
-  const totals = sumAdFacts(rows);
-  const prev = sumAdFacts(prevRows);
+  const rangeLabel = formatRangeLabel(range, preset);
+
+  let totals: AdFacts;
+  let prev: AdFacts;
+  let trend: Array<{ date: string; spend: number; revenue: number }>;
+  let campaigns: CampaignWithFacts[];
+  let partialFailure = false;
+  let pacing: { activeDailyBudgetMinor: number; spendTodayMinor: number } | null = null;
+
+  if (provider === "meta" && !isDemoMode) {
+    // Meta is on-demand/live per client instruction — no local historical
+    // storage. Two live pulls (current + previous period) so the delta
+    // comparisons on every card keep working; a few extra Graph API calls
+    // per page view is an accepted trade-off (see meta-live.ts). Pacing is
+    // always about today regardless of the selected range, so it's a
+    // separate fetch.
+    const [current, previous, pacingResult] = await Promise.all([
+      getLiveMetaReport(workspaceId, range),
+      getLiveMetaReport(workspaceId, previousPeriod(range)),
+      getMetaPacing(workspaceId),
+    ]);
+    totals = current.totals;
+    prev = previous.totals;
+    trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
+    campaigns = current.campaigns;
+    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
+    pacing = pacingResult;
+  } else {
+    const [rows, prevRows, dbCampaigns] = await Promise.all([
+      getAdDaily(workspaceId, range, [provider]),
+      getAdDaily(workspaceId, previousPeriod(range), [provider]),
+      getCampaignsWithFacts(workspaceId, provider, range),
+    ]);
+    totals = sumAdFacts(rows);
+    prev = sumAdFacts(prevRows);
+    trend = rows
+      .map((r) => ({ date: r.date, spend: r.spendMinor, revenue: r.revenueMinor }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+    campaigns = dbCampaigns;
+  }
+
   const deltaOf = (curr: number, p: number) => (p > 0 ? (curr - p) / p : 0);
   const metricDelta = (fn: (f: AdFacts) => number, invert = false) => {
     const d = deltaOf(fn(totals), fn(prev));
     return invert ? -d : d;
   };
 
-  const trend = rows
-    .map((r) => ({ date: r.date, spend: r.spendMinor, revenue: r.revenueMinor }))
-    .sort((a, b) => a.date.localeCompare(b.date));
+  campaigns.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
 
-  const campaigns = demoCampaigns(workspaceId, provider).sort(
-    (a, b) => b.facts.spendMinor - a.facts.spendMinor,
-  );
-
-  /** The important KPI set, one small card each, with plain-language info. vs previous 30 days. */
+  /** The important KPI set, one small card each, with plain-language info. */
   type Kpi = { label: string; value: string; delta?: number; hint?: string; info: string };
   const overviewKpis: Kpi[] = [
     { label: "Spend", value: formatMoney(totals.spendMinor), delta: deltaOf(totals.spendMinor, prev.spendMinor), info: `Total money paid to ${label} to run ads this period.` },
@@ -101,30 +147,56 @@ export async function AdsReport({
   ];
 
   const kpiGroups: Array<{ title: string; subtitle: string; items: Kpi[] }> = [
-    { title: "Overview", subtitle: "Last 30 days · vs previous 30 days", items: overviewKpis },
+    { title: "Overview", subtitle: `${rangeLabel} · vs previous period`, items: overviewKpis },
     { title: "Clicks & landing", subtitle: "Off-platform engagement", items: clicksKpis },
     { title: "Video", subtitle: "Watch-through funnel", items: videoKpis },
     { title: "Conversion funnel", subtitle: "Product → purchase, each step with its own cost", items: funnelKpis },
   ];
+
+  if (pacing) {
+    const pacingPct = pacing.activeDailyBudgetMinor > 0
+      ? pacing.spendTodayMinor / pacing.activeDailyBudgetMinor
+      : 0;
+    const pacingKpis: Kpi[] = [
+      { label: "Active daily budget", value: formatMoney(pacing.activeDailyBudgetMinor), info: "Total daily budget across every campaign that's currently active — what you're set up to spend today if everything runs at full budget." },
+      { label: "Spent today", value: formatMoney(pacing.spendTodayMinor), info: "Actual spend so far today, across every active Meta account — resets at midnight." },
+      { label: "Pacing", value: formatPercent(pacingPct), hint: "Spent today ÷ active daily budget", info: "How much of today's active budget has been spent so far. Well under 100% partway through the day is normal; if it's near or over 100% early in the day, campaigns may exhaust budget before midnight." },
+    ];
+    kpiGroups.push({
+      title: "Pacing",
+      subtitle: "Today only — independent of the date range above",
+      items: pacingKpis,
+    });
+  }
 
   const th = "px-3 py-2 text-right font-medium whitespace-nowrap";
   const td = "px-3 py-2.5 text-right tabular-nums whitespace-nowrap";
 
   /** Meta's three campaign-grain quality signals — coloured so a below-average
    * ranking is easy to spot without reading the label. */
-  const rankTone = (rank?: string): "positive" | "neutral" | "negative" | "outline" => {
+  const rankTone = (rank?: string | null): "positive" | "neutral" | "negative" | "outline" => {
     if (rank === "above_average") return "positive";
     if (rank === "below_average") return "negative";
     if (rank === "average") return "neutral";
     return "outline";
   };
-  const rankLabel = (rank?: string) => (rank ? rank.replace(/_/g, " ") : "—");
+  const rankLabel = (rank?: string | null) => (rank ? rank.replace(/_/g, " ") : "—");
 
   return (
     <main className="space-y-6 px-6 py-6">
+        <DateRangePicker preset={preset} range={range} />
+
+        {partialFailure ? (
+          <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
+            Couldn&apos;t reach one or more connected Meta accounts just now (expired token, rate
+            limit, or Meta API issue) — numbers below may be incomplete. This report is pulled
+            live on every page view, so refreshing may resolve it.
+          </div>
+        ) : null}
+
         <div className="space-y-5">
           <p className="text-xs font-medium uppercase tracking-widest text-muted">
-            Last 30 days · vs previous 30 days · hover the ⓘ on any card for a plain-English explanation
+            {rangeLabel} · vs previous period · hover the ⓘ on any card for a plain-English explanation
           </p>
           {kpiGroups.map((group) => (
             <div key={group.title}>
@@ -141,7 +213,7 @@ export async function AdsReport({
         </div>
 
         <Card>
-          <CardHeader title="Spend vs attributed revenue" subtitle="Daily, last 30 days" />
+          <CardHeader title="Spend vs attributed revenue" subtitle={`Daily, ${rangeLabel}`} />
           <div className="px-3 pb-4">
             <MoneyAreaChart
               data={trend}
@@ -156,7 +228,7 @@ export async function AdsReport({
         <Card>
           <CardHeader
             title="Campaigns"
-            subtitle="Last 30 days · all key KPIs per campaign · sorted by spend"
+            subtitle={`${rangeLabel} · all key KPIs per campaign · sorted by spend`}
           />
           <div className="overflow-x-auto px-2 pb-3">
             <table className="w-full text-[13px]">
@@ -179,6 +251,15 @@ export async function AdsReport({
                 </tr>
               </thead>
               <tbody>
+                {campaigns.length === 0 ? (
+                  <tr>
+                    <td colSpan={14} className="px-3 py-6 text-center text-xs text-muted">
+                      {provider === "meta" && !isDemoMode
+                        ? "No campaigns found for this date range — connect a Meta ad account in Settings, or try a wider date range."
+                        : "No campaigns synced for this client yet — connect an ad account in Settings and wait for the first sync to complete."}
+                    </td>
+                  </tr>
+                ) : null}
                 {campaigns.map((c) => {
                   const f = c.facts;
                   const roas = adMetrics.roas(f);
@@ -243,16 +324,25 @@ export async function AdsReport({
 export async function AdsChannelPage({
   provider,
   label,
+  searchParams,
 }: {
   provider: DemoProvider;
   label: string;
+  searchParams: ReportSearchParams;
 }) {
   const workspaceId = await getActiveWorkspaceId();
   const workspaceName = await getWorkspaceName(workspaceId);
+  const { range, preset } = resolveDateRange(await searchParams);
   return (
     <>
       <Topbar title={`${label} — ${workspaceName}`} />
-      <AdsReport workspaceId={workspaceId} provider={provider} label={label} />
+      <AdsReport
+        workspaceId={workspaceId}
+        provider={provider}
+        label={label}
+        range={range}
+        preset={preset}
+      />
     </>
   );
 }
