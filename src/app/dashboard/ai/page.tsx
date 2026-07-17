@@ -1,9 +1,11 @@
 import { Topbar } from "@/components/shell/topbar";
 import { Card, CardHeader, Badge } from "@/components/ui/primitives";
 import { getAdDaily, getShopDaily, lastNDays, previousPeriod } from "@/features/metrics/queries";
-import { adMetrics, blendedMetrics, sumAdFacts, sumShopFacts } from "@/lib/metrics/definitions";
+import { getLiveMetaReport } from "@/features/integrations/meta-live";
+import { adMetrics, blendedMetrics, sumAdFacts, sumShopFacts, type AdFacts } from "@/lib/metrics/definitions";
 import { formatMoney, formatPercent } from "@/lib/utils";
 import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
+import { isDemoMode } from "@/lib/env";
 
 export const metadata = { title: "AI Copilot" };
 
@@ -22,18 +24,32 @@ interface Insight {
 async function computeInsights(workspaceId: string): Promise<Insight[]> {
   const range = lastNDays(7);
   const prevRange = previousPeriod(range);
-  const [ads, prevAds, shop, prevShop] = await Promise.all([
-    getAdDaily(workspaceId, range),
-    getAdDaily(workspaceId, prevRange),
+  // Meta is pulled live now (features/integrations/meta-live.ts) — the
+  // database only carries Google/TikTok in live mode, so it's queried
+  // separately here and merged in, same pattern as the Overview page.
+  const dbProviders = isDemoMode
+    ? (["meta", "google_ads", "tiktok"] as const)
+    : (["google_ads", "tiktok"] as const);
+  const [dbAds, prevDbAds, shop, prevShop, metaCurrent, metaPrevious] = await Promise.all([
+    getAdDaily(workspaceId, range, [...dbProviders]),
+    getAdDaily(workspaceId, prevRange, [...dbProviders]),
     getShopDaily(workspaceId, range),
     getShopDaily(workspaceId, prevRange),
+    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, range),
+    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, prevRange),
   ]);
 
   const insights: Insight[] = [];
 
   for (const provider of ["meta", "google_ads", "tiktok"] as const) {
-    const now = sumAdFacts(ads.filter((a) => a.provider === provider));
-    const before = sumAdFacts(prevAds.filter((a) => a.provider === provider));
+    const now: AdFacts =
+      provider === "meta"
+        ? (metaCurrent?.totals ?? sumAdFacts([]))
+        : sumAdFacts(dbAds.filter((a) => a.provider === provider));
+    const before: AdFacts =
+      provider === "meta"
+        ? (metaPrevious?.totals ?? sumAdFacts([]))
+        : sumAdFacts(prevDbAds.filter((a) => a.provider === provider));
     const roasNow = adMetrics.roas(now);
     const roasBefore = adMetrics.roas(before);
     if (roasBefore > 0) {
@@ -57,8 +73,8 @@ async function computeInsights(workspaceId: string): Promise<Insight[]> {
 
   const shopNow = sumShopFacts(shop);
   const shopBefore = sumShopFacts(prevShop);
-  const adsNow = sumAdFacts(ads);
-  const adsBefore = sumAdFacts(prevAds);
+  const adsNow = sumAdFacts(metaCurrent ? [sumAdFacts(dbAds), metaCurrent.totals] : dbAds);
+  const adsBefore = sumAdFacts(metaPrevious ? [sumAdFacts(prevDbAds), metaPrevious.totals] : prevDbAds);
   const merNow = blendedMetrics.mer(shopNow, adsNow);
   const merBefore = blendedMetrics.mer(shopBefore, adsBefore);
   if (merBefore > 0) {
