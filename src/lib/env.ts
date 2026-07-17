@@ -11,6 +11,13 @@ const serverSchema = z.object({
   SUPABASE_SECRET_KEY: z.string().min(1).optional(),
   APP_ENCRYPTION_KEY: z.string().min(32).optional(),
   CRON_SECRET: z.string().min(16).optional(),
+  /** One agency-wide long-lived Meta user token — sees every ad account the
+   *  agency admin manages. Optional: per-client connections (OAuth or a
+   *  pasted token) work without it; sync falls back to this only when a
+   *  connection has no per-client credential of its own. */
+  META_USER_TOKEN: z.string().min(20).optional(),
+  META_APP_ID: z.string().min(1).optional(),
+  META_APP_SECRET: z.string().min(1).optional(),
 });
 
 const clientSchema = z.object({
@@ -24,6 +31,9 @@ export const env = {
     SUPABASE_SECRET_KEY: process.env.SUPABASE_SECRET_KEY,
     APP_ENCRYPTION_KEY: process.env.APP_ENCRYPTION_KEY,
     CRON_SECRET: process.env.CRON_SECRET,
+    META_USER_TOKEN: process.env.META_USER_TOKEN,
+    META_APP_ID: process.env.META_APP_ID,
+    META_APP_SECRET: process.env.META_APP_SECRET,
   }),
   ...clientSchema.parse({
     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,

@@ -13,6 +13,24 @@ export interface AdFacts {
   reach: number;
   videoViews3s: number;
   videoPlays: number;
+  /** Clicks on links inside the ad (excludes reactions/shares/etc). */
+  inlineLinkClicks: number;
+  /** Clicks that sent someone off-platform to the advertiser's site. */
+  outboundClicks: number;
+  /** Deduplicated clicking people, vs. `clicks` which counts every click. */
+  uniqueClicks: number;
+  landingPageViews: number;
+  /** Page/post likes, comments, shares, etc. combined. */
+  pageEngagements: number;
+  videoThruplays: number;
+  videoP50: number;
+  videoP75: number;
+  videoP100: number;
+  viewContent: number;
+  addToCart: number;
+  initiateCheckout: number;
+  addPaymentInfo: number;
+  leads: number;
 }
 
 export interface ShopFacts {
@@ -35,6 +53,17 @@ export const adMetrics = {
   cpa: (f: AdFacts) => ratio(f.spendMinor, f.purchases),
   frequency: (f: AdFacts) => ratio(f.impressions, f.reach),
   hookRate: (f: AdFacts) => ratio(f.videoViews3s, f.impressions),
+  /** Share of impressions that resulted in an outbound click. */
+  outboundCtr: (f: AdFacts) => ratio(f.outboundClicks, f.impressions),
+  costPerOutboundClick: (f: AdFacts) => ratio(f.spendMinor, f.outboundClicks),
+  costPerLandingPageView: (f: AdFacts) => ratio(f.spendMinor, f.landingPageViews),
+  costPerThruplay: (f: AdFacts) => ratio(f.spendMinor, f.videoThruplays),
+  costPerViewContent: (f: AdFacts) => ratio(f.spendMinor, f.viewContent),
+  costPerAddToCart: (f: AdFacts) => ratio(f.spendMinor, f.addToCart),
+  costPerInitiateCheckout: (f: AdFacts) => ratio(f.spendMinor, f.initiateCheckout),
+  costPerAddPaymentInfo: (f: AdFacts) => ratio(f.spendMinor, f.addPaymentInfo),
+  costPerLead: (f: AdFacts) => ratio(f.spendMinor, f.leads),
+  costPerPurchase: (f: AdFacts) => ratio(f.spendMinor, f.purchases),
 } as const;
 
 export const shopMetrics = {
@@ -54,6 +83,31 @@ export const blendedMetrics = {
     shop.netSalesMinor - ads.spendMinor,
 } as const;
 
+const EMPTY_AD_FACTS: AdFacts = {
+  spendMinor: 0,
+  revenueMinor: 0,
+  impressions: 0,
+  clicks: 0,
+  purchases: 0,
+  reach: 0,
+  videoViews3s: 0,
+  videoPlays: 0,
+  inlineLinkClicks: 0,
+  outboundClicks: 0,
+  uniqueClicks: 0,
+  landingPageViews: 0,
+  pageEngagements: 0,
+  videoThruplays: 0,
+  videoP50: 0,
+  videoP75: 0,
+  videoP100: 0,
+  viewContent: 0,
+  addToCart: 0,
+  initiateCheckout: 0,
+  addPaymentInfo: 0,
+  leads: 0,
+};
+
 export function sumAdFacts(rows: AdFacts[]): AdFacts {
   return rows.reduce<AdFacts>(
     (acc, r) => ({
@@ -65,17 +119,22 @@ export function sumAdFacts(rows: AdFacts[]): AdFacts {
       reach: acc.reach + r.reach,
       videoViews3s: acc.videoViews3s + r.videoViews3s,
       videoPlays: acc.videoPlays + r.videoPlays,
+      inlineLinkClicks: acc.inlineLinkClicks + r.inlineLinkClicks,
+      outboundClicks: acc.outboundClicks + r.outboundClicks,
+      uniqueClicks: acc.uniqueClicks + r.uniqueClicks,
+      landingPageViews: acc.landingPageViews + r.landingPageViews,
+      pageEngagements: acc.pageEngagements + r.pageEngagements,
+      videoThruplays: acc.videoThruplays + r.videoThruplays,
+      videoP50: acc.videoP50 + r.videoP50,
+      videoP75: acc.videoP75 + r.videoP75,
+      videoP100: acc.videoP100 + r.videoP100,
+      viewContent: acc.viewContent + r.viewContent,
+      addToCart: acc.addToCart + r.addToCart,
+      initiateCheckout: acc.initiateCheckout + r.initiateCheckout,
+      addPaymentInfo: acc.addPaymentInfo + r.addPaymentInfo,
+      leads: acc.leads + r.leads,
     }),
-    {
-      spendMinor: 0,
-      revenueMinor: 0,
-      impressions: 0,
-      clicks: 0,
-      purchases: 0,
-      reach: 0,
-      videoViews3s: 0,
-      videoPlays: 0,
-    },
+    { ...EMPTY_AD_FACTS },
   );
 }
 

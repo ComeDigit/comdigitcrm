@@ -164,6 +164,40 @@ export const webhookInbox = pgTable(
   (t) => [uniqueIndex("webhook_inbox_event_uq").on(t.provider, t.eventId)],
 );
 
+/**
+ * Public, no-login share links. A share link exposes ONE workspace's ONE
+ * provider report at /share/:provider/:token — never the full dashboard,
+ * never the workspace switcher, never another client's data. The raw token
+ * is generated once at creation time and handed to the caller; only its
+ * SHA-256 hash is stored here (same pattern as `invites.tokenHash`), so a
+ * database leak can't be used to mint working share URLs. Revoke by setting
+ * revokedAt — rows are never deleted, so view history survives revocation.
+ */
+export const shareLinks = pgTable(
+  "share_links",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    provider: providerEnum("provider").notNull(),
+    /** Optional human label shown only in the internal management list. */
+    label: text("label"),
+    tokenHash: text("token_hash").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    lastViewedAt: timestamp("last_viewed_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("share_links_token_hash_uq").on(t.tokenHash),
+    index("share_links_workspace_idx").on(t.workspaceId),
+    index("share_links_org_idx").on(t.orgId),
+  ],
+);
+
 /** Append-only audit log, written by mutation helpers — never by hand. */
 export const auditLog = pgTable(
   "audit_log",

@@ -8,6 +8,7 @@ import {
   syncCursors,
 } from "@/db/schema";
 import { decryptSecret } from "@/lib/crypto";
+import { env } from "@/lib/env";
 import { createMetaProvider } from "./meta";
 import { createMockAdsProvider } from "./mock";
 import type { AdsProvider, ProviderCredentials } from "./types";
@@ -18,8 +19,13 @@ import type { ClaimedJob } from "@/lib/jobs/queue";
  * Sync job handler: connection → provider → entities + daily facts.
  * Idempotent by construction — campaigns and insights are natural-key
  * upserts, so re-runs and restatement lookbacks are safe.
- * Live credentials → real provider; none → deterministic mock (lets the
- * whole pipeline be exercised end-to-end before any real connector).
+ * Credential precedence for Meta: a per-connection secret (OAuth or a
+ * pasted token) wins if one exists; otherwise falls back to the one
+ * agency-wide META_USER_TOKEN, if set; otherwise the deterministic mock
+ * (lets the whole pipeline be exercised end-to-end before any real
+ * connector). This lets per-client connections and one shared agency
+ * token coexist — a connection only needs its own secret row if it's
+ * meant to override the shared token.
  */
 
 const LOOKBACK_DAYS = 28;
@@ -49,6 +55,8 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
   });
 
   let creds: ProviderCredentials = { accessToken: "mock" };
+  let hasLiveCreds = false;
+
   if (secret?.encryptedPayload) {
     const parsed = JSON.parse(decryptSecret(secret.encryptedPayload)) as {
       accessToken: string;
@@ -57,9 +65,16 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
       accessToken: parsed.accessToken,
       extra: { currency: connection.currencyCode ?? "INR" },
     };
+    hasLiveCreds = true;
+  } else if (connection.provider === "meta" && env.META_USER_TOKEN) {
+    creds = {
+      accessToken: env.META_USER_TOKEN,
+      extra: { currency: connection.currencyCode ?? "INR" },
+    };
+    hasLiveCreds = true;
   }
 
-  const provider = resolveProvider(connection.provider, Boolean(secret?.encryptedPayload));
+  const provider = resolveProvider(connection.provider, hasLiveCreds);
   if (!provider) throw new Error(`no ads provider for ${connection.provider}`);
 
   try {
@@ -71,7 +86,12 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
         connection.externalAccountId,
         campaignCursor,
       );
+      // Best-effort campaign-grain rankings — never blocks the entity sync.
+      const rankings = provider.getRankings
+        ? await provider.getRankings(creds, connection.externalAccountId)
+        : {};
       for (const c of page.items) {
+        const rank = rankings[c.externalId];
         await db
           .insert(campaigns)
           .values({
@@ -85,6 +105,9 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
             objective: c.objective,
             dailyBudgetMinor: c.dailyBudgetMinor,
             currencyCode: c.currencyCode,
+            qualityRanking: c.qualityRanking ?? rank?.qualityRanking,
+            engagementRateRanking: c.engagementRateRanking ?? rank?.engagementRateRanking,
+            conversionRateRanking: c.conversionRateRanking ?? rank?.conversionRateRanking,
           })
           .onConflictDoUpdate({
             target: [campaigns.connectionId, campaigns.externalId],
@@ -93,6 +116,9 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
               status: c.status,
               objective: c.objective,
               dailyBudgetMinor: c.dailyBudgetMinor,
+              qualityRanking: c.qualityRanking ?? rank?.qualityRanking,
+              engagementRateRanking: c.engagementRateRanking ?? rank?.engagementRateRanking,
+              conversionRateRanking: c.conversionRateRanking ?? rank?.conversionRateRanking,
               updatedAt: new Date(),
             },
           });
@@ -145,6 +171,20 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
             reach: r.reach,
             videoViews3s: r.videoViews3s,
             videoPlays: r.videoPlays,
+            inlineLinkClicks: r.inlineLinkClicks,
+            outboundClicks: r.outboundClicks,
+            uniqueClicks: r.uniqueClicks,
+            landingPageViews: r.landingPageViews,
+            pageEngagements: r.pageEngagements,
+            videoThruplays: r.videoThruplays,
+            videoP50: r.videoP50,
+            videoP75: r.videoP75,
+            videoP100: r.videoP100,
+            viewContent: r.viewContent,
+            addToCart: r.addToCart,
+            initiateCheckout: r.initiateCheckout,
+            addPaymentInfo: r.addPaymentInfo,
+            leads: r.leads,
           })
           .onConflictDoUpdate({
             target: [adInsightsDaily.campaignId, adInsightsDaily.date],
@@ -157,6 +197,20 @@ export async function runSyncJob(job: ClaimedJob): Promise<void> {
               reach: r.reach,
               videoViews3s: r.videoViews3s,
               videoPlays: r.videoPlays,
+              inlineLinkClicks: r.inlineLinkClicks,
+              outboundClicks: r.outboundClicks,
+              uniqueClicks: r.uniqueClicks,
+              landingPageViews: r.landingPageViews,
+              pageEngagements: r.pageEngagements,
+              videoThruplays: r.videoThruplays,
+              videoP50: r.videoP50,
+              videoP75: r.videoP75,
+              videoP100: r.videoP100,
+              viewContent: r.viewContent,
+              addToCart: r.addToCart,
+              initiateCheckout: r.initiateCheckout,
+              addPaymentInfo: r.addPaymentInfo,
+              leads: r.leads,
               updatedAt: new Date(),
             },
           });

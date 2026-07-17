@@ -31,6 +31,10 @@ export interface CampaignRecord {
   objective?: string;
   dailyBudgetMinor?: number;
   currencyCode: string;
+  /** Meta's categorical ad-quality signals, when the provider exposes them. */
+  qualityRanking?: string;
+  engagementRateRanking?: string;
+  conversionRateRanking?: string;
 }
 
 export interface DailyInsightRecord extends AdFacts {
@@ -58,6 +62,16 @@ export interface AdsProvider {
     range: { since: string; until: string },
     cursor?: string,
   ): Promise<PageResult<DailyInsightRecord>>;
+  /** Optional: campaign-grain quality/engagement/conversion rankings, best-effort. */
+  getRankings?(
+    creds: ProviderCredentials,
+    accountId: string,
+  ): Promise<
+    Record<
+      string,
+      Pick<CampaignRecord, "qualityRanking" | "engagementRateRanking" | "conversionRateRanking">
+    >
+  >;
 }
 
 export class ProviderRateLimitError extends Error {

@@ -66,6 +66,20 @@ export async function getAdDaily(
       reach: r.reach,
       videoViews3s: r.videoViews3s,
       videoPlays: r.videoPlays,
+      inlineLinkClicks: r.inlineLinkClicks,
+      outboundClicks: r.outboundClicks,
+      uniqueClicks: r.uniqueClicks,
+      landingPageViews: r.landingPageViews,
+      pageEngagements: r.pageEngagements,
+      videoThruplays: r.videoThruplays,
+      videoP50: r.videoP50,
+      videoP75: r.videoP75,
+      videoP100: r.videoP100,
+      viewContent: r.viewContent,
+      addToCart: r.addToCart,
+      initiateCheckout: r.initiateCheckout,
+      addPaymentInfo: r.addPaymentInfo,
+      leads: r.leads,
     }));
 }
 

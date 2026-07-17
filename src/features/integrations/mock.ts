@@ -30,6 +30,9 @@ export function createMockAdsProvider(key: DemoProvider): AdsProvider {
         name: c.name,
         status: c.status,
         currencyCode: "INR",
+        qualityRanking: c.qualityRanking,
+        engagementRateRanking: c.engagementRateRanking,
+        conversionRateRanking: c.conversionRateRanking,
       }));
       return { items };
     },
@@ -58,6 +61,20 @@ export function createMockAdsProvider(key: DemoProvider): AdsProvider {
         reach: d.reach,
         videoViews3s: d.videoViews3s,
         videoPlays: d.videoPlays,
+        inlineLinkClicks: d.inlineLinkClicks,
+        outboundClicks: d.outboundClicks,
+        uniqueClicks: d.uniqueClicks,
+        landingPageViews: d.landingPageViews,
+        pageEngagements: d.pageEngagements,
+        videoThruplays: d.videoThruplays,
+        videoP50: d.videoP50,
+        videoP75: d.videoP75,
+        videoP100: d.videoP100,
+        viewContent: d.viewContent,
+        addToCart: d.addToCart,
+        initiateCheckout: d.initiateCheckout,
+        addPaymentInfo: d.addPaymentInfo,
+        leads: d.leads,
       }));
       return { items };
     },

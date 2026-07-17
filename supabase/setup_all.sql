@@ -223,6 +223,20 @@ CREATE TABLE "ad_insights_daily" (
 	"reach" bigint DEFAULT 0 NOT NULL,
 	"video_views_3s" bigint DEFAULT 0 NOT NULL,
 	"video_plays" bigint DEFAULT 0 NOT NULL,
+	"inline_link_clicks" bigint DEFAULT 0 NOT NULL,
+	"outbound_clicks" bigint DEFAULT 0 NOT NULL,
+	"unique_clicks" bigint DEFAULT 0 NOT NULL,
+	"landing_page_views" bigint DEFAULT 0 NOT NULL,
+	"page_engagements" bigint DEFAULT 0 NOT NULL,
+	"video_thruplays" bigint DEFAULT 0 NOT NULL,
+	"video_p50" bigint DEFAULT 0 NOT NULL,
+	"video_p75" bigint DEFAULT 0 NOT NULL,
+	"video_p100" bigint DEFAULT 0 NOT NULL,
+	"view_content" integer DEFAULT 0 NOT NULL,
+	"add_to_cart" integer DEFAULT 0 NOT NULL,
+	"initiate_checkout" integer DEFAULT 0 NOT NULL,
+	"add_payment_info" integer DEFAULT 0 NOT NULL,
+	"leads" integer DEFAULT 0 NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
 --> statement-breakpoint
@@ -238,8 +252,23 @@ CREATE TABLE "campaigns" (
 	"objective" text,
 	"daily_budget_minor" bigint,
 	"currency_code" text DEFAULT 'INR' NOT NULL,
+	"quality_ranking" text,
+	"engagement_rate_ranking" text,
+	"conversion_rate_ranking" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "share_links" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"org_id" uuid NOT NULL,
+	"workspace_id" uuid NOT NULL,
+	"provider" "provider" NOT NULL,
+	"label" text,
+	"token_hash" text NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"last_viewed_at" timestamp with time zone,
+	"revoked_at" timestamp with time zone
 );
 --> statement-breakpoint
 CREATE TABLE "fx_rates_daily" (
@@ -286,6 +315,8 @@ ALTER TABLE "tasks" ADD CONSTRAINT "tasks_workspace_id_workspaces_id_fk" FOREIGN
 ALTER TABLE "ad_insights_daily" ADD CONSTRAINT "ad_insights_daily_campaign_id_campaigns_id_fk" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "campaigns" ADD CONSTRAINT "campaigns_org_id_organizations_id_fk" FOREIGN KEY ("org_id") REFERENCES "public"."organizations"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "campaigns" ADD CONSTRAINT "campaigns_workspace_id_workspaces_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "share_links" ADD CONSTRAINT "share_links_org_id_organizations_id_fk" FOREIGN KEY ("org_id") REFERENCES "public"."organizations"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "share_links" ADD CONSTRAINT "share_links_workspace_id_workspaces_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "invites_org_idx" ON "invites" USING btree ("org_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "memberships_org_user_uq" ON "memberships" USING btree ("org_id","user_id");--> statement-breakpoint
 CREATE INDEX "memberships_user_idx" ON "memberships" USING btree ("user_id");--> statement-breakpoint
@@ -311,7 +342,10 @@ CREATE UNIQUE INDEX "campaigns_natural_uq" ON "campaigns" USING btree ("connecti
 CREATE INDEX "campaigns_ws_provider_idx" ON "campaigns" USING btree ("workspace_id","provider");--> statement-breakpoint
 CREATE UNIQUE INDEX "fx_rates_uq" ON "fx_rates_daily" USING btree ("date","currency_code");--> statement-breakpoint
 CREATE UNIQUE INDEX "shop_sales_natural_uq" ON "shop_sales_daily" USING btree ("connection_id","date");--> statement-breakpoint
-CREATE INDEX "shop_sales_ws_date_idx" ON "shop_sales_daily" USING btree ("workspace_id","date");-- ============================================================
+CREATE INDEX "shop_sales_ws_date_idx" ON "shop_sales_daily" USING btree ("workspace_id","date");--> statement-breakpoint
+CREATE UNIQUE INDEX "share_links_token_hash_uq" ON "share_links" USING btree ("token_hash");--> statement-breakpoint
+CREATE INDEX "share_links_workspace_idx" ON "share_links" USING btree ("workspace_id");--> statement-breakpoint
+CREATE INDEX "share_links_org_idx" ON "share_links" USING btree ("org_id");-- ============================================================
 -- ComeDigit CRM — Row Level Security
 -- Applied AFTER drizzle-generated DDL (0001). RLS is the floor;
 -- app code additionally scopes every query explicitly.
@@ -376,6 +410,7 @@ alter table public.campaigns              enable row level security;
 alter table public.ad_insights_daily      enable row level security;
 alter table public.shop_sales_daily       enable row level security;
 alter table public.fx_rates_daily         enable row level security;
+alter table public.share_links            enable row level security;
 
 -- ---------- policies ----------
 
@@ -477,6 +512,22 @@ end $$;
 -- fx rates: global reference data — readable by any authenticated user.
 create policy fx_select on public.fx_rates_daily
   for select using (auth.role() = 'authenticated');
+
+-- share_links: public, no-login report links (/share/:provider/:token).
+-- Managed by agency staff with workspace access; the public route itself
+-- is served by server code on the direct (RLS-bypassing) connection and
+-- verifies the token in application code, not through these policies.
+create policy share_links_select on public.share_links
+  for select using (
+    org_id = public.current_org_id() and public.has_workspace_access(workspace_id)
+  );
+create policy share_links_write on public.share_links
+  for all using (
+    org_id = public.current_org_id()
+    and public.has_workspace_access(workspace_id)
+    and (public.current_membership()).role in
+      ('super_admin','agency_owner','manager','marketing_executive','media_buyer')
+  );
 
 -- ---------- claims hook ----------
 -- Supabase Auth "custom access token" hook: stamp org_id into JWT.

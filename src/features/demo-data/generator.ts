@@ -106,6 +106,13 @@ export function demoAdInsights(
       spendMinor * profile.roas * (0.75 + rand() * 0.5),
     );
     const purchases = Math.max(1, Math.round(revenueMinor / 1_499_00));
+    const videoViews3s = Math.round(impressions * (0.28 + rand() * 0.1));
+    const outboundClicks = Math.round(clicks * (0.75 + rand() * 0.15));
+    const landingPageViews = Math.round(outboundClicks * (0.7 + rand() * 0.2));
+    const viewContent = Math.round(landingPageViews * (0.55 + rand() * 0.2));
+    const addToCart = Math.round(viewContent * (0.35 + rand() * 0.15));
+    const initiateCheckout = Math.round(addToCart * (0.5 + rand() * 0.2));
+    const addPaymentInfo = Math.round(initiateCheckout * (0.7 + rand() * 0.15));
     return {
       date,
       provider,
@@ -115,8 +122,22 @@ export function demoAdInsights(
       clicks,
       purchases,
       reach: Math.round(impressions / (1.6 + rand() * 0.8)),
-      videoViews3s: Math.round(impressions * (0.28 + rand() * 0.1)),
+      videoViews3s,
       videoPlays: Math.round(impressions * (0.55 + rand() * 0.15)),
+      inlineLinkClicks: Math.round(clicks * (0.85 + rand() * 0.1)),
+      outboundClicks,
+      uniqueClicks: Math.round(clicks * (0.8 + rand() * 0.1)),
+      landingPageViews,
+      pageEngagements: Math.round(impressions * (0.02 + rand() * 0.015)),
+      videoThruplays: Math.round(videoViews3s * (0.4 + rand() * 0.15)),
+      videoP50: Math.round(videoViews3s * (0.3 + rand() * 0.1)),
+      videoP75: Math.round(videoViews3s * (0.18 + rand() * 0.08)),
+      videoP100: Math.round(videoViews3s * (0.1 + rand() * 0.06)),
+      viewContent,
+      addToCart,
+      initiateCheckout,
+      addPaymentInfo,
+      leads: Math.round(purchases * (0.15 + rand() * 0.2)),
     };
   });
 }
@@ -151,6 +172,9 @@ export interface DemoCampaign {
   name: string;
   provider: DemoProvider;
   status: "active" | "paused";
+  qualityRanking: string;
+  engagementRateRanking: string;
+  conversionRateRanking: string;
   facts: AdFacts;
 }
 
@@ -183,20 +207,46 @@ export function demoCampaigns(
     const revenueMinor = Math.round(
       spendMinor * profile.roas * (0.55 + rand() * 0.9),
     );
+    const videoViews3s = Math.round(impressions * 0.3);
+    const outboundClicks = Math.round(clicks * 0.82);
+    const landingPageViews = Math.round(outboundClicks * 0.78);
+    const viewContent = Math.round(landingPageViews * 0.6);
+    const addToCart = Math.round(viewContent * 0.4);
+    const initiateCheckout = Math.round(addToCart * 0.55);
+    const purchases = Math.max(1, Math.round(revenueMinor / 1_499_00));
+    const rankings = ["above_average", "average", "below_average"] as const;
+    const pick = () => rankings[Math.floor(rand() * rankings.length)];
     return {
       id: `${provider}-c${i}`,
       name,
       provider,
       status: rand() > 0.2 ? ("active" as const) : ("paused" as const),
+      qualityRanking: pick(),
+      engagementRateRanking: pick(),
+      conversionRateRanking: pick(),
       facts: {
         spendMinor,
         revenueMinor,
         impressions,
         clicks,
-        purchases: Math.max(1, Math.round(revenueMinor / 1_499_00)),
+        purchases,
         reach: Math.round(impressions / 2),
-        videoViews3s: Math.round(impressions * 0.3),
+        videoViews3s,
         videoPlays: Math.round(impressions * 0.6),
+        inlineLinkClicks: Math.round(clicks * 0.88),
+        outboundClicks,
+        uniqueClicks: Math.round(clicks * 0.83),
+        landingPageViews,
+        pageEngagements: Math.round(impressions * 0.025),
+        videoThruplays: Math.round(videoViews3s * 0.45),
+        videoP50: Math.round(videoViews3s * 0.32),
+        videoP75: Math.round(videoViews3s * 0.2),
+        videoP100: Math.round(videoViews3s * 0.12),
+        viewContent,
+        addToCart,
+        initiateCheckout,
+        addPaymentInfo: Math.round(initiateCheckout * 0.75),
+        leads: Math.round(purchases * 0.2),
       },
     };
   });

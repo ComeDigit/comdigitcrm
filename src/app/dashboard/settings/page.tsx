@@ -1,10 +1,15 @@
 import { Topbar } from "@/components/shell/topbar";
 import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
-import { isDemoMode } from "@/lib/env";
+import { env, isDemoMode } from "@/lib/env";
 import { getPrincipal } from "@/lib/auth/principal";
 import { getActiveWorkspaceId } from "@/lib/workspace";
 import { getWorkspaces } from "@/features/crm/queries";
-import { ConnectMetaTokenForm } from "@/features/integrations/components/forms";
+import {
+  ConnectMetaTokenForm,
+  ConnectMetaAgencyForm,
+} from "@/features/integrations/components/forms";
+import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
+import { ShareLinksManager } from "@/features/share/components/manager";
 
 export const metadata = { title: "Settings" };
 
@@ -36,6 +41,14 @@ export default async function SettingsPage() {
   const connections = await getConnections(principal.orgId);
   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
   const metaConfigured = Boolean(process.env.META_APP_ID);
+  const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
+  const agencyTokenHealth = agencyTokenConfigured
+    ? await checkAgencyMetaTokenHealth()
+    : null;
+  const agencyTokenWarning =
+    agencyTokenHealth?.configured &&
+    (!agencyTokenHealth.valid ||
+      (agencyTokenHealth.daysUntilExpiry !== null && agencyTokenHealth.daysUntilExpiry <= 7));
 
   return (
     <>
@@ -73,6 +86,30 @@ export default async function SettingsPage() {
             subtitle="Each connector activates the moment its keys are added — the data pipeline behind them is already built"
           />
           <div className="space-y-2 px-5 pb-5 pt-2">
+            {agencyTokenWarning ? (
+              <div className="rounded-lg border border-negative/30 bg-negative/5 px-4 py-3 text-[13px]">
+                <p className="font-medium text-negative">
+                  {agencyTokenHealth && !agencyTokenHealth.valid
+                    ? "Agency Meta token is no longer valid."
+                    : `Agency Meta token expires in ${agencyTokenHealth?.daysUntilExpiry} day${agencyTokenHealth?.daysUntilExpiry === 1 ? "" : "s"}.`}
+                </p>
+                <p className="mt-0.5 text-xs text-muted">
+                  Generate a new long-lived token and update{" "}
+                  <code className="rounded bg-surface-2 px-1">META_USER_TOKEN</code> in Vercel —
+                  any client relying on the shared agency token will stop syncing once it expires.
+                </p>
+              </div>
+            ) : null}
+            {agencyTokenConfigured && agencyTokenHealth?.valid && !agencyTokenWarning ? (
+              <div className="flex items-center justify-between rounded-lg border border-border px-4 py-3 text-[13px]">
+                <span className="text-muted">Agency Meta token</span>
+                <Badge tone="positive">
+                  {agencyTokenHealth.daysUntilExpiry !== null
+                    ? `Healthy · expires in ${agencyTokenHealth.daysUntilExpiry} days`
+                    : "Healthy · no expiry"}
+                </Badge>
+              </div>
+            ) : null}
             {PROVIDERS.map((p) => {
               const existing = connections.filter((c) => c.provider === p.key);
               const canConnect = p.key === "meta" && metaConfigured && !isDemoMode;
@@ -117,10 +154,29 @@ export default async function SettingsPage() {
                     {p.key === "meta" && !isDemoMode ? (
                       <ConnectMetaTokenForm workspaces={workspaces} />
                     ) : null}
+                    {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
+                      <ConnectMetaAgencyForm workspaces={workspaces} />
+                    ) : null}
                   </div>
                 </div>
               );
             })}
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader
+            title="Share links"
+            subtitle="Public, no-login report links for clients — one workspace and one channel per link, revocable any time"
+          />
+          <div className="px-5 pb-5 pt-2">
+            {isDemoMode ? (
+              <p className="text-xs text-muted">
+                Demo mode — connect Supabase to create real share links.
+              </p>
+            ) : (
+              <ShareLinksManager workspaces={workspaces} />
+            )}
           </div>
         </Card>
       </main>
