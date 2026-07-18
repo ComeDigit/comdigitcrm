@@ -6,6 +6,7 @@ CREATE TYPE "public"."deal_stage" AS ENUM('lead', 'qualified', 'proposal', 'nego
 CREATE TYPE "public"."invoice_status" AS ENUM('draft', 'sent', 'paid', 'overdue', 'void');--> statement-breakpoint
 CREATE TYPE "public"."task_status" AS ENUM('todo', 'in_progress', 'review', 'done');--> statement-breakpoint
 CREATE TYPE "public"."entity_status" AS ENUM('active', 'paused', 'archived', 'deleted');--> statement-breakpoint
+CREATE TYPE "public"."client_user_status" AS ENUM('active', 'disabled');--> statement-breakpoint
 CREATE TABLE "invites" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"org_id" uuid NOT NULL,
@@ -271,6 +272,26 @@ CREATE TABLE "share_links" (
 	"revoked_at" timestamp with time zone
 );
 --> statement-breakpoint
+CREATE TABLE "client_users" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"org_id" uuid NOT NULL,
+	"workspace_id" uuid NOT NULL,
+	"username" text NOT NULL,
+	"password_hash" text NOT NULL,
+	"status" "client_user_status" DEFAULT 'active' NOT NULL,
+	"last_login_at" timestamp with time zone,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
+CREATE TABLE "client_sessions" (
+	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+	"client_user_id" uuid NOT NULL,
+	"token_hash" text NOT NULL,
+	"expires_at" timestamp with time zone NOT NULL,
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+--> statement-breakpoint
 CREATE TABLE "fx_rates_daily" (
 	"date" date NOT NULL,
 	"currency_code" text NOT NULL,
@@ -317,6 +338,9 @@ ALTER TABLE "campaigns" ADD CONSTRAINT "campaigns_org_id_organizations_id_fk" FO
 ALTER TABLE "campaigns" ADD CONSTRAINT "campaigns_workspace_id_workspaces_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "share_links" ADD CONSTRAINT "share_links_org_id_organizations_id_fk" FOREIGN KEY ("org_id") REFERENCES "public"."organizations"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "share_links" ADD CONSTRAINT "share_links_workspace_id_workspaces_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "client_users" ADD CONSTRAINT "client_users_org_id_organizations_id_fk" FOREIGN KEY ("org_id") REFERENCES "public"."organizations"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "client_users" ADD CONSTRAINT "client_users_workspace_id_workspaces_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "client_sessions" ADD CONSTRAINT "client_sessions_client_user_id_client_users_id_fk" FOREIGN KEY ("client_user_id") REFERENCES "public"."client_users"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "invites_org_idx" ON "invites" USING btree ("org_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "memberships_org_user_uq" ON "memberships" USING btree ("org_id","user_id");--> statement-breakpoint
 CREATE INDEX "memberships_user_idx" ON "memberships" USING btree ("user_id");--> statement-breakpoint
@@ -345,7 +369,12 @@ CREATE UNIQUE INDEX "shop_sales_natural_uq" ON "shop_sales_daily" USING btree ("
 CREATE INDEX "shop_sales_ws_date_idx" ON "shop_sales_daily" USING btree ("workspace_id","date");--> statement-breakpoint
 CREATE UNIQUE INDEX "share_links_token_hash_uq" ON "share_links" USING btree ("token_hash");--> statement-breakpoint
 CREATE INDEX "share_links_workspace_idx" ON "share_links" USING btree ("workspace_id");--> statement-breakpoint
-CREATE INDEX "share_links_org_idx" ON "share_links" USING btree ("org_id");-- ============================================================
+CREATE INDEX "share_links_org_idx" ON "share_links" USING btree ("org_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "client_users_username_uq" ON "client_users" USING btree ("username");--> statement-breakpoint
+CREATE INDEX "client_users_workspace_idx" ON "client_users" USING btree ("workspace_id");--> statement-breakpoint
+CREATE INDEX "client_users_org_idx" ON "client_users" USING btree ("org_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "client_sessions_token_hash_uq" ON "client_sessions" USING btree ("token_hash");--> statement-breakpoint
+CREATE INDEX "client_sessions_client_user_idx" ON "client_sessions" USING btree ("client_user_id");-- ============================================================
 -- ComeDigit CRM — Row Level Security
 -- Applied AFTER drizzle-generated DDL (0001). RLS is the floor;
 -- app code additionally scopes every query explicitly.
@@ -411,6 +440,8 @@ alter table public.ad_insights_daily      enable row level security;
 alter table public.shop_sales_daily       enable row level security;
 alter table public.fx_rates_daily         enable row level security;
 alter table public.share_links            enable row level security;
+alter table public.client_users           enable row level security; -- no policies: service-role only
+alter table public.client_sessions        enable row level security; -- no policies: service-role only
 
 -- ---------- policies ----------
 

@@ -218,3 +218,64 @@ export const auditLog = pgTable(
     index("audit_org_created_idx").on(t.orgId, t.createdAt),
   ],
 );
+
+export const clientUserStatusEnum = pgEnum("client_user_status", ["active", "disabled"]);
+
+/**
+ * Client portal login — the fourth access tier alongside the internal team
+ * dashboard, the (currently no-op) member system, and public share links.
+ * One row per client login, tied to exactly ONE workspace: logging in as
+ * this user can only ever resolve that workspace, never any other, and
+ * never the cross-client switcher the internal dashboard has. Passwords
+ * are never stored — only a salted hash (see lib/auth/client-session.ts).
+ * Username is globally unique because login doesn't specify a workspace
+ * up front — the username alone determines which one you land in.
+ */
+export const clientUsers = pgTable(
+  "client_users",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    username: text("username").notNull(),
+    passwordHash: text("password_hash").notNull(),
+    status: clientUserStatusEnum("status").notNull().default("active"),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("client_users_username_uq").on(t.username),
+    index("client_users_workspace_idx").on(t.workspaceId),
+    index("client_users_org_idx").on(t.orgId),
+  ],
+);
+
+/**
+ * Client portal sessions — same hashed-opaque-token pattern as share_links:
+ * the raw token lives only in the httpOnly cookie, only its SHA-256 hash is
+ * persisted here. A session is looked up on every /client/* page load to
+ * resolve which workspace to render — the workspace is NEVER taken from a
+ * client-editable cookie or query param, only from this server-side lookup,
+ * so a client can't tamper their way into seeing another client's data.
+ */
+export const clientSessions = pgTable(
+  "client_sessions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    clientUserId: uuid("client_user_id")
+      .notNull()
+      .references(() => clientUsers.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("client_sessions_token_hash_uq").on(t.tokenHash),
+    index("client_sessions_client_user_idx").on(t.clientUserId),
+  ],
+);

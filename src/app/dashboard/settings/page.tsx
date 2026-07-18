@@ -11,6 +11,7 @@ import {
 import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
 import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
 import { ShareLinksManager } from "@/features/share/components/manager";
+import { ClientPortalManager } from "@/features/client-portal/components/manager";
 
 export const metadata = { title: "Settings" };
 
@@ -204,6 +205,22 @@ export default async function SettingsPage() {
               </p>
             ) : (
               <ShareLinksManager workspaces={workspaces} />
+            )}
+          </div>
+        </Card>
+
+        <Card>
+          <CardHeader
+            title="Client portal logins"
+            subtitle="Give a client their own username and password to sign in and see their full dashboard, locked to their workspace"
+          />
+          <div className="px-5 pb-5 pt-2">
+            {isDemoMode ? (
+              <p className="text-xs text-muted">
+                Demo mode — connect Supabase to create real client logins.
+              </p>
+            ) : (
+              <ClientPortalManager workspaces={workspaces} />
             )}
           </div>
         </Card>

@@ -28,6 +28,7 @@ export type Action =
   | "metrics.read"
   | "reports.generate"
   | "share_links.manage"
+  | "client_users.manage"
   | "automations.manage"
   | "billing.manage";
 
@@ -36,20 +37,21 @@ const GRANTS: Record<Role, ReadonlySet<Action>> = {
   super_admin: new Set<Action>([
     "org.manage", "workspace.manage", "members.manage", "connections.manage",
     "crm.read", "crm.write", "metrics.read", "reports.generate", "share_links.manage",
-    "automations.manage", "billing.manage",
+    "client_users.manage", "automations.manage", "billing.manage",
   ]),
   agency_owner: new Set<Action>([
     "org.manage", "workspace.manage", "members.manage", "connections.manage",
     "crm.read", "crm.write", "metrics.read", "reports.generate", "share_links.manage",
-    "automations.manage", "billing.manage",
+    "client_users.manage", "automations.manage", "billing.manage",
   ]),
   manager: new Set<Action>([
     "workspace.manage", "members.manage", "connections.manage",
     "crm.read", "crm.write", "metrics.read", "reports.generate", "share_links.manage",
-    "automations.manage",
+    "client_users.manage", "automations.manage",
   ]),
   marketing_executive: new Set<Action>([
     "crm.read", "crm.write", "metrics.read", "reports.generate", "share_links.manage",
+    "client_users.manage",
   ]),
   media_buyer: new Set<Action>([
     "connections.manage", "crm.read", "metrics.read", "reports.generate", "share_links.manage",
