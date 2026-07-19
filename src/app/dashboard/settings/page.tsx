@@ -7,6 +7,7 @@ import { getWorkspaces } from "@/features/crm/queries";
 import {
   ConnectMetaTokenForm,
   ConnectMetaAgencyForm,
+  AutoProvisionMetaAccountsButton,
 } from "@/features/integrations/components/forms";
 import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
 import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
@@ -185,6 +186,9 @@ export default async function SettingsPage() {
                     ) : null}
                     {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
                       <ConnectMetaAgencyForm workspaces={workspaces} />
+                    ) : null}
+                    {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
+                      <AutoProvisionMetaAccountsButton />
                     ) : null}
                   </div>
                 </div>

@@ -3,11 +3,24 @@
 import { revalidatePath } from "next/cache";
 import { env, isDemoMode } from "@/lib/env";
 import { getDb } from "@/lib/db";
-import { integrationConnections, integrationSecrets } from "@/db/schema";
+import { integrationConnections, integrationSecrets, workspaces, auditLog } from "@/db/schema";
 import { authorize, AuthorizationError } from "@/lib/auth/authorize";
-import { getPrincipal } from "@/lib/auth/principal";
+import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
 import { encryptSecret } from "@/lib/crypto";
 import { checkMetaTokenHealth, type MetaTokenHealth } from "./meta";
+
+/** Same slugify as features/crm/actions.ts's createWorkspace — duplicated
+ *  rather than imported so this file doesn't reach across features for one
+ *  small pure function. Keep the two in sync if the scheme ever changes. */
+function slugify(value: string): string {
+  return (
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48) || "client"
+  );
+}
 
 /**
  * Manual-credential connect path — bypasses the OAuth dialog entirely.
@@ -295,4 +308,136 @@ export async function connectAgencyMetaAccounts(
 
   revalidatePath("/dashboard/settings");
   return { ok: true };
+}
+
+export interface AutoProvisionResult {
+  error?: string;
+  ok?: boolean;
+  createdWorkspaces?: number;
+  connectedAccounts?: number;
+  skippedAccounts?: number;
+}
+
+/**
+ * Auto-provisioning variant of the agency-token flow above: instead of an
+ * admin hand-picking a client workspace per ad account, this fetches every
+ * ad account the agency token can see and, for each one not already
+ * connected to some workspace in this org, creates a brand-new client
+ * workspace named after the ad account (Meta is the source of truth for
+ * the client list, not the other way round) and connects it — one
+ * workspace per ad account. Accounts already connected somewhere (matched
+ * by externalAccountId, not by name) are left untouched, so this is safe
+ * to re-run any time a new ad account shows up in the Business portfolio —
+ * it only ever adds, never duplicates or reassigns.
+ */
+export async function autoProvisionAgencyMetaAccounts(): Promise<AutoProvisionResult> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  if (!env.META_USER_TOKEN) {
+    return { error: "META_USER_TOKEN isn't set in this environment yet." };
+  }
+
+  const preview = await listMetaAdAccounts(env.META_USER_TOKEN);
+  if (preview.error || !preview.accounts) {
+    return { error: preview.error ?? "Could not list ad accounts." };
+  }
+
+  let createdWorkspaces = 0;
+  let connectedAccounts = 0;
+  let skippedAccounts = 0;
+
+  try {
+    const principal = await getPrincipal();
+    authorize(principal, "workspace.manage");
+    authorize(principal, "connections.manage");
+    const db = getDb();
+
+    for (const account of preview.accounts) {
+      // Already connected to some workspace in this org? Leave it alone —
+      // this is what makes re-running auto-provision safe rather than
+      // spawning a duplicate workspace every time it's clicked.
+      const existing = await db.query.integrationConnections.findFirst({
+        where: (c, { and, eq }) =>
+          and(
+            eq(c.orgId, principal.orgId),
+            eq(c.provider, "meta"),
+            eq(c.externalAccountId, account.accountId),
+          ),
+      });
+      if (existing) {
+        skippedAccounts++;
+        continue;
+      }
+
+      const baseSlug = slugify(account.name);
+      let slug = baseSlug;
+      for (let i = 2; i <= 20; i++) {
+        const clash = await db.query.workspaces.findFirst({
+          where: (w, { and, eq }) => and(eq(w.orgId, principal.orgId), eq(w.slug, slug)),
+        });
+        if (!clash) break;
+        slug = `${baseSlug}-${i}`;
+      }
+
+      const [workspace] = await db
+        .insert(workspaces)
+        .values({
+          orgId: principal.orgId,
+          name: account.name,
+          slug,
+          currencyCode: account.currency || "INR",
+          timezone: account.timezone || "Asia/Kolkata",
+        })
+        .returning({ id: workspaces.id });
+      createdWorkspaces++;
+
+      await db.insert(auditLog).values({
+        orgId: principal.orgId,
+        workspaceId: workspace.id,
+        actorId: actorIdOrNull(principal.userId),
+        action: "workspace.create",
+        resourceType: "workspace",
+        resourceId: workspace.id,
+        after: { name: account.name, source: "meta_auto_provision", accountId: account.accountId },
+      });
+
+      await db
+        .insert(integrationConnections)
+        .values({
+          orgId: principal.orgId,
+          workspaceId: workspace.id,
+          provider: "meta",
+          externalAccountId: account.accountId,
+          displayName: account.name,
+          status: "active",
+          grantedScopes: ["ads_read"],
+          currencyCode: account.currency,
+          timezone: account.timezone,
+        })
+        .onConflictDoUpdate({
+          target: [
+            integrationConnections.workspaceId,
+            integrationConnections.provider,
+            integrationConnections.externalAccountId,
+          ],
+          set: { status: "active", lastError: null, displayName: account.name },
+        });
+      connectedAccounts++;
+    }
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    return {
+      error:
+        e instanceof Error
+          ? `Stopped partway through: ${e.message}. Anything already created is safe — re-run to pick up the rest.`
+          : "Unknown error while auto-provisioning.",
+    };
+  }
+
+  revalidatePath("/dashboard/settings");
+  revalidatePath("/dashboard/clients");
+  revalidatePath("/dashboard");
+
+  return { ok: true, createdWorkspaces, connectedAccounts, skippedAccounts };
 }

@@ -1,12 +1,13 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { Building2, KeyRound, X } from "lucide-react";
+import { Building2, KeyRound, Sparkles, X } from "lucide-react";
 import {
   previewMetaAccessToken,
   connectMetaAccounts,
   previewAgencyMetaAccounts,
   connectAgencyMetaAccounts,
+  autoProvisionAgencyMetaAccounts,
   type MetaAccountPreview,
 } from "@/features/integrations/actions";
 import { Button } from "@/components/ui/primitives";
@@ -326,6 +327,75 @@ export function ConnectMetaAgencyForm({
               </div>
             </div>
           )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * One click, one client per Meta ad account. Meta's Business portfolio
+ * becomes the source of truth for who your clients are — every ad account
+ * the agency token can see gets its own workspace, named after the ad
+ * account, with no manual "which client does this belong to" step. Safe to
+ * click again later: accounts already connected to a workspace are left
+ * alone, so it only ever picks up newly added ad accounts.
+ */
+export function AutoProvisionMetaAccountsButton() {
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [summary, setSummary] = useState<string | null>(null);
+  const [pending, startTransition] = useTransition();
+
+  function run() {
+    setError(null);
+    setSummary(null);
+    startTransition(async () => {
+      const result = await autoProvisionAgencyMetaAccounts();
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      const parts: string[] = [];
+      if (result.createdWorkspaces) {
+        parts.push(
+          `created ${result.createdWorkspaces} new client workspace${result.createdWorkspaces === 1 ? "" : "s"}`,
+        );
+      }
+      if (result.skippedAccounts) {
+        parts.push(
+          `${result.skippedAccounts} ad account${result.skippedAccounts === 1 ? " was" : "s were"} already connected`,
+        );
+      }
+      setSummary(
+        parts.length > 0
+          ? `Done — ${parts.join(", ")}.`
+          : "Done — no ad accounts found on this token.",
+      );
+    });
+  }
+
+  return (
+    <div className="relative">
+      <Button variant="outline" onClick={() => setOpen((v) => !v)}>
+        {open ? <X size={13} /> : <Sparkles size={13} />} Auto-create clients from Meta
+      </Button>
+      {open ? (
+        <div className="absolute right-0 z-30 mt-2 w-96 rounded-xl border border-border bg-surface p-4 shadow-xl">
+          <div className="space-y-2.5">
+            <p className="text-xs leading-relaxed text-muted">
+              Scans every ad account the agency token (
+              <code className="rounded bg-surface-2 px-1">META_USER_TOKEN</code>) can see and
+              creates a client workspace for each one that doesn&apos;t already have one —
+              named and connected automatically, nothing to pick by hand. Existing clients are
+              left exactly as they are.
+            </p>
+            {error ? <p className="text-xs text-negative">{error}</p> : null}
+            {summary ? <p className="text-xs text-positive">{summary}</p> : null}
+            <Button className="w-full" disabled={pending} onClick={run}>
+              {pending ? "Working…" : "Run auto-create"}
+            </Button>
+          </div>
         </div>
       ) : null}
     </div>
