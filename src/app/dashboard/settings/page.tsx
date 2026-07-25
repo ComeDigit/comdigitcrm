@@ -8,9 +8,15 @@ import {
   ConnectMetaTokenForm,
   ConnectMetaAgencyForm,
   AutoProvisionMetaAccountsButton,
+  ConnectShopifyForm,
+  ConnectGoogleAdsAgencyForm,
+  ConnectTikTokTokenForm,
 } from "@/features/integrations/components/forms";
 import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
 import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
+import { checkShopifyAccountsHealth } from "@/features/integrations/shopify-live";
+import { checkGoogleAdsAccountsHealth } from "@/features/integrations/google-ads-live";
+import { checkTikTokAccountsHealth } from "@/features/integrations/tiktok-live";
 import { ShareLinksManager } from "@/features/share/components/manager";
 import { ClientPortalManager } from "@/features/client-portal/components/manager";
 
@@ -24,8 +30,8 @@ const PROVIDERS: Array<{
 }> = [
   { key: "shopify", label: "Shopify", phase: "Phase 6" },
   { key: "meta", label: "Meta Ads", phase: "Phase 7", envVar: "META_APP_ID" },
-  { key: "google_ads", label: "Google Ads", phase: "Phase 8" },
-  { key: "tiktok", label: "TikTok Ads", phase: "Phase 9" },
+  { key: "google_ads", label: "Google Ads", phase: "Phase 8", envVar: "GOOGLE_ADS_CLIENT_ID" },
+  { key: "tiktok", label: "TikTok Ads", phase: "Phase 9", envVar: "TIKTOK_APP_ID" },
   { key: "ga4", label: "Google Analytics 4", phase: "Phase 10" },
   { key: "search_console", label: "Search Console", phase: "Phase 10" },
 ];
@@ -45,6 +51,12 @@ export default async function SettingsPage() {
   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
   const metaConfigured = Boolean(process.env.META_APP_ID);
   const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
+  const googleAdsConfigured = Boolean(process.env.GOOGLE_ADS_CLIENT_ID);
+  const googleAdsAgencyConfigured = Boolean(env.GOOGLE_ADS_REFRESH_TOKEN);
+  // Both vars are required: unlike Meta's manual-token form (which only
+  // needs the pasted token itself), TikTok's advertiser lookup needs the
+  // app id/secret alongside any pasted token — see previewTikTokAccessToken.
+  const tiktokConfigured = Boolean(process.env.TIKTOK_APP_ID && process.env.TIKTOK_APP_SECRET);
   const agencyTokenHealth = agencyTokenConfigured
     ? await checkAgencyMetaTokenHealth()
     : null;
@@ -64,6 +76,51 @@ export default async function SettingsPage() {
     const healthResults = await Promise.all(metaWorkspaceIds.map((wsId) => checkMetaAccountsHealth(wsId)));
     for (const list of healthResults) {
       for (const r of list) metaHealthByConnection.set(r.connectionId, r.health);
+    }
+  }
+
+  // Same on-demand health probe for Shopify — ShopifyAccountHealth is the
+  // same "live" | "idle" | "no_access" shape as Meta's AccountHealth, so it
+  // shares the tone/label helpers below.
+  const shopifyWorkspaceIds = [
+    ...new Set(connections.filter((c) => c.provider === "shopify").map((c) => c.workspaceId)),
+  ];
+  const shopifyHealthByConnection = new Map<string, AccountHealth>();
+  if (!isDemoMode) {
+    const shopifyHealthResults = await Promise.all(
+      shopifyWorkspaceIds.map((wsId) => checkShopifyAccountsHealth(wsId)),
+    );
+    for (const list of shopifyHealthResults) {
+      for (const r of list) shopifyHealthByConnection.set(r.connectionId, r.health);
+    }
+  }
+
+  // Same on-demand health probe for Google Ads — checkGoogleAdsAccountsHealth
+  // returns the same "live" | "idle" | "no_access" shape too.
+  const googleAdsWorkspaceIds = [
+    ...new Set(connections.filter((c) => c.provider === "google_ads").map((c) => c.workspaceId)),
+  ];
+  const googleAdsHealthByConnection = new Map<string, AccountHealth>();
+  if (!isDemoMode) {
+    const googleAdsHealthResults = await Promise.all(
+      googleAdsWorkspaceIds.map((wsId) => checkGoogleAdsAccountsHealth(wsId)),
+    );
+    for (const list of googleAdsHealthResults) {
+      for (const r of list) googleAdsHealthByConnection.set(r.connectionId, r.health);
+    }
+  }
+
+  // Same on-demand health probe for TikTok.
+  const tiktokWorkspaceIds = [
+    ...new Set(connections.filter((c) => c.provider === "tiktok").map((c) => c.workspaceId)),
+  ];
+  const tiktokHealthByConnection = new Map<string, AccountHealth>();
+  if (!isDemoMode) {
+    const tiktokHealthResults = await Promise.all(
+      tiktokWorkspaceIds.map((wsId) => checkTikTokAccountsHealth(wsId)),
+    );
+    for (const list of tiktokHealthResults) {
+      for (const r of list) tiktokHealthByConnection.set(r.connectionId, r.health);
     }
   }
   const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
@@ -140,7 +197,27 @@ export default async function SettingsPage() {
             ) : null}
             {PROVIDERS.map((p) => {
               const existing = connections.filter((c) => c.provider === p.key);
-              const canConnect = p.key === "meta" && metaConfigured && !isDemoMode;
+              const canConnect =
+                !isDemoMode &&
+                ((p.key === "meta" && metaConfigured) ||
+                  (p.key === "google_ads" && googleAdsConfigured) ||
+                  (p.key === "tiktok" && tiktokConfigured));
+              const hasConnectUi =
+                !isDemoMode &&
+                (p.key === "meta" ||
+                  p.key === "shopify" ||
+                  (p.key === "google_ads" && (googleAdsConfigured || googleAdsAgencyConfigured)) ||
+                  (p.key === "tiktok" && tiktokConfigured));
+              const healthMap =
+                p.key === "meta"
+                  ? metaHealthByConnection
+                  : p.key === "shopify"
+                    ? shopifyHealthByConnection
+                    : p.key === "google_ads"
+                      ? googleAdsHealthByConnection
+                      : p.key === "tiktok"
+                        ? tiktokHealthByConnection
+                        : null;
               return (
                 <div
                   key={p.key}
@@ -156,9 +233,9 @@ export default async function SettingsPage() {
                             {c.status}
                           </span>
                         </span>
-                        {p.key === "meta" && !isDemoMode ? (
-                          <Badge tone={healthTone(metaHealthByConnection.get(c.id))}>
-                            {healthLabel(metaHealthByConnection.get(c.id))}
+                        {healthMap ? (
+                          <Badge tone={healthTone(healthMap.get(c.id))}>
+                            {healthLabel(healthMap.get(c.id))}
                           </Badge>
                         ) : c.lastSyncAt ? (
                           `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
@@ -170,14 +247,14 @@ export default async function SettingsPage() {
                     <Badge tone="outline">
                       {existing.length > 0
                         ? `${existing.length} connected`
-                        : canConnect
+                        : hasConnectUi
                           ? "Not connected yet"
                           : p.envVar && !isDemoMode
                             ? `Set ${p.envVar} to enable`
                             : `Ready · live in ${p.phase}`}
                     </Badge>
                     {canConnect ? (
-                      <a href={`/api/integrations/meta/start?workspace=${workspaceId}`}>
+                      <a href={`/api/integrations/${p.key}/start?workspace=${workspaceId}`}>
                         <Button>Connect</Button>
                       </a>
                     ) : null}
@@ -189,6 +266,15 @@ export default async function SettingsPage() {
                     ) : null}
                     {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
                       <AutoProvisionMetaAccountsButton />
+                    ) : null}
+                    {p.key === "shopify" && !isDemoMode ? (
+                      <ConnectShopifyForm workspaces={workspaces} />
+                    ) : null}
+                    {p.key === "google_ads" && !isDemoMode && googleAdsAgencyConfigured ? (
+                      <ConnectGoogleAdsAgencyForm workspaces={workspaces} />
+                    ) : null}
+                    {p.key === "tiktok" && !isDemoMode && tiktokConfigured ? (
+                      <ConnectTikTokTokenForm workspaces={workspaces} />
                     ) : null}
                   </div>
                 </div>

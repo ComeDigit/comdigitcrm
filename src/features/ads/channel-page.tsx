@@ -13,7 +13,9 @@ import {
   type RangePreset,
   type CampaignWithFacts,
 } from "@/features/metrics/queries";
-import { getLiveMetaReport, getMetaPacing, type MetaFetchFailure } from "@/features/integrations/meta-live";
+import { getLiveMetaReport, getMetaPacing } from "@/features/integrations/meta-live";
+import { getLiveGoogleAdsReport, getGoogleAdsPacing } from "@/features/integrations/google-ads-live";
+import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
 import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
 import type { DemoProvider } from "@/features/demo-data/generator";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
@@ -52,16 +54,18 @@ export async function AdsReport({
   let trend: Array<{ date: string; spend: number; revenue: number }>;
   let campaigns: CampaignWithFacts[];
   let partialFailure = false;
-  let failures: MetaFetchFailure[] = [];
+  let failures: Array<{ displayName: string; reason: string }> = [];
   let pacing: { activeDailyBudgetMinor: number; spendTodayMinor: number } | null = null;
 
+  // All three ad channels are on-demand/live per client instruction — no
+  // local historical storage for any of them. Two live pulls (current +
+  // previous period) so the delta comparisons on every card keep working;
+  // a few extra API calls per page view is an accepted trade-off (see
+  // meta-live.ts / google-ads-live.ts / tiktok-live.ts). Pacing is always
+  // about today regardless of the selected range, so it's a separate
+  // fetch. Kept as one block per provider (rather than a generic dispatch
+  // table) so each live-report/pacing pair's types stay concrete.
   if (provider === "meta" && !isDemoMode) {
-    // Meta is on-demand/live per client instruction — no local historical
-    // storage. Two live pulls (current + previous period) so the delta
-    // comparisons on every card keep working; a few extra Graph API calls
-    // per page view is an accepted trade-off (see meta-live.ts). Pacing is
-    // always about today regardless of the selected range, so it's a
-    // separate fetch.
     const [current, previous, pacingResult] = await Promise.all([
       getLiveMetaReport(workspaceId, range),
       getLiveMetaReport(workspaceId, previousPeriod(range)),
@@ -77,7 +81,35 @@ export async function AdsReport({
     // would just be duplicates for the same underlying reason.
     failures = current.failures;
     pacing = pacingResult;
+  } else if (provider === "google_ads" && !isDemoMode) {
+    const [current, previous, pacingResult] = await Promise.all([
+      getLiveGoogleAdsReport(workspaceId, range),
+      getLiveGoogleAdsReport(workspaceId, previousPeriod(range)),
+      getGoogleAdsPacing(workspaceId),
+    ]);
+    totals = current.totals;
+    prev = previous.totals;
+    trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
+    campaigns = current.campaigns;
+    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
+    failures = current.failures;
+    pacing = pacingResult;
+  } else if (provider === "tiktok" && !isDemoMode) {
+    const [current, previous, pacingResult] = await Promise.all([
+      getLiveTikTokReport(workspaceId, range),
+      getLiveTikTokReport(workspaceId, previousPeriod(range)),
+      getTikTokPacing(workspaceId),
+    ]);
+    totals = current.totals;
+    prev = previous.totals;
+    trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
+    campaigns = current.campaigns;
+    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
+    failures = current.failures;
+    pacing = pacingResult;
   } else {
+    // Demo mode only reaches here now — every real provider has a live
+    // branch above.
     const [rows, prevRows, dbCampaigns] = await Promise.all([
       getAdDaily(workspaceId, range, [provider]),
       getAdDaily(workspaceId, previousPeriod(range), [provider]),
@@ -148,7 +180,7 @@ export async function AdsReport({
       : 0;
     const pacingKpis: Kpi[] = [
       { label: "Active daily budget", value: formatMoney(pacing.activeDailyBudgetMinor), info: "Total daily budget across every campaign that's currently active — what you're set up to spend today if everything runs at full budget." },
-      { label: "Spent today", value: formatMoney(pacing.spendTodayMinor), info: "Actual spend so far today, across every active Meta account — resets at midnight." },
+      { label: "Spent today", value: formatMoney(pacing.spendTodayMinor), info: `Actual spend so far today, across every active ${label} account — resets at midnight.` },
       { label: "Pacing", value: formatPercent(pacingPct), hint: "Spent today ÷ active daily budget", info: "How much of today's active budget has been spent so far. Well under 100% partway through the day is normal; if it's near or over 100% early in the day, campaigns may exhaust budget before midnight." },
     ];
     kpiGroups.push({
@@ -178,7 +210,7 @@ export async function AdsReport({
         {partialFailure ? (
           <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
             <p>
-              Couldn&apos;t reach {failures.length === 1 ? "one connected Meta account" : `${failures.length || "one or more"} connected Meta account(s)`} just now —
+              Couldn&apos;t reach {failures.length === 1 ? `one connected ${label} account` : `${failures.length || "one or more"} connected ${label} account(s)`} just now —
               numbers below may be incomplete. This report is pulled live on every page view, so
               refreshing may resolve it.
             </p>
@@ -254,8 +286,8 @@ export async function AdsReport({
                 {campaigns.length === 0 ? (
                   <tr>
                     <td colSpan={14} className="px-3 py-6 text-center text-xs text-muted">
-                      {provider === "meta" && !isDemoMode
-                        ? "No campaigns found for this date range — connect a Meta ad account in Settings, or try a wider date range."
+                      {!isDemoMode
+                        ? `No campaigns found for this date range — connect a ${label} account in Settings, or try a wider date range.`
                         : "No campaigns synced for this client yet — connect an ad account in Settings and wait for the first sync to complete."}
                     </td>
                   </tr>

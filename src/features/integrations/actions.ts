@@ -8,6 +8,9 @@ import { authorize, AuthorizationError } from "@/lib/auth/authorize";
 import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
 import { encryptSecret } from "@/lib/crypto";
 import { checkMetaTokenHealth, type MetaTokenHealth } from "./meta";
+import { verifyShopifyCredentials, type ShopifyShopInfo } from "./shopify";
+import { refreshAccessToken, listLinkedClientAccounts } from "./google-ads";
+import { fetchAuthorizedAdvertiserIds, fetchAdvertiserInfo } from "./tiktok";
 
 /** Same slugify as features/crm/actions.ts's createWorkspace — duplicated
  *  rather than imported so this file doesn't reach across features for one
@@ -440,4 +443,435 @@ export async function autoProvisionAgencyMetaAccounts(): Promise<AutoProvisionRe
   revalidatePath("/dashboard");
 
   return { ok: true, createdWorkspaces, connectedAccounts, skippedAccounts };
+}
+
+/**
+ * Shopify connect — a "custom app" per store (created directly in the
+ * merchant's own Shopify admin), not a public OAuth app. This is the
+ * Shopify-recommended approach for an agency integrating a known, bounded
+ * list of client stores: no App Store review, and the Admin API access
+ * token is available the moment the custom app is installed. Two steps,
+ * mirroring the Meta manual-token flow exactly: preview (verify the
+ * credentials work, show the shop name back) → connect (save it).
+ */
+
+function normalizeShopDomain(input: string): string | null {
+  let v = input.trim().toLowerCase();
+  v = v.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  if (!v) return null;
+  if (!v.includes(".")) v = `${v}.myshopify.com`;
+  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(v)) {
+    return null;
+  }
+  return v;
+}
+
+export interface ShopifyPreviewResult {
+  error?: string;
+  shop?: ShopifyShopInfo;
+}
+
+export async function previewShopifyStore(
+  shopDomainRaw: string,
+  accessToken: string,
+): Promise<ShopifyPreviewResult> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  const shopDomain = normalizeShopDomain(shopDomainRaw);
+  if (!shopDomain) {
+    return { error: "Enter a valid shop domain, e.g. yourstore.myshopify.com" };
+  }
+  const token = accessToken.trim();
+  if (token.length < 10) {
+    return { error: "That doesn't look like a valid Admin API access token." };
+  }
+
+  try {
+    const principal = await getPrincipal();
+    authorize(principal, "connections.manage");
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    return { error: "Could not verify permissions right now." };
+  }
+
+  try {
+    const shop = await verifyShopifyCredentials(shopDomain, token);
+    return { shop: { ...shop, domain: shopDomain } };
+  } catch (e) {
+    return {
+      error:
+        e instanceof Error
+          ? e.message
+          : "Could not reach Shopify with these credentials.",
+    };
+  }
+}
+
+export async function connectShopifyStore(
+  workspaceId: string,
+  shopDomainRaw: string,
+  accessToken: string,
+): Promise<ActionResult> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  const shopDomain = normalizeShopDomain(shopDomainRaw);
+  if (!shopDomain) {
+    return { error: "Enter a valid shop domain, e.g. yourstore.myshopify.com" };
+  }
+  const token = accessToken.trim();
+  if (token.length < 10) {
+    return { error: "That doesn't look like a valid Admin API access token." };
+  }
+
+  try {
+    const principal = await getPrincipal();
+    authorize(principal, "connections.manage", workspaceId);
+
+    const shop = await verifyShopifyCredentials(shopDomain, token);
+    const db = getDb();
+
+    const [connection] = await db
+      .insert(integrationConnections)
+      .values({
+        orgId: principal.orgId,
+        workspaceId,
+        provider: "shopify",
+        externalAccountId: shopDomain,
+        displayName: shop.name,
+        status: "active",
+        grantedScopes: ["read_orders", "read_customers"],
+        currencyCode: shop.currency,
+        timezone: shop.timezone,
+      })
+      .onConflictDoUpdate({
+        target: [
+          integrationConnections.workspaceId,
+          integrationConnections.provider,
+          integrationConnections.externalAccountId,
+        ],
+        set: {
+          status: "active",
+          lastError: null,
+          displayName: shop.name,
+          currencyCode: shop.currency,
+          timezone: shop.timezone,
+        },
+      })
+      .returning();
+
+    await db
+      .insert(integrationSecrets)
+      .values({
+        connectionId: connection.id,
+        encryptedPayload: encryptSecret(JSON.stringify({ accessToken: token })),
+      })
+      .onConflictDoUpdate({
+        target: integrationSecrets.connectionId,
+        set: {
+          encryptedPayload: encryptSecret(JSON.stringify({ accessToken: token })),
+          rotatedAt: new Date(),
+        },
+      });
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    return {
+      error:
+        e instanceof Error
+          ? `Could not connect this store: ${e.message}`
+          : "Unknown error while connecting.",
+    };
+  }
+
+  revalidatePath("/dashboard/settings");
+  return { ok: true };
+}
+
+/**
+ * Google Ads agency-wide connect — mirrors the Meta agency-token flow
+ * (previewAgencyMetaAccounts/connectAgencyMetaAccounts), but sourced from
+ * GOOGLE_ADS_REFRESH_TOKEN + GOOGLE_ADS_LOGIN_CUSTOMER_ID (the agency's own
+ * MCC) instead of a single long-lived token. This is the recommended path
+ * for connecting client accounts: it needs the admin to mint ONE refresh
+ * token (via Google's OAuth Playground, or by running this app's own
+ * /api/integrations/google_ads/start once and copying the result), then
+ * every client linked under the MCC can be connected just by picking it
+ * from a list — no per-client OAuth consent needed.
+ */
+
+export interface GoogleAdsAccountPreview {
+  customerId: string;
+  name: string;
+  currency: string;
+  timezone: string;
+}
+
+export interface GoogleAdsAccountSelection extends GoogleAdsAccountPreview {
+  workspaceId: string;
+}
+
+export async function previewAgencyGoogleAdsAccounts(): Promise<{
+  error?: string;
+  accounts?: GoogleAdsAccountPreview[];
+}> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  if (!env.GOOGLE_ADS_REFRESH_TOKEN) {
+    return { error: "GOOGLE_ADS_REFRESH_TOKEN isn't set in this environment yet." };
+  }
+  if (!env.GOOGLE_ADS_DEVELOPER_TOKEN) {
+    return { error: "GOOGLE_ADS_DEVELOPER_TOKEN isn't set in this environment yet." };
+  }
+  if (!env.GOOGLE_ADS_LOGIN_CUSTOMER_ID) {
+    return { error: "GOOGLE_ADS_LOGIN_CUSTOMER_ID isn't set in this environment yet." };
+  }
+
+  try {
+    const principal = await getPrincipal();
+    authorize(principal, "connections.manage");
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    return { error: "Could not verify permissions right now." };
+  }
+
+  try {
+    const { accessToken } = await refreshAccessToken(env.GOOGLE_ADS_REFRESH_TOKEN);
+    const accounts = await listLinkedClientAccounts(
+      accessToken,
+      env.GOOGLE_ADS_DEVELOPER_TOKEN,
+      env.GOOGLE_ADS_LOGIN_CUSTOMER_ID,
+    );
+    if (accounts.length === 0) {
+      return {
+        error:
+          "No client accounts found one level under this MCC — check GOOGLE_ADS_LOGIN_CUSTOMER_ID is the manager account's id (digits only, no dashes).",
+      };
+    }
+    return {
+      accounts: accounts.map((a) => ({
+        customerId: a.customerId,
+        name: a.descriptiveName,
+        currency: a.currencyCode,
+        timezone: a.timeZone,
+      })),
+    };
+  } catch (e) {
+    return {
+      error: e instanceof Error ? e.message : "Could not reach Google Ads right now.",
+    };
+  }
+}
+
+export async function connectAgencyGoogleAdsAccounts(
+  selections: GoogleAdsAccountSelection[],
+): Promise<ActionResult> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  if (!env.GOOGLE_ADS_REFRESH_TOKEN) {
+    return { error: "GOOGLE_ADS_REFRESH_TOKEN isn't set in this environment yet." };
+  }
+  if (selections.length === 0) {
+    return { error: "Pick at least one account." };
+  }
+  if (selections.some((s) => !s.workspaceId)) {
+    return { error: "Pick a client workspace for every selected account." };
+  }
+
+  try {
+    const principal = await getPrincipal();
+    const db = getDb();
+
+    for (const sel of selections) {
+      authorize(principal, "connections.manage", sel.workspaceId);
+
+      // Google Ads reporting is on-demand (see google-ads-live.ts) — no
+      // integrationSecrets row saved here, same trick
+      // connectAgencyMetaAccounts uses: an empty secret makes
+      // google-ads-live.ts's resolveCreds() fall back to the shared
+      // GOOGLE_ADS_REFRESH_TOKEN at read time.
+      await db
+        .insert(integrationConnections)
+        .values({
+          orgId: principal.orgId,
+          workspaceId: sel.workspaceId,
+          provider: "google_ads",
+          externalAccountId: sel.customerId,
+          displayName: sel.name,
+          status: "active",
+          grantedScopes: ["adwords"],
+          currencyCode: sel.currency,
+          timezone: sel.timezone,
+        })
+        .onConflictDoUpdate({
+          target: [
+            integrationConnections.workspaceId,
+            integrationConnections.provider,
+            integrationConnections.externalAccountId,
+          ],
+          set: { status: "active", lastError: null, displayName: sel.name },
+        });
+    }
+  } catch (e) {
+    if (e instanceof AuthorizationError) {
+      return { error: "Not allowed for one of the selected workspaces." };
+    }
+    return {
+      error:
+        e instanceof Error
+          ? `Could not save this connection: ${e.message}`
+          : "Unknown error while connecting.",
+    };
+  }
+
+  revalidatePath("/dashboard/settings");
+  return { ok: true };
+}
+
+/**
+ * TikTok manual-token connect — mirrors the Meta paste-a-token flow
+ * exactly (previewMetaAccessToken/connectMetaAccounts). Given genuine
+ * uncertainty about TikTok Business API token lifetimes (see tiktok.ts's
+ * file-level comment), this paste flow — not OAuth — is the recommended
+ * default: it works the same way regardless of how long the pasted token
+ * lasts, and re-pasting a fresh one if it ever expires is a one-step fix.
+ * Two steps: previewTikTokAccessToken lists every ad account the token can
+ * reach, connectTikTokAccounts saves the ones picked.
+ */
+
+export interface TikTokAccountPreview {
+  advertiserId: string;
+  name: string;
+  currency: string;
+  timezone: string;
+}
+
+export interface TikTokAccountSelection extends TikTokAccountPreview {
+  workspaceId: string;
+}
+
+export async function previewTikTokAccessToken(rawToken: string): Promise<{
+  error?: string;
+  accounts?: TikTokAccountPreview[];
+}> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  const accessToken = rawToken.trim();
+  if (accessToken.length < 10) {
+    return { error: "That doesn't look like a valid access token." };
+  }
+  if (!env.TIKTOK_APP_ID || !env.TIKTOK_APP_SECRET) {
+    return { error: "TIKTOK_APP_ID/TIKTOK_APP_SECRET aren't set in this environment yet." };
+  }
+
+  try {
+    const principal = await getPrincipal();
+    authorize(principal, "connections.manage");
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    return { error: "Could not verify permissions right now." };
+  }
+
+  try {
+    const advertiserIds = await fetchAuthorizedAdvertiserIds(accessToken, env.TIKTOK_APP_ID, env.TIKTOK_APP_SECRET);
+    if (advertiserIds.length === 0) {
+      return { error: "This token has no ad accounts attached to it." };
+    }
+    const infos = await fetchAdvertiserInfo(accessToken, advertiserIds);
+    return {
+      accounts: infos.map((a) => ({
+        advertiserId: a.advertiserId,
+        name: a.name,
+        currency: a.currency,
+        timezone: a.timezone,
+      })),
+    };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : "Could not reach TikTok right now." };
+  }
+}
+
+export async function connectTikTokAccounts(
+  rawToken: string,
+  selections: TikTokAccountSelection[],
+): Promise<ActionResult> {
+  if (isDemoMode) {
+    return { error: "Demo mode — connect Supabase to save real connections." };
+  }
+  const accessToken = rawToken.trim();
+  if (accessToken.length < 10) {
+    return { error: "That doesn't look like a valid access token." };
+  }
+  if (selections.length === 0) {
+    return { error: "Pick at least one ad account." };
+  }
+  if (selections.some((s) => !s.workspaceId)) {
+    return { error: "Pick a client workspace for every selected ad account." };
+  }
+
+  try {
+    const principal = await getPrincipal();
+    const db = getDb();
+
+    for (const sel of selections) {
+      authorize(principal, "connections.manage", sel.workspaceId);
+
+      const [connection] = await db
+        .insert(integrationConnections)
+        .values({
+          orgId: principal.orgId,
+          workspaceId: sel.workspaceId,
+          provider: "tiktok",
+          externalAccountId: sel.advertiserId,
+          displayName: sel.name,
+          status: "active",
+          grantedScopes: ["reporting"],
+          currencyCode: sel.currency,
+          timezone: sel.timezone,
+        })
+        .onConflictDoUpdate({
+          target: [
+            integrationConnections.workspaceId,
+            integrationConnections.provider,
+            integrationConnections.externalAccountId,
+          ],
+          set: { status: "active", lastError: null, displayName: sel.name },
+        })
+        .returning();
+
+      // No refresh token from a pasted-token connect (there was no OAuth
+      // exchange) — if this token ever stops working, tiktok-live.ts
+      // surfaces a normal auth error and re-pasting a fresh one here fixes
+      // it, same as Meta's and Shopify's manual-token paths.
+      await db
+        .insert(integrationSecrets)
+        .values({
+          connectionId: connection.id,
+          encryptedPayload: encryptSecret(JSON.stringify({ accessToken })),
+        })
+        .onConflictDoUpdate({
+          target: integrationSecrets.connectionId,
+          set: {
+            encryptedPayload: encryptSecret(JSON.stringify({ accessToken })),
+            rotatedAt: new Date(),
+          },
+        });
+    }
+  } catch (e) {
+    if (e instanceof AuthorizationError) {
+      return { error: "Not allowed for one of the selected workspaces." };
+    }
+    return {
+      error:
+        e instanceof Error
+          ? `Could not save this connection: ${e.message}`
+          : "Unknown error while connecting.",
+    };
+  }
+
+  revalidatePath("/dashboard/settings");
+  return { ok: true };
 }

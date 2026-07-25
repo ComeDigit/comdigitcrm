@@ -9,13 +9,20 @@ import {
   type DateRange,
   type RangePreset,
 } from "@/features/metrics/queries";
-import { getLiveMetaReport } from "@/features/integrations/meta-live";
+import {
+  getLiveAdsReport,
+  adsReportFromRows,
+  AD_PROVIDER_KEYS,
+  AD_PROVIDER_LABELS,
+  type LiveAdsReport,
+} from "@/features/integrations/live-ads";
+import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
 import {
   adMetrics,
   blendedMetrics,
   shopMetrics,
-  sumAdFacts,
   sumShopFacts,
+  type ShopFacts,
 } from "@/lib/metrics/definitions";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
 import { isDemoMode } from "@/lib/env";
@@ -51,31 +58,52 @@ export async function OverviewReport({
   const rangeLabel = formatRangeLabel(range, preset);
   const prevRange = previousPeriod(range);
 
-  // Meta is pulled live (see features/integrations/meta-live.ts) — nothing
-  // syncs it to the database anymore, so the database query here only
-  // covers Google/TikTok in live mode. Demo mode keeps its old all-three
-  // behaviour since there's no live Meta connection to speak of.
-  const dbAdProviders = isDemoMode
-    ? (["meta", "google_ads", "tiktok"] as const)
-    : (["google_ads", "tiktok"] as const);
+  // Meta/Google Ads/TikTok/Shopify are all pulled live now (see
+  // features/integrations/*-live.ts) — nothing syncs to the database
+  // anymore. Demo mode keeps reading the deterministic generator for both,
+  // reshaped into the same {totals, trend, byProvider} structure via
+  // adsReportFromRows so everything below reads one shape either way.
+  let ads: LiveAdsReport;
+  let adsPrev: LiveAdsReport;
+  let shop: Array<ShopFacts & { date: string }>;
+  let prevShop: Array<ShopFacts & { date: string }>;
+  let shopFailures: Array<{ displayName: string; reason: string }> = [];
 
-  const [dbAds, shop, prevDbAds, prevShop, metaCurrent, metaPrevious] = await Promise.all([
-    getAdDaily(workspaceId, range, [...dbAdProviders]),
-    getShopDaily(workspaceId, range),
-    getAdDaily(workspaceId, prevRange, [...dbAdProviders]),
-    getShopDaily(workspaceId, prevRange),
-    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, range),
-    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, prevRange),
-  ]);
+  if (!isDemoMode) {
+    const [adsCurrent, adsPrevious, shopCurrent, shopPrevious] = await Promise.all([
+      getLiveAdsReport(workspaceId, range),
+      getLiveAdsReport(workspaceId, prevRange),
+      getLiveShopifyReport(workspaceId, range),
+      getLiveShopifyReport(workspaceId, prevRange),
+    ]);
+    ads = adsCurrent;
+    adsPrev = adsPrevious;
+    shop = shopCurrent.rows;
+    prevShop = shopPrevious.rows;
+    shopFailures = shopCurrent.failures;
+  } else {
+    const [dbAds, prevDbAds, shopRows, prevShopRows] = await Promise.all([
+      getAdDaily(workspaceId, range, [...AD_PROVIDER_KEYS]),
+      getAdDaily(workspaceId, prevRange, [...AD_PROVIDER_KEYS]),
+      getShopDaily(workspaceId, range),
+      getShopDaily(workspaceId, prevRange),
+    ]);
+    ads = adsReportFromRows(dbAds);
+    adsPrev = adsReportFromRows(prevDbAds);
+    shop = shopRows;
+    prevShop = prevShopRows;
+  }
 
-  // dbAds keeps its per-row shape (date + provider) for the trend chart and
-  // the per-channel breakdown below; metaCurrent/metaPrevious carry Meta's
-  // live totals separately since they don't have that per-row shape.
-  const metaFailures = metaCurrent?.failures ?? [];
+  // ads.failures already carry a `provider` tag (see live-ads.ts) — merged
+  // with Shopify's own failures for one combined banner below.
+  const allFailures = [
+    ...ads.failures.map((f) => ({ channel: AD_PROVIDER_LABELS[f.provider], displayName: f.displayName, reason: f.reason })),
+    ...shopFailures.map((f) => ({ channel: "Shopify", displayName: f.displayName, reason: f.reason })),
+  ];
 
-  const a = sumAdFacts(metaCurrent ? [sumAdFacts(dbAds), metaCurrent.totals] : dbAds);
+  const a = ads.totals;
   const s = sumShopFacts(shop);
-  const pa = sumAdFacts(metaPrevious ? [sumAdFacts(prevDbAds), metaPrevious.totals] : prevDbAds);
+  const pa = adsPrev.totals;
   const ps = sumShopFacts(prevShop);
 
   const deltaOf = (curr: number, prev: number) =>
@@ -114,24 +142,17 @@ export async function OverviewReport({
     { label: "Returning share", value: formatPercent(shopMetrics.returningShare(s)), delta: deltaOf(shopMetrics.returningShare(s), shopMetrics.returningShare(ps)), info: "What percentage of your customers this period had bought from you before — a sign of loyalty." },
   ];
 
-  // Merge ads spend + shop revenue into one daily trend. Google/TikTok come
-  // from dbAds (per-row, has a date); Meta's live trend is a separate array
-  // with the same {date, spendMinor} shape, merged in alongside it.
+  // Merge ads spend + shop revenue into one daily trend. ads.trend is
+  // already merged across all three ad channels (see live-ads.ts /
+  // adsReportFromRows above).
   const byDate = new Map<string, { date: string; revenue: number; spend: number }>();
   for (const row of shop) {
     byDate.set(row.date, { date: row.date, revenue: row.netSalesMinor, spend: 0 });
   }
-  for (const row of dbAds) {
+  for (const row of ads.trend) {
     const entry = byDate.get(row.date) ?? { date: row.date, revenue: 0, spend: 0 };
     entry.spend += row.spendMinor;
     byDate.set(row.date, entry);
-  }
-  if (metaCurrent) {
-    for (const row of metaCurrent.trend) {
-      const entry = byDate.get(row.date) ?? { date: row.date, revenue: 0, spend: 0 };
-      entry.spend += row.spendMinor;
-      byDate.set(row.date, entry);
-    }
   }
   const trend = [...byDate.values()].sort((x, y) => x.date.localeCompare(y.date));
   const ordersTrend = shop.map((r) => ({ date: r.date, orders: r.orders }));
@@ -140,13 +161,20 @@ export async function OverviewReport({
 
   return (
     <>
-      {metaFailures.length > 0 ? (
+      {allFailures.length > 0 ? (
         <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
           <p>
-            Meta numbers below may be incomplete — couldn&apos;t reach{" "}
-            {metaFailures.length === 1 ? "1 connected Meta account" : `${metaFailures.length} connected Meta accounts`}{" "}
-            just now. Check Settings or the Meta Ads page for details.
+            Numbers below may be incomplete — couldn&apos;t reach{" "}
+            {allFailures.length === 1 ? "1 connected account" : `${allFailures.length} connected accounts`} just
+            now. This report is pulled live on every page view, so refreshing may resolve it.
           </p>
+          <ul className="mt-1 list-inside list-disc space-y-0.5">
+            {allFailures.map((f, i) => (
+              <li key={`${f.channel}-${f.displayName}-${i}`}>
+                <span className="font-medium">{f.channel} · {f.displayName}:</span> {f.reason}
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
@@ -232,13 +260,8 @@ export async function OverviewReport({
         <Card>
           <CardHeader title="Channel efficiency" subtitle={rangeLabel} />
           <div className="space-y-3 px-5 pb-5 pt-2">
-            {(["meta", "google_ads", "tiktok"] as const).map((provider) => {
-              // Meta no longer has rows in dbAds (it's pulled live) — use
-              // its live totals directly instead of filtering for it.
-              const totals =
-                provider === "meta"
-                  ? (metaCurrent?.totals ?? sumAdFacts([]))
-                  : sumAdFacts(dbAds.filter((r) => r.provider === provider));
+            {AD_PROVIDER_KEYS.map((provider) => {
+              const totals = ads.byProvider[provider].totals;
               const roas = adMetrics.roas(totals);
               return (
                 <div

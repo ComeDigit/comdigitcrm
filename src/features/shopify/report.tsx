@@ -8,8 +8,10 @@ import {
   type DateRange,
   type RangePreset,
 } from "@/features/metrics/queries";
+import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
 import { shopMetrics, sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
+import { isDemoMode } from "@/lib/env";
 
 /**
  * The read-only Shopify report body — KPI grid + sales/customer charts —
@@ -27,10 +29,37 @@ export async function ShopifyReport({
   preset: RangePreset;
 }) {
   const rangeLabel = formatRangeLabel(range, preset);
-  const [rows, prevRows] = await Promise.all([
-    getShopDaily(workspaceId, range),
-    getShopDaily(workspaceId, previousPeriod(range)),
-  ]);
+  const prevRange = previousPeriod(range);
+
+  // Shopify is pulled live now (see features/integrations/shopify-live.ts)
+  // — nothing syncs orders to the database anymore, same "pull-on-demand"
+  // shape as Meta/Google Ads/TikTok. Demo mode keeps reading the
+  // deterministic generator via getShopDaily since there's no real store
+  // connected to pull from.
+  let rows: Array<ShopFacts & { date: string }>;
+  let prevRows: Array<ShopFacts & { date: string }>;
+  let partialFailure = false;
+  let failures: Array<{ displayName: string; reason: string }> = [];
+
+  if (!isDemoMode) {
+    const [current, previous] = await Promise.all([
+      getLiveShopifyReport(workspaceId, range),
+      getLiveShopifyReport(workspaceId, prevRange),
+    ]);
+    rows = current.rows;
+    prevRows = previous.rows;
+    partialFailure = current.partialFailure || previous.partialFailure;
+    // Current-range failures are the most relevant to show — the previous-
+    // period pull uses the same connections/credentials, so its failures
+    // would just be duplicates for the same underlying reason.
+    failures = current.failures;
+  } else {
+    [rows, prevRows] = await Promise.all([
+      getShopDaily(workspaceId, range),
+      getShopDaily(workspaceId, prevRange),
+    ]);
+  }
+
   const totals = sumShopFacts(rows);
   const prev = sumShopFacts(prevRows);
   const deltaOf = (c: number, p: number) => (p > 0 ? (c - p) / p : 0);
@@ -68,6 +97,25 @@ export async function ShopifyReport({
 
   return (
     <>
+      {partialFailure ? (
+        <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
+          <p>
+            Couldn&apos;t reach {failures.length === 1 ? "one connected store" : `${failures.length || "one or more"} connected store(s)`} just
+            now — numbers below may be incomplete. This report is pulled live on every page view,
+            so refreshing may resolve it.
+          </p>
+          {failures.length > 0 ? (
+            <ul className="mt-1 list-inside list-disc space-y-0.5">
+              {failures.map((f, i) => (
+                <li key={`${f.displayName}-${i}`}>
+                  <span className="font-medium">{f.displayName}:</span> {f.reason}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
       <div>
         <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
           {rangeLabel} · vs previous period · hover the ⓘ on any card for a plain-English explanation
