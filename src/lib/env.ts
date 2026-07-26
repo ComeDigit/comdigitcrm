@@ -23,6 +23,15 @@ const serverSchema = z.object({
    *  webhook settings). Read directly by the webhook route too; declared
    *  here as well so it's validated/discoverable alongside every other key. */
   SHOPIFY_WEBHOOK_SECRET: z.string().min(1).optional(),
+  /** Shopify OAuth app credentials (Partner/Dev Dashboard → your app →
+   *  Client ID/Client secret — "custom distribution" so it installs on a
+   *  client's store without App Store review). Powers the
+   *  /api/integrations/shopify/start|callback "Connect" button — the
+   *  alternative to pasting an Admin API access token by hand. Shopify
+   *  retired in-admin custom apps for new setups, so this is now the
+   *  simpler path for connecting a brand-new client store. */
+  SHOPIFY_CLIENT_ID: z.string().min(1).optional(),
+  SHOPIFY_CLIENT_SECRET: z.string().min(1).optional(),
   /** Google Ads OAuth client (Google Cloud Console → APIs & Services →
    *  Credentials → OAuth client ID, type "Web application"). Required for
    *  the /api/integrations/google_ads/start|callback OAuth flow. */
@@ -67,6 +76,8 @@ export const env = {
     META_APP_ID: process.env.META_APP_ID,
     META_APP_SECRET: process.env.META_APP_SECRET,
     SHOPIFY_WEBHOOK_SECRET: process.env.SHOPIFY_WEBHOOK_SECRET,
+    SHOPIFY_CLIENT_ID: process.env.SHOPIFY_CLIENT_ID,
+    SHOPIFY_CLIENT_SECRET: process.env.SHOPIFY_CLIENT_SECRET,
     GOOGLE_ADS_CLIENT_ID: process.env.GOOGLE_ADS_CLIENT_ID,
     GOOGLE_ADS_CLIENT_SECRET: process.env.GOOGLE_ADS_CLIENT_SECRET,
     GOOGLE_ADS_DEVELOPER_TOKEN: process.env.GOOGLE_ADS_DEVELOPER_TOKEN,

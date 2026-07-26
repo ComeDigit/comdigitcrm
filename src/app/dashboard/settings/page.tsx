@@ -9,6 +9,7 @@ import {
   ConnectMetaAgencyForm,
   AutoProvisionMetaAccountsButton,
   ConnectShopifyForm,
+  ConnectShopifyOAuthForm,
   ConnectGoogleAdsAgencyForm,
   ConnectTikTokTokenForm,
 } from "@/features/integrations/components/forms";
@@ -50,6 +51,7 @@ export default async function SettingsPage() {
   const connections = await getConnections(principal.orgId);
   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
   const metaConfigured = Boolean(process.env.META_APP_ID);
+  const shopifyOAuthConfigured = Boolean(process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET);
   const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
   const googleAdsConfigured = Boolean(process.env.GOOGLE_ADS_CLIENT_ID);
   const googleAdsAgencyConfigured = Boolean(env.GOOGLE_ADS_REFRESH_TOKEN);
@@ -266,6 +268,9 @@ export default async function SettingsPage() {
                     ) : null}
                     {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
                       <AutoProvisionMetaAccountsButton />
+                    ) : null}
+                    {p.key === "shopify" && !isDemoMode && shopifyOAuthConfigured ? (
+                      <ConnectShopifyOAuthForm workspaceId={workspaceId} />
                     ) : null}
                     {p.key === "shopify" && !isDemoMode ? (
                       <ConnectShopifyForm workspaces={workspaces} />

@@ -486,12 +486,12 @@ export function ConnectShopifyForm({
           {!shopInfo ? (
             <div className="space-y-2.5">
               <p className="text-xs leading-relaxed text-muted">
-                In the store&apos;s Shopify admin: Settings → Apps and sales channels →
-                Develop apps → Create an app → enable{" "}
-                <code className="rounded bg-surface-2 px-1">read_orders</code> and{" "}
-                <code className="rounded bg-surface-2 px-1">read_customers</code> under Admin
-                API scopes → Install app. Paste the access token it shows you (starts with{" "}
-                <code className="rounded bg-surface-2 px-1">shpat_</code>) below.
+                Already have an Admin API access token for this store (from an existing
+                custom app, or one minted another way)? Paste it below — it starts with{" "}
+                <code className="rounded bg-surface-2 px-1">shpat_</code>. Setting up a brand
+                new store? The &quot;Connect via OAuth&quot; button is the easier path now —
+                Shopify moved custom-app creation to the Dev Dashboard, so there&apos;s no
+                longer a one-click way to get a token straight from a store&apos;s own admin.
               </p>
               <div>
                 <label className="mb-1 block text-xs text-muted">Shop domain</label>
@@ -545,6 +545,58 @@ export function ConnectShopifyForm({
               </div>
             </div>
           )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * OAuth "Connect" for Shopify — the recommended path now that Shopify has
+ * retired in-admin custom-app creation (see the paste-a-token form's
+ * copy). Unlike Meta/Google Ads/TikTok, Shopify's consent dialog lives on
+ * the STORE's own domain rather than one fixed URL, so this needs a shop
+ * domain up front. A plain GET form straight to the start route is enough
+ * — no client-side preview step, Shopify's own consent screen (and the
+ * callback's HMAC verification) is what proves the connection is real.
+ * Connects to whichever workspace is currently active in the top nav —
+ * same convention as the plain OAuth anchor Meta/Google Ads/TikTok use.
+ */
+export function ConnectShopifyOAuthForm({ workspaceId }: { workspaceId: string }) {
+  const [open, setOpen] = useState(false);
+  const [shop, setShop] = useState("");
+
+  return (
+    <div className="relative">
+      <Button
+        variant="outline"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <X size={13} /> : <ShoppingBag size={13} />} Connect via OAuth
+      </Button>
+      {open ? (
+        <div className="absolute right-0 z-30 mt-2 w-80 rounded-xl border border-border bg-surface p-4 shadow-xl">
+          <form action="/api/integrations/shopify/start" method="GET" className="space-y-2.5">
+            <p className="text-xs leading-relaxed text-muted">
+              Enter the client&apos;s store domain. You&apos;ll be sent to Shopify to approve
+              access for the currently-active workspace, then back here, connected.
+            </p>
+            <input type="hidden" name="workspace" value={workspaceId} />
+            <div>
+              <label className="mb-1 block text-xs text-muted">Shop domain</label>
+              <input
+                className={inputCls}
+                name="shop"
+                value={shop}
+                onChange={(e) => setShop(e.target.value)}
+                placeholder="yourstore.myshopify.com"
+                required
+              />
+            </div>
+            <Button className="w-full" type="submit" disabled={!shop.trim()}>
+              Continue to Shopify
+            </Button>
+          </form>
         </div>
       ) : null}
     </div>
