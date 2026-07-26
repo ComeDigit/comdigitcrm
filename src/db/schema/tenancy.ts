@@ -44,6 +44,15 @@ export const organizations = pgTable("organizations", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/**
+ * Suspend ≠ delete: "suspended" is a normal, reversible, admin-toggled
+ * pause (client access blocked, data untouched) — distinct from
+ * `archivedAt` below, which is the soft-delete path. A workspace can be
+ * suspended without being archived, and vice versa isn't meaningful (an
+ * archived workspace is already hidden everywhere).
+ */
+export const workspaceStatusEnum = pgEnum("workspace_status", ["active", "suspended"]);
+
 export const workspaces = pgTable(
   "workspaces",
   {
@@ -58,6 +67,7 @@ export const workspaces = pgTable(
     website: text("website"),
     currencyCode: text("currency_code").notNull().default("INR"),
     timezone: text("timezone").notNull().default("Asia/Kolkata"),
+    status: workspaceStatusEnum("status").notNull().default("active"),
     /** Soft archive keeps history queryable. */
     archivedAt: timestamp("archived_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

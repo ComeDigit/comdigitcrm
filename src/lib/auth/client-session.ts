@@ -7,6 +7,22 @@ import { clientSessions } from "@/db/schema";
 import { eq } from "drizzle-orm";
 
 /**
+ * A session that resolves to a suspended or archived workspace is treated
+ * as invalid — this is what makes "Suspend client" / "Delete client" in the
+ * admin clients page actually cut off portal access, rather than just
+ * hiding the workspace from the admin's own roster while the client stays
+ * logged in indefinitely on their existing session.
+ */
+async function workspaceBlocksAccess(workspaceId: string): Promise<boolean> {
+  const db = getDb();
+  const workspace = await db.query.workspaces.findFirst({
+    where: (w, { eq: eqOp }) => eqOp(w.id, workspaceId),
+    columns: { status: true, archivedAt: true },
+  });
+  return !workspace || workspace.status === "suspended" || workspace.archivedAt !== null;
+}
+
+/**
  * Client portal auth — a second, separate login system from the internal
  * agency dashboard (which has none, by design). A client_user is tied to
  * exactly one workspace; a session resolves to that workspace and ONLY
@@ -93,6 +109,7 @@ export async function getClientSession(): Promise<ClientSession | null> {
     where: (u, { eq: eqOp }) => eqOp(u.id, session.clientUserId),
   });
   if (!user || user.status !== "active") return null;
+  if (await workspaceBlocksAccess(user.workspaceId)) return null;
 
   return {
     clientUserId: user.id,

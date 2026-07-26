@@ -34,19 +34,48 @@ export interface WorkspaceRow {
   id: string;
   name: string;
   vertical?: string;
+  status: "active" | "suspended";
+  website: string | null;
+  archivedAt: string | null;
 }
 
 export async function getWorkspaces(orgId: string): Promise<WorkspaceRow[]> {
   if (isDemoMode) {
-    return demoWorkspaces.map((w) => ({ id: w.id, name: w.name, vertical: w.vertical }));
+    return demoWorkspaces.map((w) => ({
+      id: w.id,
+      name: w.name,
+      vertical: w.vertical,
+      status: "active",
+      website: null,
+      archivedAt: null,
+    }));
   }
   const db = getDb();
   const rows = await db.query.workspaces.findMany({
     where: (w, { eq, and, isNull }) => and(eq(w.orgId, orgId), isNull(w.archivedAt)),
-    columns: { id: true, name: true },
+    columns: { id: true, name: true, status: true, website: true, archivedAt: true },
     orderBy: (w, { asc }) => asc(w.createdAt),
   });
-  return rows;
+  return rows.map((r) => ({ ...r, archivedAt: r.archivedAt ? r.archivedAt.toISOString() : null }));
+}
+
+/**
+ * Archived (soft-deleted) clients only — the "Delete client" action never
+ * hard-deletes (that would cascade-wipe contacts/tasks/invoices/connections/
+ * client logins with zero recovery path); it sets archivedAt instead, and
+ * this is how the clients page renders a separate "Archived" section with
+ * a Restore action, matching how getWorkspaces already hides them from the
+ * main roster.
+ */
+export async function getArchivedWorkspaces(orgId: string): Promise<WorkspaceRow[]> {
+  if (isDemoMode) return [];
+  const db = getDb();
+  const rows = await db.query.workspaces.findMany({
+    where: (w, { eq, and, isNotNull }) => and(eq(w.orgId, orgId), isNotNull(w.archivedAt)),
+    columns: { id: true, name: true, status: true, website: true, archivedAt: true },
+    orderBy: (w, { desc }) => desc(w.archivedAt),
+  });
+  return rows.map((r) => ({ ...r, archivedAt: r.archivedAt ? r.archivedAt.toISOString() : null }));
 }
 
 export async function getContacts(orgId: string): Promise<ContactRow[]> {

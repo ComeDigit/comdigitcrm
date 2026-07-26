@@ -18,8 +18,14 @@ async function liveWorkspaceList(): Promise<Array<{ id: string; name: string }>>
   const principal = await getPrincipal();
   if (!principal) return [];
   const db = getDb();
+  // Archived (soft-deleted) clients must disappear from the switcher too —
+  // otherwise "delete client" only hides a workspace from the roster page
+  // while every other dashboard route stays fully reachable for it via this
+  // dropdown. Suspended clients are NOT filtered here: suspend only blocks
+  // that client's own portal login: the agency's internal dashboard access
+  // to a suspended client's data is untouched by design.
   const rows = await db.query.workspaces.findMany({
-    where: (w, { eq }) => eq(w.orgId, principal.orgId),
+    where: (w, { eq, and, isNull }) => and(eq(w.orgId, principal.orgId), isNull(w.archivedAt)),
   });
   if (rows.length > 0) return rows.map((w) => ({ id: w.id, name: w.name }));
 
@@ -30,9 +36,11 @@ async function liveWorkspaceList(): Promise<Array<{ id: string; name: string }>>
     .returning();
   if (created) return [{ id: created.id, name: created.name }];
 
-  // Race with another concurrent bootstrap request — re-read.
+  // Race with another concurrent bootstrap request — re-read. Same
+  // archived-filter as above; onConflictDoNothing can no-op against an
+  // archived workspace that happens to share the bootstrap slug.
   const retry = await db.query.workspaces.findMany({
-    where: (w, { eq }) => eq(w.orgId, principal.orgId),
+    where: (w, { eq, and, isNull }) => and(eq(w.orgId, principal.orgId), isNull(w.archivedAt)),
   });
   return retry.map((w) => ({ id: w.id, name: w.name }));
 }

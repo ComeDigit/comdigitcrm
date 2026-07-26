@@ -244,6 +244,18 @@ export const clientUsers = pgTable(
     username: text("username").notNull(),
     passwordHash: text("password_hash").notNull(),
     status: clientUserStatusEnum("status").notNull().default("active"),
+    /**
+     * Login rate limiting: failedAttempts increments on each bad password
+     * and resets to 0 on a successful login. Once it crosses the threshold
+     * (see client-portal/actions.ts), lockedUntil is set to a future
+     * timestamp and login is refused — even with the correct password —
+     * until that time passes, at which point the next attempt is allowed
+     * again and the counters reset. This is a per-account lock (not IP-based)
+     * matching what a single client login form can enforce without extra
+     * infra.
+     */
+    failedAttempts: integer("failed_attempts").notNull().default(0),
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

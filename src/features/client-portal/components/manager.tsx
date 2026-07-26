@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState, useTransition } from "react";
-import { KeyRound, Power, Trash2 } from "lucide-react";
+import { KeyRound, Power, Trash2, LockOpen } from "lucide-react";
 import {
   getClientLogin,
   saveClientLogin,
   setClientLoginStatus,
+  unlockClientLogin,
   deleteClientLogin,
   type ClientLoginSummary,
 } from "@/features/client-portal/actions";
@@ -79,6 +80,16 @@ export function ClientPortalManager({
     });
   }
 
+  function unlock() {
+    if (!login) return;
+    startTransition(async () => {
+      const result = await unlockClientLogin(login.id, workspaceId);
+      if (!result.error) refresh(workspaceId);
+    });
+  }
+
+  const isLocked = Boolean(login?.lockedUntil && new Date(login.lockedUntil) > new Date());
+
   if (workspaces.length === 0) {
     return (
       <p className="text-xs text-muted">Add a client workspace first to create a client login.</p>
@@ -111,11 +122,22 @@ export function ClientPortalManager({
                 ? `Last login ${new Date(login.lastLoginAt).toLocaleString("en-IN")}`
                 : "Never logged in"}
             </p>
+            {isLocked ? (
+              <p className="text-xs text-negative">
+                Locked until {new Date(login.lockedUntil as string).toLocaleTimeString("en-IN")}{" "}
+                after too many failed sign-ins.
+              </p>
+            ) : null}
           </div>
           <div className="flex items-center gap-2">
             <Badge tone={login.status === "active" ? "positive" : "outline"}>
               {login.status === "active" ? "Active" : "Disabled"}
             </Badge>
+            {isLocked ? (
+              <Button variant="outline" disabled={pending} onClick={unlock}>
+                <LockOpen size={13} /> Unlock
+              </Button>
+            ) : null}
             <Button variant="outline" disabled={pending} onClick={toggleStatus}>
               <Power size={13} /> {login.status === "active" ? "Disable" : "Enable"}
             </Button>

@@ -1,12 +1,16 @@
 "use client";
 
-import { useActionState, useState } from "react";
-import { Plus, X } from "lucide-react";
+import { useActionState, useState, type ReactNode } from "react";
+import { Plus, X, Pencil, Pause, Play, RotateCcw } from "lucide-react";
 import {
   createContact,
   createTask,
   createWorkspace,
   updateTaskStatus,
+  updateWorkspace,
+  setWorkspaceStatus,
+  archiveWorkspace,
+  restoreWorkspace,
   type ActionResult,
 } from "@/features/crm/actions";
 import { Button } from "@/components/ui/primitives";
@@ -20,19 +24,27 @@ const inputCls =
 
 function Popover({
   label,
+  icon,
+  align = "right",
   children,
 }: {
   label: string;
+  icon?: ReactNode;
+  align?: "left" | "right";
   children: (close: () => void) => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="relative">
       <Button variant="outline" onClick={() => setOpen((v) => !v)}>
-        {open ? <X size={13} /> : <Plus size={13} />} {label}
+        {open ? <X size={13} /> : (icon ?? <Plus size={13} />)} {label}
       </Button>
       {open ? (
-        <div className="absolute right-0 z-30 mt-2 w-80 rounded-xl border border-border bg-surface p-4 shadow-xl">
+        <div
+          className={`absolute z-30 mt-2 w-80 rounded-xl border border-border bg-surface p-4 shadow-xl ${
+            align === "right" ? "right-0" : "left-0"
+          }`}
+        >
           {children(() => setOpen(false))}
         </div>
       ) : null}
@@ -55,6 +67,116 @@ export function NewWorkspaceForm() {
         </form>
       )}
     </Popover>
+  );
+}
+
+/** Rename a client / set its website — the popover behind each card's "Edit". */
+export function EditWorkspaceForm({
+  workspace,
+}: {
+  workspace: { id: string; name: string; website: string | null };
+}) {
+  const [state, formAction, pending] = useActionState(updateWorkspace, initial);
+  return (
+    <Popover label="Edit" icon={<Pencil size={13} />} align="left">
+      {() => (
+        <form action={formAction} className="space-y-2.5">
+          <input type="hidden" name="workspaceId" value={workspace.id} />
+          <input
+            name="name"
+            required
+            defaultValue={workspace.name}
+            placeholder="Client / brand name"
+            className={inputCls}
+          />
+          <input
+            name="website"
+            defaultValue={workspace.website ?? ""}
+            placeholder="Website (optional)"
+            className={inputCls}
+          />
+          {state.error ? <p className="text-xs text-negative">{state.error}</p> : null}
+          {state.ok ? <p className="text-xs text-positive">Saved.</p> : null}
+          <Button type="submit" className="w-full" disabled={pending}>
+            {pending ? "Saving…" : "Save changes"}
+          </Button>
+        </form>
+      )}
+    </Popover>
+  );
+}
+
+/** Suspend blocks that client's own portal login only — admin access, data, and every record are untouched. Reversible with one click. */
+export function WorkspaceStatusToggle({
+  workspaceId,
+  status,
+}: {
+  workspaceId: string;
+  status: "active" | "suspended";
+}) {
+  const [state, formAction, pending] = useActionState(setWorkspaceStatus, initial);
+  const next = status === "active" ? "suspended" : "active";
+  return (
+    <form action={formAction} className="inline" title={state.error}>
+      <input type="hidden" name="workspaceId" value={workspaceId} />
+      <input type="hidden" name="status" value={next} />
+      <Button type="submit" variant="outline" disabled={pending}>
+        {pending ? (
+          "…"
+        ) : status === "active" ? (
+          <>
+            <Pause size={13} /> Suspend
+          </>
+        ) : (
+          <>
+            <Play size={13} /> Reactivate
+          </>
+        )}
+      </Button>
+    </form>
+  );
+}
+
+/** "Delete client" — archives (soft-delete), never hard-deletes. A confirm
+ * step inside the popover explains that, so nobody assumes it's permanent. */
+export function ArchiveWorkspaceForm({
+  workspaceId,
+  name,
+}: {
+  workspaceId: string;
+  name: string;
+}) {
+  const [state, formAction, pending] = useActionState(archiveWorkspace, initial);
+  return (
+    <Popover label="Delete" icon={<X size={13} />}>
+      {() => (
+        <form action={formAction} className="space-y-2.5">
+          <input type="hidden" name="workspaceId" value={workspaceId} />
+          <p className="text-[13px]">
+            Archive <span className="font-medium">{name}</span>? This removes it from your
+            active roster and blocks its client login, but keeps every contact, task, and
+            connection on file — restore it any time from Archived clients below.
+          </p>
+          {state.error ? <p className="text-xs text-negative">{state.error}</p> : null}
+          <Button type="submit" variant="outline" className="w-full" disabled={pending}>
+            {pending ? "Archiving…" : "Archive client"}
+          </Button>
+        </form>
+      )}
+    </Popover>
+  );
+}
+
+/** Undoes ArchiveWorkspaceForm — brings a client back onto the active roster. */
+export function RestoreWorkspaceForm({ workspaceId }: { workspaceId: string }) {
+  const [state, formAction, pending] = useActionState(restoreWorkspace, initial);
+  return (
+    <form action={formAction} className="inline" title={state.error}>
+      <input type="hidden" name="workspaceId" value={workspaceId} />
+      <Button type="submit" variant="outline" disabled={pending}>
+        <RotateCcw size={13} /> {pending ? "Restoring…" : "Restore"}
+      </Button>
+    </form>
   );
 }
 

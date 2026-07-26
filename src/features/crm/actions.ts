@@ -152,6 +152,206 @@ export async function createWorkspace(
   return { ok: true };
 }
 
+const updateWorkspaceSchema = z.object({
+  workspaceId: z.string().uuid(),
+  name: z.string().trim().min(2, "Client name is too short").max(80),
+  website: z.string().trim().max(200).optional().or(z.literal("")),
+});
+
+/** Renames a client brand and/or sets its website — the "Edit client" action. */
+export async function updateWorkspace(
+  _prev: ActionResult,
+  formData: FormData,
+): Promise<ActionResult> {
+  if (isDemoMode) return { error: DEMO_ERROR };
+
+  const parsed = updateWorkspaceSchema.safeParse({
+    workspaceId: formData.get("workspaceId"),
+    name: formData.get("name"),
+    website: formData.get("website"),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input" };
+  }
+
+  const principal = await getPrincipal();
+  try {
+    authorize(principal, "workspace.manage", parsed.data.workspaceId);
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    throw e;
+  }
+
+  const db = getDb();
+  const existing = await db.query.workspaces.findFirst({
+    where: (w, { and: andOp, eq: eqOp }) =>
+      andOp(eqOp(w.id, parsed.data.workspaceId), eqOp(w.orgId, principal.orgId)),
+    columns: { name: true, website: true },
+  });
+  if (!existing) return { error: "Client not found." };
+
+  let website = parsed.data.website?.trim() || "";
+  if (website && !/^https?:\/\//i.test(website)) website = `https://${website}`;
+
+  await db
+    .update(workspaces)
+    .set({ name: parsed.data.name, website: website || null, updatedAt: new Date() })
+    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)));
+
+  await db.insert(auditLog).values({
+    orgId: principal.orgId,
+    workspaceId: parsed.data.workspaceId,
+    actorId: actorIdOrNull(principal.userId),
+    action: "workspace.update",
+    resourceType: "workspace",
+    resourceId: parsed.data.workspaceId,
+    before: existing,
+    after: { name: parsed.data.name, website: website || null },
+  });
+
+  revalidatePath("/dashboard/clients");
+  return { ok: true };
+}
+
+const workspaceStatusSchema = z.object({
+  workspaceId: z.string().uuid(),
+  status: z.enum(["active", "suspended"]),
+});
+
+/**
+ * Suspend ≠ delete: blocks that client's portal login (checked in
+ * getClientSession/clientLogin) while leaving every row untouched and
+ * reversible with one click. This is what "Suspend client" means in the
+ * clients-page UI.
+ */
+export async function setWorkspaceStatus(
+  _prev: ActionResult,
+  formData: FormData,
+): Promise<ActionResult> {
+  if (isDemoMode) return { error: DEMO_ERROR };
+
+  const parsed = workspaceStatusSchema.safeParse({
+    workspaceId: formData.get("workspaceId"),
+    status: formData.get("status"),
+  });
+  if (!parsed.success) return { error: "Invalid input" };
+
+  const principal = await getPrincipal();
+  try {
+    authorize(principal, "workspace.manage", parsed.data.workspaceId);
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    throw e;
+  }
+
+  const db = getDb();
+  const [row] = await db
+    .update(workspaces)
+    .set({ status: parsed.data.status, updatedAt: new Date() })
+    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)))
+    .returning({ id: workspaces.id });
+  if (!row) return { error: "Client not found." };
+
+  await db.insert(auditLog).values({
+    orgId: principal.orgId,
+    workspaceId: parsed.data.workspaceId,
+    actorId: actorIdOrNull(principal.userId),
+    action: parsed.data.status === "suspended" ? "workspace.suspend" : "workspace.reactivate",
+    resourceType: "workspace",
+    resourceId: parsed.data.workspaceId,
+    after: { status: parsed.data.status },
+  });
+
+  revalidatePath("/dashboard/clients");
+  return { ok: true };
+}
+
+const workspaceIdSchema = z.object({ workspaceId: z.string().uuid() });
+
+/**
+ * "Delete client" — a soft delete (archivedAt), never a hard delete. A hard
+ * delete would cascade-wipe contacts/tasks/notes/invoices/connections/
+ * client logins in one irreversible shot; archiving hides the workspace
+ * from the roster and blocks its client login (same check as suspend) while
+ * keeping every row recoverable via restoreWorkspace below.
+ */
+export async function archiveWorkspace(
+  _prev: ActionResult,
+  formData: FormData,
+): Promise<ActionResult> {
+  if (isDemoMode) return { error: DEMO_ERROR };
+
+  const parsed = workspaceIdSchema.safeParse({ workspaceId: formData.get("workspaceId") });
+  if (!parsed.success) return { error: "Invalid input" };
+
+  const principal = await getPrincipal();
+  try {
+    authorize(principal, "workspace.manage", parsed.data.workspaceId);
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    throw e;
+  }
+
+  const db = getDb();
+  const [row] = await db
+    .update(workspaces)
+    .set({ archivedAt: new Date(), updatedAt: new Date() })
+    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)))
+    .returning({ id: workspaces.id });
+  if (!row) return { error: "Client not found." };
+
+  await db.insert(auditLog).values({
+    orgId: principal.orgId,
+    workspaceId: parsed.data.workspaceId,
+    actorId: actorIdOrNull(principal.userId),
+    action: "workspace.archive",
+    resourceType: "workspace",
+    resourceId: parsed.data.workspaceId,
+  });
+
+  revalidatePath("/dashboard/clients");
+  return { ok: true };
+}
+
+/** Undoes archiveWorkspace — brings a client back onto the active roster. */
+export async function restoreWorkspace(
+  _prev: ActionResult,
+  formData: FormData,
+): Promise<ActionResult> {
+  if (isDemoMode) return { error: DEMO_ERROR };
+
+  const parsed = workspaceIdSchema.safeParse({ workspaceId: formData.get("workspaceId") });
+  if (!parsed.success) return { error: "Invalid input" };
+
+  const principal = await getPrincipal();
+  try {
+    authorize(principal, "workspace.manage", parsed.data.workspaceId);
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    throw e;
+  }
+
+  const db = getDb();
+  const [row] = await db
+    .update(workspaces)
+    .set({ archivedAt: null, updatedAt: new Date() })
+    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)))
+    .returning({ id: workspaces.id });
+  if (!row) return { error: "Client not found." };
+
+  await db.insert(auditLog).values({
+    orgId: principal.orgId,
+    workspaceId: parsed.data.workspaceId,
+    actorId: actorIdOrNull(principal.userId),
+    action: "workspace.restore",
+    resourceType: "workspace",
+    resourceId: parsed.data.workspaceId,
+  });
+
+  revalidatePath("/dashboard/clients");
+  return { ok: true };
+}
+
 const taskSchema = z.object({
   workspaceId: z.string().uuid("Pick a client workspace"),
   title: z.string().trim().min(2, "Title is too short").max(200),
