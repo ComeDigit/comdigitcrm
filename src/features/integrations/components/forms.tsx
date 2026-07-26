@@ -14,6 +14,7 @@ import {
   connectAgencyGoogleAdsAccounts,
   previewTikTokAccessToken,
   connectTikTokAccounts,
+  disconnectConnection,
   type MetaAccountPreview,
   type GoogleAdsAccountPreview,
   type TikTokAccountPreview,
@@ -408,6 +409,50 @@ export function AutoProvisionMetaAccountsButton() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Cuts a single connected account off — the counterpart to every connect
+ * flow above. Previously there was no way to do this at all short of
+ * editing the database by hand. Reversible: reconnecting through the
+ * normal flow (with valid credentials) brings it back to active.
+ */
+export function DisconnectConnectionButton({
+  connectionId,
+  workspaceId,
+}: {
+  connectionId: string;
+  workspaceId: string;
+}) {
+  const [pending, startTransition] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  function run() {
+    setError(null);
+    startTransition(async () => {
+      const result = await disconnectConnection(connectionId, workspaceId);
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      setDone(true);
+    });
+  }
+
+  if (done) return <span className="text-xs text-muted">Disconnected</span>;
+
+  return (
+    <button
+      type="button"
+      disabled={pending}
+      onClick={run}
+      title={error ?? undefined}
+      className="text-xs font-medium text-muted underline-offset-4 hover:text-negative hover:underline disabled:opacity-50"
+    >
+      {pending ? "…" : "Disconnect"}
+    </button>
   );
 }
 

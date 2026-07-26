@@ -3,7 +3,7 @@ import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
 import { env, isDemoMode } from "@/lib/env";
 import { getPrincipal } from "@/lib/auth/principal";
 import { getActiveWorkspaceId } from "@/lib/workspace";
-import { getWorkspaces } from "@/features/crm/queries";
+import { getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
 import {
   ConnectMetaTokenForm,
   ConnectMetaAgencyForm,
@@ -12,6 +12,7 @@ import {
   ConnectShopifyOAuthForm,
   ConnectGoogleAdsAgencyForm,
   ConnectTikTokTokenForm,
+  DisconnectConnectionButton,
 } from "@/features/integrations/components/forms";
 import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
 import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
@@ -50,6 +51,13 @@ export default async function SettingsPage() {
   const workspaceId = await getActiveWorkspaceId();
   const connections = await getConnections(principal.orgId);
   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
+  const archivedWorkspaces = isDemoMode ? [] : await getArchivedWorkspaces(principal.orgId);
+  // Connections span every client — without this label, a Meta/Shopify/
+  // Google Ads/TikTok connection only ever shows its own ad-account/store
+  // name, with no indication of WHICH client it belongs to (AUDIT_REPORT.md
+  // — Partial: "global connected-accounts view doesn't label by client").
+  const workspaceNameById = new Map<string, string>();
+  for (const w of [...workspaces, ...archivedWorkspaces]) workspaceNameById.set(w.id, w.name);
   const metaConfigured = Boolean(process.env.META_APP_ID);
   const shopifyOAuthConfigured = Boolean(process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET);
   const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
@@ -228,9 +236,12 @@ export default async function SettingsPage() {
                   <div>
                     <span className="font-medium">{p.label}</span>
                     {existing.map((c) => (
-                      <p key={c.id} className="flex items-center gap-1.5 text-xs text-muted">
+                      <p key={c.id} className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
+                        <span className="font-medium text-foreground">
+                          {workspaceNameById.get(c.workspaceId) ?? "Deleted client"}
+                        </span>
                         <span>
-                          {c.displayName} ·{" "}
+                          — {c.displayName} ·{" "}
                           <span className={c.status === "active" ? "text-positive" : "text-muted"}>
                             {c.status}
                           </span>
@@ -241,6 +252,9 @@ export default async function SettingsPage() {
                           </Badge>
                         ) : c.lastSyncAt ? (
                           `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
+                        ) : null}
+                        {c.status === "active" ? (
+                          <DisconnectConnectionButton connectionId={c.id} workspaceId={c.workspaceId} />
                         ) : null}
                       </p>
                     ))}

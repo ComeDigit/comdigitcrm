@@ -5,15 +5,43 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { isDemoMode } from "@/lib/env";
 import { getDb } from "@/lib/db";
-import { clientUsers } from "@/db/schema";
+import { clientUsers, auditLog } from "@/db/schema";
 import { authorize, AuthorizationError } from "@/lib/auth/authorize";
-import { getPrincipal } from "@/lib/auth/principal";
+import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
 import {
   hashPassword,
   verifyPassword,
   createClientSession,
   destroyClientSession,
+  getClientSession,
 } from "@/lib/auth/client-session";
+
+/**
+ * Auth-event audit trail (AUDIT_REPORT.md — High: "no audit trail for
+ * auth/connection events"). Failed attempts against a username that
+ * doesn't exist at all are deliberately NOT logged here — there's no
+ * orgId/workspaceId to attach them to, and it's mostly attacker
+ * fingerprinting rather than something an agency can act on. Every event
+ * below is for a username that DOES resolve to a real client_user.
+ */
+async function logClientAuthEvent(params: {
+  orgId: string;
+  workspaceId: string;
+  clientUserId: string;
+  username: string;
+  action: "client_auth.login_success" | "client_auth.login_failed" | "client_auth.lockout" | "client_auth.logout";
+}): Promise<void> {
+  const db = getDb();
+  await db.insert(auditLog).values({
+    orgId: params.orgId,
+    workspaceId: params.workspaceId,
+    actorId: params.clientUserId,
+    action: params.action,
+    resourceType: "client_user",
+    resourceId: params.clientUserId,
+    after: { username: params.username },
+  });
+}
 
 /**
  * Login rate limiting (AUDIT_REPORT.md — Critical: "no rate limiting on
@@ -120,19 +148,34 @@ export async function saveClientLogin(
 
     const passwordHash = hashPassword(password);
 
+    let clientUserId = existing?.id ?? null;
     if (existing) {
       await db
         .update(clientUsers)
         .set({ username: cleanUsername, passwordHash, status: "active", updatedAt: new Date() })
         .where(eq(clientUsers.id, existing.id));
     } else {
-      await db.insert(clientUsers).values({
-        orgId: principal.orgId,
-        workspaceId,
-        username: cleanUsername,
-        passwordHash,
-      });
+      const [created] = await db
+        .insert(clientUsers)
+        .values({
+          orgId: principal.orgId,
+          workspaceId,
+          username: cleanUsername,
+          passwordHash,
+        })
+        .returning({ id: clientUsers.id });
+      clientUserId = created.id;
     }
+
+    await db.insert(auditLog).values({
+      orgId: principal.orgId,
+      workspaceId,
+      actorId: actorIdOrNull(principal.userId),
+      action: existing ? "client_user.update" : "client_user.create",
+      resourceType: "client_user",
+      resourceId: clientUserId,
+      after: { username: cleanUsername },
+    });
 
     revalidatePath("/dashboard/settings");
     return { ok: true };
@@ -158,6 +201,14 @@ export async function setClientLoginStatus(
       .update(clientUsers)
       .set({ status, updatedAt: new Date() })
       .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
+    await db.insert(auditLog).values({
+      orgId: principal.orgId,
+      workspaceId,
+      actorId: actorIdOrNull(principal.userId),
+      action: status === "active" ? "client_user.enable" : "client_user.disable",
+      resourceType: "client_user",
+      resourceId: id,
+    });
     revalidatePath("/dashboard/settings");
     return { ok: true };
   } catch (e) {
@@ -177,6 +228,14 @@ export async function unlockClientLogin(id: string, workspaceId: string): Promis
       .update(clientUsers)
       .set({ failedAttempts: 0, lockedUntil: null, updatedAt: new Date() })
       .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
+    await db.insert(auditLog).values({
+      orgId: principal.orgId,
+      workspaceId,
+      actorId: actorIdOrNull(principal.userId),
+      action: "client_user.unlock",
+      resourceType: "client_user",
+      resourceId: id,
+    });
     revalidatePath("/dashboard/settings");
     return { ok: true };
   } catch (e) {
@@ -194,6 +253,14 @@ export async function deleteClientLogin(id: string, workspaceId: string): Promis
     await db
       .delete(clientUsers)
       .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
+    await db.insert(auditLog).values({
+      orgId: principal.orgId,
+      workspaceId,
+      actorId: actorIdOrNull(principal.userId),
+      action: "client_user.delete",
+      resourceType: "client_user",
+      resourceId: id,
+    });
     revalidatePath("/dashboard/settings");
     return { ok: true };
   } catch (e) {
@@ -263,10 +330,24 @@ export async function clientLogin(username: string, password: string): Promise<A
         .update(clientUsers)
         .set({ failedAttempts: 0, lockedUntil: new Date(Date.now() + LOCKOUT_DURATION_MS) })
         .where(eq(clientUsers.id, user.id));
+      await logClientAuthEvent({
+        orgId: user.orgId,
+        workspaceId: user.workspaceId,
+        clientUserId: user.id,
+        username: user.username,
+        action: "client_auth.lockout",
+      });
       return {
         error: `Too many failed attempts. Try again in ${Math.ceil(LOCKOUT_DURATION_MS / 60_000)} minutes, or ask your agency to unlock it.`,
       };
     }
+    await logClientAuthEvent({
+      orgId: user.orgId,
+      workspaceId: user.workspaceId,
+      clientUserId: user.id,
+      username: user.username,
+      action: "client_auth.login_failed",
+    });
     return { error: "Incorrect username or password." };
   }
 
@@ -275,10 +356,34 @@ export async function clientLogin(username: string, password: string): Promise<A
     .update(clientUsers)
     .set({ lastLoginAt: new Date(), failedAttempts: 0, lockedUntil: null })
     .where(eq(clientUsers.id, user.id));
+  await logClientAuthEvent({
+    orgId: user.orgId,
+    workspaceId: user.workspaceId,
+    clientUserId: user.id,
+    username: user.username,
+    action: "client_auth.login_success",
+  });
   redirect("/client");
 }
 
 export async function clientLogoutAction(): Promise<void> {
+  const session = await getClientSession();
   await destroyClientSession();
+  if (session) {
+    const db = getDb();
+    const user = await db.query.clientUsers.findFirst({
+      where: (u, { eq: eqOp }) => eqOp(u.id, session.clientUserId),
+      columns: { orgId: true },
+    });
+    if (user) {
+      await logClientAuthEvent({
+        orgId: user.orgId,
+        workspaceId: session.workspaceId,
+        clientUserId: session.clientUserId,
+        username: session.username,
+        action: "client_auth.logout",
+      });
+    }
+  }
   redirect("/client/login");
 }

@@ -12,6 +12,7 @@ import {
   CheckSquare,
   Settings,
   Sparkles,
+  History,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -45,6 +46,7 @@ const NAV: Array<{ section: string; items: NavItem[] }> = [
     section: "Workspace",
     items: [
       { href: "/dashboard/ai", label: "AI Copilot", icon: Sparkles },
+      { href: "/dashboard/activity", label: "Activity log", icon: History },
       { href: "/dashboard/settings", label: "Settings", icon: Settings },
     ],
   },

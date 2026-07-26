@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { and, eq } from "drizzle-orm";
 import { env, isDemoMode } from "@/lib/env";
 import { getDb } from "@/lib/db";
 import { integrationConnections, integrationSecrets, workspaces, auditLog } from "@/db/schema";
@@ -11,6 +12,34 @@ import { checkMetaTokenHealth, type MetaTokenHealth } from "./meta";
 import { verifyShopifyCredentials, type ShopifyShopInfo } from "./shopify";
 import { refreshAccessToken, listLinkedClientAccounts } from "./google-ads";
 import { fetchAuthorizedAdvertiserIds, fetchAdvertiserInfo } from "./tiktok";
+
+/**
+ * Connection lifecycle audit trail (AUDIT_REPORT.md — High: "no audit trail
+ * for auth/connection events"). Every successful connect/disconnect across
+ * all five providers funnels through this one insert so the shape and the
+ * resourceType string stay identical everywhere, instead of each provider's
+ * connect function hand-rolling its own auditLog.values({...}).
+ */
+async function logConnectionEvent(params: {
+  orgId: string;
+  workspaceId: string;
+  actorId: string | null;
+  provider: string;
+  externalAccountId: string;
+  displayName: string;
+  action: "connection.connect" | "connection.disconnect";
+}): Promise<void> {
+  const db = getDb();
+  await db.insert(auditLog).values({
+    orgId: params.orgId,
+    workspaceId: params.workspaceId,
+    actorId: params.actorId,
+    action: params.action,
+    resourceType: "integration_connection",
+    resourceId: params.externalAccountId,
+    after: { provider: params.provider, displayName: params.displayName },
+  });
+}
 
 /** Same slugify as features/crm/actions.ts's createWorkspace — duplicated
  *  rather than imported so this file doesn't reach across features for one
@@ -202,6 +231,15 @@ export async function connectMetaAccounts(
       // Meta reporting is on-demand now (see features/integrations/meta-live.ts)
       // — no background sync job to enqueue. The Meta Ads page and share
       // links pull live from Graph the moment someone opens them.
+      await logConnectionEvent({
+        orgId: principal.orgId,
+        workspaceId: sel.workspaceId,
+        actorId: actorIdOrNull(principal.userId),
+        provider: "meta",
+        externalAccountId: sel.accountId,
+        displayName: sel.name,
+        action: "connection.connect",
+      });
     }
   } catch (e) {
     if (e instanceof AuthorizationError) {
@@ -296,6 +334,16 @@ export async function connectAgencyMetaAccounts(
           ],
           set: { status: "active", lastError: null, displayName: sel.name },
         });
+
+      await logConnectionEvent({
+        orgId: principal.orgId,
+        workspaceId: sel.workspaceId,
+        actorId: actorIdOrNull(principal.userId),
+        provider: "meta",
+        externalAccountId: sel.accountId,
+        displayName: sel.name,
+        action: "connection.connect",
+      });
     }
   } catch (e) {
     if (e instanceof AuthorizationError) {
@@ -426,6 +474,15 @@ export async function autoProvisionAgencyMetaAccounts(): Promise<AutoProvisionRe
           ],
           set: { status: "active", lastError: null, displayName: account.name },
         });
+      await logConnectionEvent({
+        orgId: principal.orgId,
+        workspaceId: workspace.id,
+        actorId: actorIdOrNull(principal.userId),
+        provider: "meta",
+        externalAccountId: account.accountId,
+        displayName: account.name,
+        action: "connection.connect",
+      });
       connectedAccounts++;
     }
   } catch (e) {
@@ -574,6 +631,16 @@ export async function connectShopifyStore(
           rotatedAt: new Date(),
         },
       });
+
+    await logConnectionEvent({
+      orgId: principal.orgId,
+      workspaceId,
+      actorId: actorIdOrNull(principal.userId),
+      provider: "shopify",
+      externalAccountId: shopDomain,
+      displayName: shop.name,
+      action: "connection.connect",
+    });
   } catch (e) {
     if (e instanceof AuthorizationError) return { error: "Not allowed." };
     return {
@@ -713,6 +780,16 @@ export async function connectAgencyGoogleAdsAccounts(
           ],
           set: { status: "active", lastError: null, displayName: sel.name },
         });
+
+      await logConnectionEvent({
+        orgId: principal.orgId,
+        workspaceId: sel.workspaceId,
+        actorId: actorIdOrNull(principal.userId),
+        provider: "google_ads",
+        externalAccountId: sel.customerId,
+        displayName: sel.name,
+        action: "connection.connect",
+      });
     }
   } catch (e) {
     if (e instanceof AuthorizationError) {
@@ -859,6 +936,16 @@ export async function connectTikTokAccounts(
             rotatedAt: new Date(),
           },
         });
+
+      await logConnectionEvent({
+        orgId: principal.orgId,
+        workspaceId: sel.workspaceId,
+        actorId: actorIdOrNull(principal.userId),
+        provider: "tiktok",
+        externalAccountId: sel.advertiserId,
+        displayName: sel.name,
+        action: "connection.connect",
+      });
     }
   } catch (e) {
     if (e instanceof AuthorizationError) {
@@ -874,4 +961,59 @@ export async function connectTikTokAccounts(
 
   revalidatePath("/dashboard/settings");
   return { ok: true };
+}
+
+/**
+ * Disconnects any connected account (any provider) — the counterpart to
+ * every connect* function above, and previously missing entirely (there
+ * was no way to cut a client's Meta/Shopify/Google Ads/TikTok connection
+ * off without deleting rows by hand in the database). Sets status to
+ * "disconnected" rather than removing the row: every live-report/health
+ * function already filters on status = "active" (see meta-live.ts,
+ * shopify-live.ts, google-ads-live.ts, tiktok-live.ts), so this alone stops
+ * it from being read anywhere, immediately — the encrypted secret is left
+ * in place since reconnecting through the normal connect flow overwrites it
+ * anyway, and there's no separate "reactivate without re-entering
+ * credentials" path (a provider may have revoked the token in the
+ * meantime, so re-verifying is the safer default).
+ */
+export async function disconnectConnection(
+  connectionId: string,
+  workspaceId: string,
+): Promise<ActionResult> {
+  if (isDemoMode) return { error: "Demo mode." };
+  try {
+    const principal = await getPrincipal();
+    authorize(principal, "connections.manage", workspaceId);
+
+    const db = getDb();
+    const [row] = await db
+      .update(integrationConnections)
+      .set({ status: "disconnected" })
+      .where(
+        and(
+          eq(integrationConnections.id, connectionId),
+          eq(integrationConnections.workspaceId, workspaceId),
+          eq(integrationConnections.orgId, principal.orgId),
+        ),
+      )
+      .returning();
+    if (!row) return { error: "Connection not found." };
+
+    await logConnectionEvent({
+      orgId: principal.orgId,
+      workspaceId,
+      actorId: actorIdOrNull(principal.userId),
+      provider: row.provider,
+      externalAccountId: row.externalAccountId,
+      displayName: row.displayName,
+      action: "connection.disconnect",
+    });
+
+    revalidatePath("/dashboard/settings");
+    return { ok: true };
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Not allowed." };
+    return { error: "Could not disconnect this account." };
+  }
 }
