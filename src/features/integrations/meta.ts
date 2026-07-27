@@ -13,13 +13,13 @@ import { ProviderAuthError, ProviderRateLimitError } from "./types";
  * decrypted credentials — never from client-facing code.
  */
 
-const GRAPH = "https://graph.facebook.com/v21.0";
+export const GRAPH = "https://graph.facebook.com/v21.0";
 
 interface MetaError {
   error?: { code?: number; message?: string };
 }
 
-async function graphGet<T>(path: string, token: string): Promise<T> {
+export async function graphGet<T>(path: string, token: string): Promise<T> {
   const sep = path.includes("?") ? "&" : "?";
   const res = await fetch(`${GRAPH}${path}${sep}access_token=${encodeURIComponent(token)}`);
   if (res.status === 401 || res.status === 403) throw new ProviderAuthError("Meta auth failed");
@@ -67,7 +67,7 @@ function actionMoney(list: ActionList, ...types: string[]): number {
   return 0;
 }
 
-interface MetaInsightRow {
+export interface MetaInsightRow {
   campaign_id: string;
   date_start: string;
   spend?: string;
@@ -85,7 +85,7 @@ interface MetaInsightRow {
   video_p100_watched_actions?: Array<{ action_type: string; value: string }>;
 }
 
-const INSIGHT_FIELDS = [
+export const INSIGHT_FIELDS = [
   "campaign_id",
   "date_start",
   "spend",
@@ -103,10 +103,16 @@ const INSIGHT_FIELDS = [
   "video_p100_watched_actions",
 ].join(",");
 
-function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord {
+/**
+ * The AdFacts-shaped subset of an insights row — factored out of
+ * mapInsightRow so meta-breakdowns.ts (ad set / ad / audience level
+ * insights, which share this exact metrics shape but aren't keyed by
+ * campaign_id+date_start the way DailyInsightRecord is) can reuse the same
+ * parsing instead of re-deriving it from Meta's actions[]/action_values[]
+ * arrays a second time.
+ */
+export function mapInsightFacts(r: MetaInsightRow, currency: string): Omit<DailyInsightRecord, "campaignExternalId" | "date"> {
   return {
-    campaignExternalId: r.campaign_id,
-    date: r.date_start,
     currencyCode: currency,
     spendMinor: toMinor(r.spend),
     revenueMinor: actionMoney(r.action_values, "omni_purchase", "purchase"),
@@ -135,6 +141,14 @@ function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord 
     initiateCheckout: actionValue(r.actions, "omni_initiated_checkout", "initiate_checkout"),
     addPaymentInfo: actionValue(r.actions, "omni_add_payment_info", "add_payment_info"),
     leads: actionValue(r.actions, "onsite_conversion.lead_grouped", "lead"),
+  };
+}
+
+function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord {
+  return {
+    campaignExternalId: r.campaign_id,
+    date: r.date_start,
+    ...mapInsightFacts(r, currency),
   };
 }
 

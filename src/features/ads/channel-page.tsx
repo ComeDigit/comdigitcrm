@@ -14,6 +14,13 @@ import {
   type CampaignWithFacts,
 } from "@/features/metrics/queries";
 import { getLiveMetaReport, getMetaPacing } from "@/features/integrations/meta-live";
+import { getLiveMetaAdSets, getLiveMetaAds, getLiveMetaAudience } from "@/features/integrations/meta-breakdowns-live";
+import type {
+  MetaAdSetInsight,
+  MetaAdInsight,
+  MetaAgeGenderInsight,
+  MetaCountryInsight,
+} from "@/features/integrations/meta-breakdowns";
 import { getLiveGoogleAdsReport, getGoogleAdsPacing } from "@/features/integrations/google-ads-live";
 import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
 import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
@@ -56,6 +63,13 @@ export async function AdsReport({
   let partialFailure = false;
   let failures: Array<{ displayName: string; reason: string }> = [];
   let pacing: { activeDailyBudgetMinor: number; spendTodayMinor: number } | null = null;
+  // Meta-only deeper breakdowns (AUDIT_REPORT.md High: ad set/ad level +
+  // audience breakdown) — stay empty for every other provider and for demo
+  // mode, same as `pacing` above.
+  let adSets: MetaAdSetInsight[] = [];
+  let ads: MetaAdInsight[] = [];
+  let byAgeGender: MetaAgeGenderInsight[] = [];
+  let byCountry: MetaCountryInsight[] = [];
 
   // All three ad channels are on-demand/live per client instruction — no
   // local historical storage for any of them. Two live pulls (current +
@@ -66,20 +80,42 @@ export async function AdsReport({
   // fetch. Kept as one block per provider (rather than a generic dispatch
   // table) so each live-report/pacing pair's types stay concrete.
   if (provider === "meta" && !isDemoMode) {
-    const [current, previous, pacingResult] = await Promise.all([
+    const [current, previous, pacingResult, adSetsResult, adsResult, audienceResult] = await Promise.all([
       getLiveMetaReport(workspaceId, range),
       getLiveMetaReport(workspaceId, previousPeriod(range)),
       getMetaPacing(workspaceId),
+      getLiveMetaAdSets(workspaceId, range),
+      getLiveMetaAds(workspaceId, range),
+      getLiveMetaAudience(workspaceId, range),
     ]);
     totals = current.totals;
     prev = previous.totals;
     trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
     campaigns = current.campaigns;
-    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
-    // Current-range failures are the most relevant to show — the previous-
-    // period pull uses the same connections/credentials, so its failures
-    // would just be duplicates for the same underlying reason.
-    failures = current.failures;
+    adSets = adSetsResult.adSets;
+    ads = adsResult.ads;
+    byAgeGender = audienceResult.byAgeGender;
+    byCountry = audienceResult.byCountry;
+    partialFailure =
+      current.partialFailure ||
+      previous.partialFailure ||
+      pacingResult.partialFailure ||
+      adSetsResult.partialFailure ||
+      adsResult.partialFailure ||
+      audienceResult.partialFailure;
+    // Every one of these calls shares the same connections/credentials, so
+    // a bad token surfaces in all of them at once — de-duped by display
+    // name so the banner lists each broken account once, not up to 6 times.
+    const seenFailures = new Set<string>();
+    failures = [];
+    for (const list of [current.failures, adSetsResult.failures, adsResult.failures, audienceResult.failures]) {
+      for (const f of list) {
+        if (!seenFailures.has(f.displayName)) {
+          seenFailures.add(f.displayName);
+          failures.push(f);
+        }
+      }
+    }
     pacing = pacingResult;
   } else if (provider === "google_ads" && !isDemoMode) {
     const [current, previous, pacingResult] = await Promise.all([
@@ -130,6 +166,19 @@ export async function AdsReport({
   };
 
   campaigns.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  adSets.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  ads.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  // Friendly names in the ad set / ad tables below instead of raw Meta IDs.
+  const campaignNameById = new Map(campaigns.map((c) => [c.id, c.name]));
+  const adSetNameById = new Map(adSets.map((a) => [a.id, a.name]));
+  // Ad sets/ads aren't capped server-side (unlike the top-25 country
+  // breakdown) since a typical account has far fewer of them than
+  // countries — but a handful of large accounts can still return hundreds,
+  // so the table itself caps to the top 50 by spend rather than rendering
+  // an unbounded page.
+  const AD_ENTITY_DISPLAY_CAP = 50;
+  const adSetsShown = adSets.slice(0, AD_ENTITY_DISPLAY_CAP);
+  const adsShown = ads.slice(0, AD_ENTITY_DISPLAY_CAP);
 
   /**
    * Trimmed to the 4 most-used cards per group (was ~35 cards across 4
@@ -343,6 +392,244 @@ export async function AdsReport({
             </table>
           </div>
         </Card>
+
+        {provider === "meta" && !isDemoMode ? (
+          <>
+            <Card>
+              <CardHeader
+                title="Ad sets"
+                subtitle={
+                  adSets.length > AD_ENTITY_DISPLAY_CAP
+                    ? `${rangeLabel} · showing top ${AD_ENTITY_DISPLAY_CAP} of ${adSets.length} by spend`
+                    : `${rangeLabel} · all key KPIs per ad set · sorted by spend`
+                }
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Ad set</th>
+                      <th className="px-3 py-2 font-medium">Campaign</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>CPC</th>
+                      <th className={th}>CPM</th>
+                      <th className={th}>CTR</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {adSetsShown.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No ad sets found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {adSetsShown.map((a) => {
+                      const f = a.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={a.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{a.name}</td>
+                          <td className="max-w-[220px] truncate px-3 py-2.5 text-muted">
+                            {campaignNameById.get(a.campaignId) ?? a.campaignId}
+                          </td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Ads"
+                subtitle={
+                  ads.length > AD_ENTITY_DISPLAY_CAP
+                    ? `${rangeLabel} · showing top ${AD_ENTITY_DISPLAY_CAP} of ${ads.length} by spend`
+                    : `${rangeLabel} · all key KPIs per ad · sorted by spend`
+                }
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Ad</th>
+                      <th className="px-3 py-2 font-medium">Ad set</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>CPC</th>
+                      <th className={th}>CPM</th>
+                      <th className={th}>CTR</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {adsShown.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No ads found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {adsShown.map((a) => {
+                      const f = a.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={a.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{a.name}</td>
+                          <td className="max-w-[220px] truncate px-3 py-2.5 text-muted">
+                            {adSetNameById.get(a.adsetId) ?? a.adsetId}
+                          </td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader title="Audience — age & gender" subtitle={`${rangeLabel} · sorted by spend`} />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Age</th>
+                      <th className="px-3 py-2 font-medium">Gender</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th}>CTR</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {byAgeGender.length === 0 ? (
+                      <tr>
+                        <td colSpan={10} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No audience data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {byAgeGender.map((row) => {
+                      const f = row.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr
+                          key={`${row.age}-${row.gender}`}
+                          className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
+                        >
+                          <td className="px-3 py-2.5 font-medium">{row.age}</td>
+                          <td className="px-3 py-2.5 capitalize text-muted">{row.gender}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Audience — country"
+                subtitle={`${rangeLabel} · sorted by spend${byCountry.length >= 25 ? " · top 25 shown" : ""}`}
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Country</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th}>CTR</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {byCountry.length === 0 ? (
+                      <tr>
+                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No audience data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {byCountry.map((row) => {
+                      const f = row.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={row.country} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="px-3 py-2.5 font-medium">{row.country}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          </>
+        ) : null}
     </main>
   );
 }

@@ -14,14 +14,14 @@ import type { DateRange } from "@/features/metrics/queries";
  * were swallowed silently (just `partialFailure = true`), which made this
  * exact situation impossible to diagnose without SSH access to Vercel logs.
  */
-function reasonFor(e: unknown): string {
+export function reasonFor(e: unknown): string {
   if (e instanceof ProviderAuthError) return "Meta rejected the token — it's likely expired or was revoked.";
   if (e instanceof ProviderRateLimitError) return "Meta rate-limited this request — try again in a minute.";
   if (e instanceof Error) return e.message;
   return "Unknown error reaching Meta.";
 }
 
-function logMetaFailure(connectionLabel: string, e: unknown): void {
+export function logMetaFailure(connectionLabel: string, e: unknown): void {
   // The only signal an operator has when a live Meta pull fails in
   // production is the Vercel function log — this is deliberate.
   console.error(`[meta-live] ${connectionLabel}: ${reasonFor(e)}`, e);
@@ -48,7 +48,11 @@ interface CacheEntry<T> {
 }
 const cache = new Map<string, CacheEntry<unknown>>();
 
-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+/** Exported so meta-breakdowns-live.ts shares this exact cache instance
+ *  (namespaced by key prefix, e.g. "meta-adsets:...") instead of running a
+ *  second independent cache for what's conceptually the same live-pull
+ *  mechanism. */
+export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
   const hit = cache.get(key);
   const now = Date.now();
   if (hit && hit.expires > now) return hit.value as T;
@@ -57,7 +61,7 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
   return value;
 }
 
-const INSIGHTS_TTL_MS = 60_000; // 60s — matches "dashboard refreshes within a minute cost zero API calls"
+export const INSIGHTS_TTL_MS = 60_000; // 60s — matches "dashboard refreshes within a minute cost zero API calls"
 const HEALTH_TTL_MS = 5 * 60_000; // 5min — account health probes every account, so it's checked less often
 
 export interface LiveCampaign {
@@ -86,7 +90,7 @@ export interface LiveMetaReport {
   failures: MetaFetchFailure[];
 }
 
-async function resolveCreds(connection: {
+export async function resolveCreds(connection: {
   id: string;
   currencyCode: string | null;
 }): Promise<ProviderCredentials | null> {
