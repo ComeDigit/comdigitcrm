@@ -35,3 +35,34 @@ export function WorkspaceSwitcher({
     </select>
   );
 }
+
+/**
+ * Per-client "Open dashboard" action (used on /dashboard/clients). A plain
+ * `<Link href="/dashboard">` here would only ever land on whichever
+ * workspace the "ws" cookie already pointed to — it never actually switches
+ * to THIS client, which silently breaks the moment there's more than one
+ * client card on the page. Setting the cookie first (same mechanism as the
+ * switcher above) before navigating is what makes it a real per-client link.
+ */
+export function OpenClientDashboardLink({
+  workspaceId,
+  className,
+}: {
+  workspaceId: string;
+  className?: string;
+}) {
+  const router = useRouter();
+
+  return (
+    <button
+      type="button"
+      className={className}
+      onClick={() => {
+        document.cookie = `ws=${workspaceId}; path=/; max-age=31536000; samesite=lax`;
+        router.push("/dashboard");
+      }}
+    >
+      Open dashboard →
+    </button>
+  );
+}

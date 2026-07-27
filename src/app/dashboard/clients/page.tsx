@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Download } from "lucide-react";
 import { Topbar } from "@/components/shell/topbar";
+import { OpenClientDashboardLink } from "@/components/shell/workspace-switcher";
 import { Card, CardHeader, Badge, EmptyState, LinkButton } from "@/components/ui/primitives";
 import { PrintButton } from "@/components/shared/print-button";
 import { getPrincipal } from "@/lib/auth/principal";
@@ -230,12 +231,10 @@ export default async function ClientsPage({
                       {ws.website}
                     </a>
                   ) : null}
-                  <Link
-                    href="/dashboard"
+                  <OpenClientDashboardLink
+                    workspaceId={ws.id}
                     className="inline-block text-xs font-medium underline-offset-4 hover:underline"
-                  >
-                    Open dashboard →
-                  </Link>
+                  />
                 </div>
                 {!isDemoMode ? (
                   <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3 print:hidden">
