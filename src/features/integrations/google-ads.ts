@@ -89,7 +89,7 @@ export async function refreshAccessToken(refreshToken: string): Promise<Refreshe
 /** developer-token and login-customer-id are agency-wide (env), not
  *  per-connection — carried on ProviderCredentials.extra so provider
  *  methods don't need extra parameters threaded through every call. */
-interface GoogleAdsCreds extends ProviderCredentials {
+export interface GoogleAdsCreds extends ProviderCredentials {
   extra?: Record<string, string>;
 }
 
@@ -114,14 +114,14 @@ interface GoogleAdsErrorBody {
  *  MUST be checked first. Google-scoped blast radius is limited (the
  *  customer id in the URL path already bounds which account's data is
  *  reachable), but a malformed date could still corrupt the query. */
-function assertIsoDate(value: string): string {
+export function assertIsoDate(value: string): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     throw new Error(`Invalid date range for Google Ads query: "${value}"`);
   }
   return value;
 }
 
-async function gaqlSearch<T>(
+export async function gaqlSearch<T>(
   customerId: string,
   query: string,
   creds: GoogleAdsCreds,
@@ -273,12 +273,12 @@ export async function listLinkedClientAccounts(
 
 /** 1,000,000 micros = 1 major currency unit = 100 minor units, so
  *  micros / 10,000 = minor units. */
-function microsToMinor(micros: string | undefined): number {
+export function microsToMinor(micros: string | undefined): number {
   return Math.round((parseInt(micros ?? "0", 10) || 0) / 10_000);
 }
 
 /** conversions_value is a decimal in major currency units (not micros). */
-function decimalToMinor(value: number | string | undefined): number {
+export function decimalToMinor(value: number | string | undefined): number {
   const n = typeof value === "string" ? parseFloat(value) : (value ?? 0);
   return Math.round((n || 0) * 100);
 }
@@ -295,40 +295,52 @@ interface GoogleAdsCampaignRow {
   campaignBudget?: { amountMicros?: string };
 }
 
+/** The metrics fields every insights-style GAQL query below selects —
+ *  shared by the campaign-grain query here and google-ads-breakdowns.ts's
+ *  keyword / search term / device / location queries, so they all map
+ *  through the exact same mapGoogleAdsFacts logic instead of re-deriving
+ *  it per breakdown. */
+export interface GoogleAdsMetricsFields {
+  costMicros?: string;
+  impressions?: string;
+  clicks?: string;
+  conversions?: number | string;
+  conversionsValue?: number | string;
+  videoViews?: string;
+}
+
 interface GoogleAdsMetricsRow {
   campaign: { id: string };
   segments: { date: string };
-  metrics: {
-    costMicros?: string;
-    impressions?: string;
-    clicks?: string;
-    conversions?: number | string;
-    conversionsValue?: number | string;
-    videoViews?: string;
-  };
+  metrics: GoogleAdsMetricsFields;
 }
 
 /**
- * Maps a metrics row to the shared AdFacts shape. Only the metrics Google
- * Ads reports at plain campaign×date grain are populated (spend, revenue,
- * impressions, clicks, conversions, video views); the funnel-stage
- * breakdown fields Meta gets for free from its `actions` array
- * (addToCart, initiateCheckout, leads, etc.) require a second query
- * segmented by conversion-action category — a reasonable follow-up, not
- * implemented here. `reach` is also 0: campaign-grain unique-reach isn't
- * exposed by a simple GAQL metric the way Meta's `reach` field is.
+ * The AdFacts-shaped subset of a metrics row — factored out of
+ * mapMetricsRow so google-ads-breakdowns.ts (keyword / search term /
+ * device / location insights, which share this exact metrics shape but
+ * aren't keyed by campaign+date the way DailyInsightRecord is) can reuse
+ * the same parsing instead of re-deriving it. Only the metrics Google Ads
+ * reports at this level are populated (spend, revenue, impressions,
+ * clicks, conversions, video views); the funnel-stage breakdown fields
+ * Meta gets for free from its `actions` array (addToCart,
+ * initiateCheckout, leads, etc.) require a second query segmented by
+ * conversion-action category — a reasonable follow-up, not implemented
+ * here. `reach` is also 0: unique-reach isn't exposed by a simple GAQL
+ * metric the way Meta's `reach` field is.
  */
-function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRecord {
-  const videoViews = parseInt(r.metrics.videoViews ?? "0", 10) || 0;
+export function mapGoogleAdsFacts(
+  m: GoogleAdsMetricsFields,
+  currency: string,
+): Omit<DailyInsightRecord, "campaignExternalId" | "date"> {
+  const videoViews = parseInt(m.videoViews ?? "0", 10) || 0;
   return {
-    campaignExternalId: r.campaign.id,
-    date: r.segments.date,
     currencyCode: currency,
-    spendMinor: microsToMinor(r.metrics.costMicros),
-    revenueMinor: decimalToMinor(r.metrics.conversionsValue),
-    impressions: parseInt(r.metrics.impressions ?? "0", 10) || 0,
-    clicks: parseInt(r.metrics.clicks ?? "0", 10) || 0,
-    purchases: Math.round(Number(r.metrics.conversions ?? 0)) || 0,
+    spendMinor: microsToMinor(m.costMicros),
+    revenueMinor: decimalToMinor(m.conversionsValue),
+    impressions: parseInt(m.impressions ?? "0", 10) || 0,
+    clicks: parseInt(m.clicks ?? "0", 10) || 0,
+    purchases: Math.round(Number(m.conversions ?? 0)) || 0,
     reach: 0,
     // Google's `video_views` is the closest available analogue to Meta's
     // 3-second-view metric, not an exact equivalent — treat as approximate.
@@ -348,6 +360,14 @@ function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRe
     initiateCheckout: 0,
     addPaymentInfo: 0,
     leads: 0,
+  };
+}
+
+function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRecord {
+  return {
+    campaignExternalId: r.campaign.id,
+    date: r.segments.date,
+    ...mapGoogleAdsFacts(r.metrics, currency),
   };
 }
 

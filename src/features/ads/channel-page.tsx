@@ -22,6 +22,17 @@ import type {
   MetaCountryInsight,
 } from "@/features/integrations/meta-breakdowns";
 import { getLiveGoogleAdsReport, getGoogleAdsPacing } from "@/features/integrations/google-ads-live";
+import {
+  getLiveGoogleAdsKeywords,
+  getLiveGoogleAdsSearchTerms,
+  getLiveGoogleAdsAudience,
+} from "@/features/integrations/google-ads-breakdowns-live";
+import type {
+  GoogleAdsKeywordInsight,
+  GoogleAdsSearchTermInsight,
+  GoogleAdsDeviceInsight,
+  GoogleAdsLocationInsight,
+} from "@/features/integrations/google-ads-breakdowns";
 import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
 import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
 import type { DemoProvider } from "@/features/demo-data/generator";
@@ -70,6 +81,12 @@ export async function AdsReport({
   let ads: MetaAdInsight[] = [];
   let byAgeGender: MetaAgeGenderInsight[] = [];
   let byCountry: MetaCountryInsight[] = [];
+  // Google-Ads-only deeper breakdowns (AUDIT_REPORT.md High: keyword/
+  // search-term/device/location reporting) — same story, empty elsewhere.
+  let googleKeywords: GoogleAdsKeywordInsight[] = [];
+  let googleSearchTerms: GoogleAdsSearchTermInsight[] = [];
+  let googleByDevice: GoogleAdsDeviceInsight[] = [];
+  let googleByLocation: GoogleAdsLocationInsight[] = [];
 
   // All three ad channels are on-demand/live per client instruction — no
   // local historical storage for any of them. Two live pulls (current +
@@ -118,17 +135,41 @@ export async function AdsReport({
     }
     pacing = pacingResult;
   } else if (provider === "google_ads" && !isDemoMode) {
-    const [current, previous, pacingResult] = await Promise.all([
+    const [current, previous, pacingResult, keywordsResult, searchTermsResult, audienceResult] = await Promise.all([
       getLiveGoogleAdsReport(workspaceId, range),
       getLiveGoogleAdsReport(workspaceId, previousPeriod(range)),
       getGoogleAdsPacing(workspaceId),
+      getLiveGoogleAdsKeywords(workspaceId, range),
+      getLiveGoogleAdsSearchTerms(workspaceId, range),
+      getLiveGoogleAdsAudience(workspaceId, range),
     ]);
     totals = current.totals;
     prev = previous.totals;
     trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
     campaigns = current.campaigns;
-    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
-    failures = current.failures;
+    googleKeywords = keywordsResult.keywords;
+    googleSearchTerms = searchTermsResult.searchTerms;
+    googleByDevice = audienceResult.byDevice;
+    googleByLocation = audienceResult.byLocation;
+    partialFailure =
+      current.partialFailure ||
+      previous.partialFailure ||
+      pacingResult.partialFailure ||
+      keywordsResult.partialFailure ||
+      searchTermsResult.partialFailure ||
+      audienceResult.partialFailure;
+    // Same story as the Meta branch above — every one of these shares the
+    // same connections/credentials, so de-dupe by display name.
+    const seenGoogleFailures = new Set<string>();
+    failures = [];
+    for (const list of [current.failures, keywordsResult.failures, searchTermsResult.failures, audienceResult.failures]) {
+      for (const f of list) {
+        if (!seenGoogleFailures.has(f.displayName)) {
+          seenGoogleFailures.add(f.displayName);
+          failures.push(f);
+        }
+      }
+    }
     pacing = pacingResult;
   } else if (provider === "tiktok" && !isDemoMode) {
     const [current, previous, pacingResult] = await Promise.all([
@@ -179,6 +220,16 @@ export async function AdsReport({
   const AD_ENTITY_DISPLAY_CAP = 50;
   const adSetsShown = adSets.slice(0, AD_ENTITY_DISPLAY_CAP);
   const adsShown = ads.slice(0, AD_ENTITY_DISPLAY_CAP);
+
+  // Google keywords/search terms are already capped to 50 per connection
+  // by the GAQL query itself (see google-ads-breakdowns.ts) — but a
+  // workspace with more than one connected Google Ads account can still
+  // exceed 50 once flat-concatenated, so re-sort + re-cap the combined list
+  // the same way as adSets/ads above.
+  googleKeywords.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  googleSearchTerms.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  const googleKeywordsShown = googleKeywords.slice(0, AD_ENTITY_DISPLAY_CAP);
+  const googleSearchTermsShown = googleSearchTerms.slice(0, AD_ENTITY_DISPLAY_CAP);
 
   /**
    * Trimmed to the 4 most-used cards per group (was ~35 cards across 4
@@ -251,6 +302,18 @@ export async function AdsReport({
     return "outline";
   };
   const rankLabel = (rank?: string | null) => (rank ? rank.replace(/_/g, " ") : "—");
+
+  /** Google's segments.device enum values, in the friendly form Google's
+   *  own UI uses — CONNECTED_TV in particular reads badly as raw text. */
+  const deviceLabels: Record<string, string> = {
+    MOBILE: "Mobile",
+    DESKTOP: "Desktop",
+    TABLET: "Tablet",
+    CONNECTED_TV: "Connected TV",
+    OTHER: "Other",
+  };
+  const deviceLabel = (d: string) => deviceLabels[d] ?? d.replace(/_/g, " ");
+  const matchTypeLabel = (m: string) => (m ? m.charAt(0) + m.slice(1).toLowerCase() : "—");
 
   return (
     <main className="space-y-6 px-6 py-6">
@@ -611,6 +674,234 @@ export async function AdsReport({
                       return (
                         <tr key={row.country} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
                           <td className="px-3 py-2.5 font-medium">{row.country}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          </>
+        ) : null}
+
+        {provider === "google_ads" && !isDemoMode ? (
+          <>
+            <Card>
+              <CardHeader
+                title="Keywords"
+                subtitle={`${rangeLabel} · top ${AD_ENTITY_DISPLAY_CAP} by spend`}
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Keyword</th>
+                      <th className="px-3 py-2 font-medium">Match type</th>
+                      <th className="px-3 py-2 font-medium">Ad group</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>CPC</th>
+                      <th className={th}>CPM</th>
+                      <th className={th}>CTR</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {googleKeywordsShown.length === 0 ? (
+                      <tr>
+                        <td colSpan={13} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No keywords found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {googleKeywordsShown.map((k) => {
+                      const f = k.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={k.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{k.text}</td>
+                          <td className="px-3 py-2.5 text-muted">{matchTypeLabel(k.matchType)}</td>
+                          <td className="max-w-[180px] truncate px-3 py-2.5 text-muted">{k.adGroupName}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Search terms"
+                subtitle={`${rangeLabel} · top ${AD_ENTITY_DISPLAY_CAP} by spend · what people actually typed`}
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Search term</th>
+                      <th className="px-3 py-2 font-medium">Ad group</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>CPC</th>
+                      <th className={th}>CPM</th>
+                      <th className={th}>CTR</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {googleSearchTermsShown.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No search terms found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {googleSearchTermsShown.map((s) => {
+                      const f = s.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={s.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{s.searchTerm}</td>
+                          <td className="max-w-[180px] truncate px-3 py-2.5 text-muted">{s.adGroupName}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader title="Device" subtitle={`${rangeLabel} · sorted by spend`} />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Device</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th}>CTR</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {googleByDevice.length === 0 ? (
+                      <tr>
+                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No device data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {googleByDevice.map((row) => {
+                      const f = row.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={row.device} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="px-3 py-2.5 font-medium">{deviceLabel(row.device)}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Location — country"
+                subtitle={`${rangeLabel} · sorted by spend${googleByLocation.length >= 25 ? " · top 25 shown" : ""}`}
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Country</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th}>CTR</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {googleByLocation.length === 0 ? (
+                      <tr>
+                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No location data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {googleByLocation.map((row) => {
+                      const f = row.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr
+                          key={row.countryCriterionId}
+                          className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
+                        >
+                          <td className="px-3 py-2.5 font-medium" title={`Google location ID ${row.countryCriterionId}`}>
+                            {row.countryCode ?? `#${row.countryCriterionId}`}
+                          </td>
                           <td className={td}>{formatMoney(f.spendMinor)}</td>
                           <td className={td}>{formatMoney(f.revenueMinor)}</td>
                           <td className={td}>

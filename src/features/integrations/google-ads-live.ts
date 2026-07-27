@@ -22,7 +22,11 @@ interface CacheEntry<T> {
 }
 const cache = new Map<string, CacheEntry<unknown>>();
 
-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+/** Exported so google-ads-breakdowns-live.ts shares this exact cache
+ *  instance (namespaced by key prefix) instead of running a second
+ *  independent cache for what's conceptually the same live-pull
+ *  mechanism — same reasoning as meta-live.ts's `cached`. */
+export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
   const hit = cache.get(key);
   const now = Date.now();
   if (hit && hit.expires > now) return hit.value as T;
@@ -31,20 +35,20 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
   return value;
 }
 
-const INSIGHTS_TTL_MS = 60_000;
+export const INSIGHTS_TTL_MS = 60_000;
 const HEALTH_TTL_MS = 5 * 60_000;
 // Google access tokens last ~3600s; refresh 10 minutes early so a slow
 // request never straddles the actual expiry.
 const ACCESS_TOKEN_TTL_MS = 50 * 60_000;
 
-function reasonFor(e: unknown): string {
+export function reasonFor(e: unknown): string {
   if (e instanceof ProviderAuthError) return e.message;
   if (e instanceof ProviderRateLimitError) return "Google Ads rate-limited this request — try again in a minute.";
   if (e instanceof Error) return e.message;
   return "Unknown error reaching Google Ads.";
 }
 
-function logGoogleAdsFailure(connectionLabel: string, e: unknown): void {
+export function logGoogleAdsFailure(connectionLabel: string, e: unknown): void {
   console.error(`[google-ads-live] ${connectionLabel}: ${reasonFor(e)}`, e);
 }
 
@@ -79,7 +83,7 @@ async function getAccessToken(connectionId: string, refreshToken: string): Promi
   return accessToken;
 }
 
-interface ResolvedGoogleAdsCreds extends ProviderCredentials {
+export interface ResolvedGoogleAdsCreds extends ProviderCredentials {
   extra: Record<string, string>;
 }
 
@@ -92,8 +96,10 @@ interface ResolvedGoogleAdsCreds extends ProviderCredentials {
  * META_USER_TOKEN fallback. Unlike Meta's resolveCreds (pure local
  * decrypt), this can throw — refreshing the access token is a network
  * call — so callers must try/catch around it, not just null-check.
+ * Exported so google-ads-breakdowns-live.ts resolves credentials the
+ * exact same way rather than duplicating the token-refresh dance.
  */
-async function resolveCreds(connection: {
+export async function resolveCreds(connection: {
   id: string;
   currencyCode: string | null;
 }): Promise<ResolvedGoogleAdsCreds | null> {
