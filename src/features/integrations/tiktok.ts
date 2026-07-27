@@ -9,8 +9,8 @@ import { ProviderAuthError, ProviderRateLimitError } from "./types";
 
 /**
  * Live TikTok Marketing API client (Business API v1.3). Called only by
- * live-pull code (tiktok-live.ts) and the OAuth callback with decrypted
- * credentials — never from client-facing code.
+ * live-pull code (tiktok-live.ts, tiktok-breakdowns.ts) and the OAuth
+ * callback with decrypted credentials — never from client-facing code.
  *
  * Built from TikTok's published v1.3 docs and consistent patterns across
  * third-party integration guides, NOT tested against a live account —
@@ -66,7 +66,7 @@ function isRateLimitError(_code: number, message: string): boolean {
   return m.includes("rate limit") || m.includes("too many requests") || m.includes("qps");
 }
 
-async function tiktokFetch<T>(
+export async function tiktokFetch<T>(
   path: string,
   accessToken: string,
   init?: { method?: "GET" | "POST"; query?: Record<string, string>; body?: unknown },
@@ -259,6 +259,65 @@ interface TikTokPageInfo {
   total_page: number;
 }
 
+/** Base metrics pulled for every TikTok performance report —
+ *  campaign-grain daily insights (getDailyInsights below) AND every
+ *  ad-level/audience breakdown in tiktok-breakdowns.ts request this same
+ *  list, so a spend/impressions/clicks number can never silently drift
+ *  between tables that are supposed to reconcile with each other. */
+export const TIKTOK_METRICS = [
+  "spend",
+  "impressions",
+  "clicks",
+  "reach",
+  "conversion",
+  "video_play_actions",
+  "video_watched_2s",
+];
+
+/**
+ * The AdFacts-shaped subset of a TikTok `/report/integrated/get/` row —
+ * factored out of getDailyInsights so tiktok-breakdowns.ts (ad-level and
+ * audience breakdowns, which share this exact metrics shape but aren't
+ * keyed by campaign_id+date the way DailyInsightRecord is) can reuse the
+ * same parsing instead of re-deriving it a second time. Mirrors meta.ts's
+ * mapInsightFacts.
+ */
+export function mapTikTokFacts(
+  metrics: Record<string, string>,
+  currency: string,
+): Omit<DailyInsightRecord, "campaignExternalId" | "date"> {
+  const num = (key: string) => parseFloat(metrics[key] ?? "0") || 0;
+  return {
+    currencyCode: currency,
+    spendMinor: Math.round(num("spend") * 100),
+    // TikTok's BASIC/AUDIENCE reports have no direct "attributed revenue"
+    // metric without a connected pixel/catalog reporting "value" — left at
+    // 0 pending that setup, same documented-gap treatment as Google Ads'
+    // funnel-breakdown fields.
+    revenueMinor: 0,
+    impressions: Math.round(num("impressions")),
+    clicks: Math.round(num("clicks")),
+    purchases: Math.round(num("conversion")),
+    reach: Math.round(num("reach")),
+    videoViews3s: Math.round(num("video_watched_2s")), // closest available bucket to a 3s view
+    videoPlays: Math.round(num("video_play_actions")),
+    inlineLinkClicks: 0,
+    outboundClicks: 0,
+    uniqueClicks: 0,
+    landingPageViews: 0,
+    pageEngagements: 0,
+    videoThruplays: 0,
+    videoP50: 0,
+    videoP75: 0,
+    videoP100: 0,
+    viewContent: 0,
+    addToCart: 0,
+    initiateCheckout: 0,
+    addPaymentInfo: 0,
+    leads: 0,
+  };
+}
+
 export function createTikTokProvider(): AdsProvider {
   return {
     key: "tiktok",
@@ -304,15 +363,6 @@ export function createTikTokProvider(): AdsProvider {
         throw new Error(`Invalid date range for TikTok report: "${range.since}" .. "${range.until}"`);
       }
       const page = cursor ? parseInt(cursor, 10) || 1 : 1;
-      const metrics = [
-        "spend",
-        "impressions",
-        "clicks",
-        "reach",
-        "conversion",
-        "video_play_actions",
-        "video_watched_2s",
-      ];
       const data = await tiktokFetch<{
         list?: Array<{
           dimensions: { campaign_id: string; stat_time_day: string };
@@ -325,7 +375,7 @@ export function createTikTokProvider(): AdsProvider {
           report_type: "BASIC",
           data_level: "AUCTION_CAMPAIGN",
           dimensions: JSON.stringify(["campaign_id", "stat_time_day"]),
-          metrics: JSON.stringify(metrics),
+          metrics: JSON.stringify(TIKTOK_METRICS),
           start_date: range.since,
           end_date: range.until,
           page: String(page),
@@ -334,42 +384,11 @@ export function createTikTokProvider(): AdsProvider {
       });
 
       const currency = creds.extra?.currency ?? "USD";
-      const items: DailyInsightRecord[] = (data.list ?? []).map((row) => {
-        const m = row.metrics;
-        const num = (key: string) => parseFloat(m[key] ?? "0") || 0;
-        const videoViews = num("video_play_actions");
-        return {
-          campaignExternalId: row.dimensions.campaign_id,
-          date: row.dimensions.stat_time_day.slice(0, 10),
-          currencyCode: currency,
-          spendMinor: Math.round(num("spend") * 100),
-          // TikTok's BASIC report has no direct "attributed revenue"
-          // metric without a connected pixel/catalog reporting "value" —
-          // left at 0 pending that setup, same documented-gap treatment as
-          // Google Ads' funnel-breakdown fields below.
-          revenueMinor: 0,
-          impressions: Math.round(num("impressions")),
-          clicks: Math.round(num("clicks")),
-          purchases: Math.round(num("conversion")),
-          reach: Math.round(num("reach")),
-          videoViews3s: Math.round(num("video_watched_2s")), // closest available bucket to a 3s view
-          videoPlays: Math.round(videoViews),
-          inlineLinkClicks: 0,
-          outboundClicks: 0,
-          uniqueClicks: 0,
-          landingPageViews: 0,
-          pageEngagements: 0,
-          videoThruplays: 0,
-          videoP50: 0,
-          videoP75: 0,
-          videoP100: 0,
-          viewContent: 0,
-          addToCart: 0,
-          initiateCheckout: 0,
-          addPaymentInfo: 0,
-          leads: 0,
-        };
-      });
+      const items: DailyInsightRecord[] = (data.list ?? []).map((row) => ({
+        campaignExternalId: row.dimensions.campaign_id,
+        date: row.dimensions.stat_time_day.slice(0, 10),
+        ...mapTikTokFacts(row.metrics, currency),
+      }));
       const info = data.page_info;
       const nextCursor = info && info.page < info.total_page ? String(info.page + 1) : undefined;
       return { items, nextCursor };

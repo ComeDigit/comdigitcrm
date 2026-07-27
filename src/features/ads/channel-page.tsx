@@ -38,6 +38,12 @@ import type {
   GoogleAdsLocationInsight,
 } from "@/features/integrations/google-ads-breakdowns";
 import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
+import { getLiveTikTokAds, getLiveTikTokAudience } from "@/features/integrations/tiktok-breakdowns-live";
+import type {
+  TikTokAdInsight,
+  TikTokAgeGenderInsight,
+  TikTokCountryInsight,
+} from "@/features/integrations/tiktok-breakdowns";
 import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
 import type { DemoProvider } from "@/features/demo-data/generator";
 import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
@@ -151,6 +157,12 @@ export async function AdsReport({
   let googleSearchTerms: GoogleAdsSearchTermInsight[] = [];
   let googleByDevice: GoogleAdsDeviceInsight[] = [];
   let googleByLocation: GoogleAdsLocationInsight[] = [];
+  // TikTok-only deeper breakdowns (AUDIT_REPORT.md Medium: "TikTok:
+  // Average Watch Time, Top Videos, Top Creatives, Audience — none
+  // implemented") — same story, empty elsewhere.
+  let tiktokAds: TikTokAdInsight[] = [];
+  let tiktokByAgeGender: TikTokAgeGenderInsight[] = [];
+  let tiktokByCountry: TikTokCountryInsight[] = [];
 
   // All three ad channels are on-demand/live per client instruction — no
   // local historical storage for any of them. Two live pulls (current +
@@ -236,17 +248,38 @@ export async function AdsReport({
     }
     pacing = pacingResult;
   } else if (provider === "tiktok" && !isDemoMode) {
-    const [current, previous, pacingResult] = await Promise.all([
+    const [current, previous, pacingResult, adsResult, audienceResult] = await Promise.all([
       getLiveTikTokReport(workspaceId, range),
       getLiveTikTokReport(workspaceId, previousPeriod(range)),
       getTikTokPacing(workspaceId),
+      getLiveTikTokAds(workspaceId, range),
+      getLiveTikTokAudience(workspaceId, range),
     ]);
     totals = current.totals;
     prev = previous.totals;
     trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
     campaigns = current.campaigns;
-    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
-    failures = current.failures;
+    tiktokAds = adsResult.ads;
+    tiktokByAgeGender = audienceResult.byAgeGender;
+    tiktokByCountry = audienceResult.byCountry;
+    partialFailure =
+      current.partialFailure ||
+      previous.partialFailure ||
+      pacingResult.partialFailure ||
+      adsResult.partialFailure ||
+      audienceResult.partialFailure;
+    // Every one of these calls shares the same connections/credentials —
+    // same de-dupe-by-display-name story as the Meta/Google branches above.
+    const seenTikTokFailures = new Set<string>();
+    failures = [];
+    for (const list of [current.failures, adsResult.failures, audienceResult.failures]) {
+      for (const f of list) {
+        if (!seenTikTokFailures.has(f.displayName)) {
+          seenTikTokFailures.add(f.displayName);
+          failures.push(f);
+        }
+      }
+    }
     pacing = pacingResult;
   } else {
     // Demo mode only reaches here now — every real provider has a live
@@ -366,6 +399,13 @@ export async function AdsReport({
   const googleKeywordsShown = googleKeywords.slice(0, AD_ENTITY_DISPLAY_CAP);
   const googleSearchTermsShown = googleSearchTerms.slice(0, AD_ENTITY_DISPLAY_CAP);
 
+  // tiktokAds already comes back sorted by spend from fetchTikTokAdInsights,
+  // but a workspace with more than one connected TikTok account can still
+  // exceed the display cap once flat-concatenated — re-sort + re-cap the
+  // combined list, same story as adSets/ads/googleKeywords above.
+  tiktokAds.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  const tiktokAdsShown = tiktokAds.slice(0, AD_ENTITY_DISPLAY_CAP);
+
   /**
    * Trimmed to the 4 most-used cards per group (was ~35 cards across 4
    * groups) — per client request, less scrolling for the numbers people
@@ -449,6 +489,23 @@ export async function AdsReport({
   };
   const deviceLabel = (d: string) => deviceLabels[d] ?? d.replace(/_/g, " ");
   const matchTypeLabel = (m: string) => (m ? m.charAt(0) + m.slice(1).toLowerCase() : "—");
+
+  /** TikTok's age-bucket enum ("AGE_25_34") and gender enum ("MALE") in
+   *  the friendly form TikTok's own Ads Manager uses. */
+  const tiktokAgeLabels: Record<string, string> = {
+    AGE_13_17: "13-17",
+    AGE_18_24: "18-24",
+    AGE_25_34: "25-34",
+    AGE_35_44: "35-44",
+    AGE_45_54: "45-54",
+    AGE_55_100: "55+",
+  };
+  const tiktokAgeLabel = (a: string) => tiktokAgeLabels[a] ?? a.replace(/^AGE_/, "").replace(/_/g, "-");
+  const tiktokGenderLabel = (g: string) => (g ? g.charAt(0) + g.slice(1).toLowerCase() : "—");
+  /** Seconds → "12.3s" — TikTok video watch-time metrics are always short
+   *  (typical videos run under a minute), so a plain seconds figure reads
+   *  better here than a mm:ss clock format. */
+  const formatSeconds = (s: number) => `${s.toFixed(1)}s`;
 
   return (
     <main className="space-y-6 px-6 py-6">
@@ -1078,6 +1135,183 @@ export async function AdsReport({
                           <td className="px-3 py-2.5 font-medium" title={`Google location ID ${row.countryCriterionId}`}>
                             {row.countryCode ?? `#${row.countryCriterionId}`}
                           </td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          </>
+        ) : null}
+
+        {provider === "tiktok" && !isDemoMode ? (
+          <>
+            <Card>
+              <CardHeader
+                title="Ads (videos & creatives)"
+                subtitle={
+                  tiktokAds.length > AD_ENTITY_DISPLAY_CAP
+                    ? `${rangeLabel} · showing top ${AD_ENTITY_DISPLAY_CAP} of ${tiktokAds.length} by spend`
+                    : `${rangeLabel} · all key KPIs per ad · sorted by spend`
+                }
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Ad / video</th>
+                      <th className="px-3 py-2 font-medium">Ad group</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>CTR</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th} title="Average watch time per video view, replays included">Avg watch time</th>
+                      <th className={th} title="Average watch time per unique viewer, replays included">Avg watch time / user</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiktokAdsShown.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No ads found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {tiktokAdsShown.map((a) => {
+                      const f = a.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={a.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td
+                            className="max-w-[220px] truncate px-3 py-2.5 font-medium"
+                            title={a.videoId ? `Video ID: ${a.videoId}` : undefined}
+                          >
+                            {a.name}
+                          </td>
+                          <td className="max-w-[180px] truncate px-3 py-2.5 text-muted">{a.adgroupName}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatSeconds(a.avgWatchTimeSeconds)}</td>
+                          <td className={td}>{formatSeconds(a.avgWatchTimePerUserSeconds)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader title="Audience — age & gender" subtitle={`${rangeLabel} · sorted by spend`} />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Age</th>
+                      <th className="px-3 py-2 font-medium">Gender</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th}>CTR</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiktokByAgeGender.length === 0 ? (
+                      <tr>
+                        <td colSpan={10} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No audience data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {tiktokByAgeGender.map((row) => {
+                      const f = row.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr
+                          key={`${row.age}-${row.gender}`}
+                          className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
+                        >
+                          <td className="px-3 py-2.5 font-medium">{tiktokAgeLabel(row.age)}</td>
+                          <td className="px-3 py-2.5 text-muted">{tiktokGenderLabel(row.gender)}</td>
+                          <td className={td}>{formatMoney(f.spendMinor)}</td>
+                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
+                          <td className={td}>
+                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
+                          </td>
+                          <td className={td}>{formatNumber(f.purchases)}</td>
+                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
+                          <td className={td}>{formatNumber(f.impressions)}</td>
+                          <td className={td}>{formatNumber(f.clicks)}</td>
+                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+
+            <Card>
+              <CardHeader
+                title="Audience — country"
+                subtitle={`${rangeLabel} · sorted by spend${tiktokByCountry.length >= 25 ? " · top 25 shown" : ""}`}
+              />
+              <div className="overflow-x-auto px-2 pb-3">
+                <table className="w-full text-[13px]">
+                  <thead>
+                    <tr className="border-b border-border text-left text-xs text-muted">
+                      <th className="px-3 py-2 font-medium">Country</th>
+                      <th className={th}>Spend</th>
+                      <th className={th}>Revenue</th>
+                      <th className={th}>ROAS</th>
+                      <th className={th}>Purchases</th>
+                      <th className={th}>CPA</th>
+                      <th className={th}>Impressions</th>
+                      <th className={th}>Clicks</th>
+                      <th className={th}>CTR</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tiktokByCountry.length === 0 ? (
+                      <tr>
+                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
+                          {`No audience data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
+                        </td>
+                      </tr>
+                    ) : null}
+                    {tiktokByCountry.map((row) => {
+                      const f = row.facts;
+                      const roas = adMetrics.roas(f);
+                      return (
+                        <tr key={row.country} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
+                          <td className="px-3 py-2.5 font-medium">{row.country}</td>
                           <td className={td}>{formatMoney(f.spendMinor)}</td>
                           <td className={td}>{formatMoney(f.revenueMinor)}</td>
                           <td className={td}>

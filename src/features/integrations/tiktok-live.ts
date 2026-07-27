@@ -19,6 +19,11 @@ import type { DateRange } from "@/features/metrics/queries";
  * back as an auth failure. Accounts with no refresh token on file (or no
  * TIKTOK_APP_ID/SECRET configured to redeem one) just surface the auth
  * error normally, same as every other provider's expired-credential path.
+ *
+ * cached/INSIGHTS_TTL_MS/reasonFor/logTikTokFailure/withCreds are exported
+ * for tiktok-breakdowns-live.ts to reuse — same cache, same failure
+ * classification, same credential-resolution-with-retry logic for the
+ * deeper ad-level/audience reports, rather than a second copy of any of it.
  */
 
 interface CacheEntry<T> {
@@ -27,7 +32,7 @@ interface CacheEntry<T> {
 }
 const cache = new Map<string, CacheEntry<unknown>>();
 
-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
   const hit = cache.get(key);
   const now = Date.now();
   if (hit && hit.expires > now) return hit.value as T;
@@ -36,17 +41,17 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
   return value;
 }
 
-const INSIGHTS_TTL_MS = 60_000;
+export const INSIGHTS_TTL_MS = 60_000;
 const HEALTH_TTL_MS = 5 * 60_000;
 
-function reasonFor(e: unknown): string {
+export function reasonFor(e: unknown): string {
   if (e instanceof ProviderAuthError) return e.message;
   if (e instanceof ProviderRateLimitError) return "TikTok rate-limited this request — try again in a minute.";
   if (e instanceof Error) return e.message;
   return "Unknown error reaching TikTok.";
 }
 
-function logTikTokFailure(connectionLabel: string, e: unknown): void {
+export function logTikTokFailure(connectionLabel: string, e: unknown): void {
   console.error(`[tiktok-live] ${connectionLabel}: ${reasonFor(e)}`, e);
 }
 
@@ -116,7 +121,7 @@ async function refreshAndPersist(connectionId: string, refreshToken: string): Pr
  * a refresh token is on file. Successful refreshes are persisted so the
  * NEXT call doesn't need to refresh again.
  */
-async function withCreds<T>(
+export async function withCreds<T>(
   connection: { id: string; displayName: string; currencyCode: string | null },
   fn: (creds: ProviderCredentials) => Promise<T>,
 ): Promise<T> {
