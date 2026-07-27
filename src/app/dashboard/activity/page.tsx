@@ -6,6 +6,21 @@ import { getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
 import { isDemoMode } from "@/lib/env";
 
 export const metadata = { title: "Activity" };
+/**
+ * Forces per-request rendering instead of a build-time static snapshot.
+ * Without this, Next.js has no signal that this page is per-tenant/live
+ * (getPrincipal() reads no cookie — this deployment has no login wall by
+ * design, see principal.ts) and will try to prerender it ONCE during
+ * `next build`. That's wrong for an audit log regardless (a frozen
+ * snapshot from the last deploy is actively misleading), and it means any
+ * transient DB hiccup on this one query — like the missing-column error
+ * that broke this exact page's build — fails the ENTIRE production
+ * deployment instead of just this one page at request time. Every other
+ * /dashboard/* page already gets this for free via searchParams (reading
+ * searchParams forces dynamic rendering); this is the one page with no
+ * such signal.
+ */
+export const dynamic = "force-dynamic";
 
 function humanizeAction(action: string): string {
   return action.replace(/[._]/g, " ");
