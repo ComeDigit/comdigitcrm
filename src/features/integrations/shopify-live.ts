@@ -22,7 +22,10 @@ interface CacheEntry<T> {
 }
 const cache = new Map<string, CacheEntry<unknown>>();
 
-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+/** Exported so shopify-products-live.ts (AUDIT_REPORT.md High: product-
+ *  level data) shares this exact cache instance instead of running a
+ *  second independent one — same reasoning as meta-live.ts's `cached`. */
+export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
   const hit = cache.get(key);
   const now = Date.now();
   if (hit && hit.expires > now) return hit.value as T;
@@ -31,17 +34,17 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
   return value;
 }
 
-const FACTS_TTL_MS = 60_000;
+export const FACTS_TTL_MS = 60_000;
 const HEALTH_TTL_MS = 5 * 60_000;
 
-function reasonFor(e: unknown): string {
+export function reasonFor(e: unknown): string {
   if (e instanceof ProviderAuthError) return "Shopify rejected the access token — it's likely been revoked. Reconnect in Settings.";
   if (e instanceof ProviderRateLimitError) return "Shopify rate-limited this request — try again in a minute.";
   if (e instanceof Error) return e.message;
   return "Unknown error reaching Shopify.";
 }
 
-function logShopifyFailure(connectionLabel: string, e: unknown): void {
+export function logShopifyFailure(connectionLabel: string, e: unknown): void {
   console.error(`[shopify-live] ${connectionLabel}: ${reasonFor(e)}`, e);
 }
 
@@ -61,12 +64,14 @@ export interface LiveShopifyReport {
   failures: ShopifyFetchFailure[];
 }
 
-interface ResolvedShopifyCreds {
+export interface ResolvedShopifyCreds {
   shopDomain: string;
   accessToken: string;
 }
 
-async function resolveCreds(connection: {
+/** Exported so shopify-products-live.ts resolves credentials the exact
+ *  same way rather than duplicating the decrypt step. */
+export async function resolveCreds(connection: {
   id: string;
   externalAccountId: string;
 }): Promise<ResolvedShopifyCreds | null> {

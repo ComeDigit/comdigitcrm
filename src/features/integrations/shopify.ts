@@ -188,3 +188,115 @@ export async function fetchShopifyDailyFacts(
 
   return byDate;
 }
+
+interface ShopifyLineItem {
+  product_id: number | null;
+  title: string;
+  sku: string | null;
+  quantity: number;
+  price: string;
+  total_discount?: string;
+}
+
+interface ShopifyOrderWithLineItems {
+  id: number;
+  created_at: string;
+  cancelled_at: string | null;
+  line_items?: ShopifyLineItem[];
+}
+
+export interface ShopifyProductFacts {
+  productId: number | null;
+  title: string;
+  sku: string | null;
+  quantity: number;
+  revenueMinor: number;
+  orders: number;
+}
+
+/**
+ * Per-product sales, aggregated from order line items (AUDIT_REPORT.md —
+ * High: "Shopify product-level data missing"). Shopify's REST Admin API
+ * has no dedicated "top products" report endpoint on non-Plus plans (the
+ * richer breakdowns need the ShopifyQL Analytics API — same Plus-only wall
+ * as the `sessions` limitation noted above) — so this derives product
+ * performance the way most third-party Shopify apps do: paginate every
+ * order in range and sum up its line_items. A separate pagination pass
+ * from fetchShopifyDailyFacts (not merged into it) — costs one extra
+ * Orders API call per page, but keeps that function's existing, working
+ * contract untouched.
+ *
+ * revenueMinor is gross-of-refunds (line price × quantity, net of that
+ * line's own discount) — refunds ARE captured correctly in the day-level
+ * totals from fetchShopifyDailyFacts, but Shopify attributes refund money
+ * to the refund record itself, and mapping that back down to individual
+ * product lines needs a second field (refund_line_items) deliberately not
+ * fetched here, to keep this a single query shape. A reasonable follow-up,
+ * not a silent gap — "revenue" in the product table should be read as
+ * "sales", not "net revenue after returns".
+ */
+export async function fetchShopifyProductFacts(
+  shopDomain: string,
+  accessToken: string,
+  range: { since: string; until: string },
+): Promise<ShopifyProductFacts[]> {
+  const createdMin = `${range.since}T00:00:00Z`;
+  const createdMax = `${range.until}T23:59:59Z`;
+  let pageInfo: string | null = null;
+  let first = true;
+
+  interface Entry {
+    productId: number | null;
+    title: string;
+    sku: string | null;
+    quantity: number;
+    revenueMinor: number;
+    orderIds: Set<number>;
+  }
+  const byProduct = new Map<string, Entry>();
+
+  do {
+    const query = first
+      ? `status=any&created_at_min=${encodeURIComponent(createdMin)}&created_at_max=${encodeURIComponent(createdMax)}&limit=250&fields=id,created_at,cancelled_at,line_items`
+      : `limit=250&page_info=${encodeURIComponent(pageInfo!)}`;
+    first = false;
+
+    const { body, linkHeader } = await shopifyFetch<{ orders: ShopifyOrderWithLineItems[] }>(
+      shopDomain,
+      `/orders.json?${query}`,
+      accessToken,
+    );
+
+    for (const order of body.orders) {
+      if (order.cancelled_at) continue;
+      for (const item of order.line_items ?? []) {
+        const key = item.product_id != null ? `p:${item.product_id}` : `t:${item.title}`;
+        const entry = byProduct.get(key) ?? {
+          productId: item.product_id ?? null,
+          title: item.title,
+          sku: item.sku ?? null,
+          quantity: 0,
+          revenueMinor: 0,
+          orderIds: new Set<number>(),
+        };
+        entry.quantity += item.quantity;
+        entry.revenueMinor += toMinor(item.price) * item.quantity - toMinor(item.total_discount);
+        entry.orderIds.add(order.id);
+        byProduct.set(key, entry);
+      }
+    }
+
+    pageInfo = nextPageInfo(linkHeader);
+  } while (pageInfo);
+
+  return [...byProduct.values()]
+    .map((e) => ({
+      productId: e.productId,
+      title: e.title,
+      sku: e.sku,
+      quantity: e.quantity,
+      revenueMinor: e.revenueMinor,
+      orders: e.orderIds.size,
+    }))
+    .sort((a, b) => b.revenueMinor - a.revenueMinor);
+}
