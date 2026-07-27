@@ -1,9 +1,12 @@
 import Link from "next/link";
+import { Download } from "lucide-react";
 import { Topbar } from "@/components/shell/topbar";
 import { KpiCard } from "@/components/charts/kpi-card";
 import { DateRangePicker } from "@/components/charts/date-range-picker";
 import { MoneyAreaChart } from "@/components/charts/charts";
-import { Card, CardHeader, Badge } from "@/components/ui/primitives";
+import { Card, CardHeader, Badge, LinkButton } from "@/components/ui/primitives";
+import { PrintButton } from "@/components/shared/print-button";
+import { campaignExportHref } from "@/features/ads/campaigns-export";
 import {
   getAdDaily,
   getCampaignsWithFacts,
@@ -92,8 +95,10 @@ export function resolveCampaignTableParams(params: {
  * identically for an internal dashboard route (current cookie-selected
  * workspace) and a public share link (one fixed workspace baked into the
  * share token, with no cross-workspace navigation exposed to strangers).
- * `AdsChannelPage` below and the public /share/meta/[token] route are the
- * only two callers — never duplicate this markup a third time.
+ * Callers: `AdsChannelPage` below (internal dashboard), the three
+ * client-portal ads pages (client/(portal)/ads/meta|google|tiktok), and
+ * the public /share/[provider]/[token] route — never duplicate this
+ * markup again for a fourth surface.
  */
 export async function AdsReport({
   workspaceId,
@@ -104,6 +109,7 @@ export async function AdsReport({
   sortKey,
   sortDir,
   page,
+  exportBase,
 }: {
   workspaceId: string;
   provider: DemoProvider;
@@ -113,8 +119,17 @@ export async function AdsReport({
   sortKey: CampaignSortKey;
   sortDir: "asc" | "desc";
   page: number;
+  /** Which surface is rendering this report — determines the Campaigns
+   *  CSV export link's base path (each surface has its own Route Handler
+   *  with its own auth, see campaigns-export.ts), or no Export CSV button
+   *  at all when omitted (the public share page: AUDIT_REPORT.md's export
+   *  request was scoped to the admin dashboard + client portal, not the
+   *  no-login share link). Print/PDF has no such restriction — it's pure
+   *  CSS, so PrintButton below always renders regardless of this prop. */
+  exportBase?: "/api/export/campaigns" | "/client/export/campaigns";
 }) {
   const rangeLabel = formatRangeLabel(range, preset);
+  const exportHref = exportBase ? campaignExportHref(exportBase, provider, preset, range) : null;
 
   let totals: AdFacts;
   let prev: AdFacts;
@@ -437,7 +452,17 @@ export async function AdsReport({
 
   return (
     <main className="space-y-6 px-6 py-6">
-        <DateRangePicker preset={preset} range={range} />
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <DateRangePicker preset={preset} range={range} />
+          <div className="flex items-center gap-2 print:hidden">
+            {exportHref ? (
+              <LinkButton variant="outline" href={exportHref}>
+                <Download size={13} /> Export CSV
+              </LinkButton>
+            ) : null}
+            <PrintButton />
+          </div>
+        </div>
 
         {partialFailure ? (
           <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
@@ -579,7 +604,7 @@ export async function AdsReport({
             </table>
           </div>
           {campaignTotalPages > 1 ? (
-            <div className="flex items-center justify-center gap-3 border-t border-border py-3">
+            <div className="flex items-center justify-center gap-3 border-t border-border py-3 print:hidden">
               {campaignPage > 1 ? (
                 <Link
                   href={campaignTableHref({ page: campaignPage - 1 })}
@@ -1108,6 +1133,7 @@ export async function AdsChannelPage({
         sortKey={sortKey}
         sortDir={sortDir}
         page={page}
+        exportBase="/api/export/campaigns"
       />
     </>
   );

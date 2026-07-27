@@ -62,7 +62,7 @@ export default async function SharedReportPage({
 
   return (
     <>
-      <header className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background/80 px-6 backdrop-blur">
+      <header className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background/80 px-6 backdrop-blur print:hidden">
         <h1 className="text-sm font-semibold tracking-tight">{heading}</h1>
         <div className="flex items-center gap-3">
           <span className="text-xs text-muted">Shared report · read-only</span>

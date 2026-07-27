@@ -81,3 +81,37 @@ body {
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
 }
+
+/* ─── Print: reports render clean on paper — no chrome, no dark bg. ───
+   Hiding nav/forms/buttons/pagination uses Tailwind's built-in `print:`
+   variant (e.g. `print:hidden`) directly on those elements — only the
+   parts Tailwind utilities can't express live here: forcing light colors
+   regardless of the viewer's dark-mode choice (printing white text on a
+   near-black background would waste ink or be unreadable), and keeping
+   table rows from splitting across a page break. */
+@media print {
+  :root,
+  .dark {
+    --background: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #fafafa;
+    --border: #d4d4d8;
+    --foreground: #18181b;
+    --muted: #52525b;
+  }
+
+  body {
+    background: #ffffff;
+  }
+
+  table {
+    break-inside: auto;
+  }
+  tr {
+    break-inside: avoid;
+    break-after: auto;
+  }
+  thead {
+    display: table-header-group;
+  }
+}

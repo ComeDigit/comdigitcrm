@@ -24,6 +24,7 @@ export default async function ClientGoogleAdsPage({
       sortKey={sortKey}
       sortDir={sortDir}
       page={page}
+      exportBase="/client/export/campaigns"
     />
   );
 }

@@ -91,6 +91,33 @@ export function Button({
   );
 }
 
+/** Same look as Button, rendered as an <a> — for actions that are really
+ *  navigations (CSV export downloads, "open in new tab") and shouldn't be
+ *  wrapped in a <button onClick> just to get button styling. */
+export function LinkButton({
+  variant = "primary",
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"a"> & {
+  variant?: "primary" | "ghost" | "outline";
+}) {
+  return (
+    <a
+      className={cn(
+        "inline-flex h-8 items-center justify-center gap-1.5 rounded-lg px-3 text-[13px] font-medium transition-colors",
+        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+        variant === "primary" &&
+          "bg-accent text-accent-foreground hover:opacity-90",
+        variant === "outline" &&
+          "border border-border bg-surface hover:bg-surface-2",
+        variant === "ghost" && "text-muted hover:bg-surface-2 hover:text-foreground",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
 export function Skeleton({ className }: { className?: string }) {
   return (
     <div

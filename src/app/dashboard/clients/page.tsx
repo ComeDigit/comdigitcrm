@@ -1,8 +1,17 @@
 import Link from "next/link";
+import { Download } from "lucide-react";
 import { Topbar } from "@/components/shell/topbar";
-import { Card, CardHeader, Badge, EmptyState } from "@/components/ui/primitives";
+import { Card, CardHeader, Badge, EmptyState, LinkButton } from "@/components/ui/primitives";
+import { PrintButton } from "@/components/shared/print-button";
 import { getPrincipal } from "@/lib/auth/principal";
-import { getContacts, getWorkspaces, getArchivedWorkspaces, type WorkspaceRow } from "@/features/crm/queries";
+import {
+  getContacts,
+  getWorkspaces,
+  getArchivedWorkspaces,
+  getClientRevenueTotals,
+  filterAndSortWorkspaces,
+  type WorkspaceRow,
+} from "@/features/crm/queries";
 import {
   NewContactForm,
   NewWorkspaceForm,
@@ -11,9 +20,8 @@ import {
   ArchiveWorkspaceForm,
   RestoreWorkspaceForm,
 } from "@/features/crm/components/forms";
-import { getShopDaily, lastNDays } from "@/features/metrics/queries";
-import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
-import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
+import { lastNDays } from "@/features/metrics/queries";
+import type { ShopFacts } from "@/lib/metrics/definitions";
 import { formatMoney } from "@/lib/utils";
 import { isDemoMode } from "@/lib/env";
 
@@ -27,19 +35,6 @@ const filterInputCls =
 // per page matches the 3-column grid (4 full rows on desktop).
 const PAGE_SIZE = 12;
 type ClientSort = "name" | "name_desc" | "revenue";
-
-async function shopTotals(workspaceId: string, range: { since: string; until: string }): Promise<ShopFacts> {
-  // Shopify is pulled live now (features/integrations/shopify-live.ts) —
-  // nothing syncs orders into the database anymore, same "pull-on-demand"
-  // shape as every ad channel. This used to call getShopDaily() even in
-  // live mode, which reads a table nothing writes to any more, so every
-  // client's revenue/orders here silently showed $0/0 in production
-  // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
-  // deterministic generator since there's no real store to pull from.
-  return isDemoMode
-    ? sumShopFacts(await getShopDaily(workspaceId, range))
-    : (await getLiveShopifyReport(workspaceId, range)).totals;
-}
 
 /** Agency client roster: every workspace is one client brand. */
 export default async function ClientsPage({
@@ -62,11 +57,7 @@ export default async function ClientsPage({
 
   const range = lastNDays(30);
 
-  const filtered = workspaces.filter((ws) => {
-    if (statusFilter !== "all" && ws.status !== statusFilter) return false;
-    if (search && !ws.name.toLowerCase().includes(search)) return false;
-    return true;
-  });
+  const filtered = filterAndSortWorkspaces(workspaces, { search, status: statusFilter });
   const isFiltered = Boolean(search) || statusFilter !== "all";
 
   // Sorting by revenue needs every filtered workspace's totals up front —
@@ -81,7 +72,7 @@ export default async function ClientsPage({
 
   if (sortKey === "revenue") {
     const withRevenue = await Promise.all(
-      filtered.map(async (ws) => ({ ws, totals: await shopTotals(ws.id, range) })),
+      filtered.map(async (ws) => ({ ws, totals: await getClientRevenueTotals(ws.id, range) })),
     );
     withRevenue.sort((a, b) => b.totals.netSalesMinor - a.totals.netSalesMinor);
     totalPages = Math.max(1, Math.ceil(withRevenue.length / PAGE_SIZE));
@@ -97,7 +88,7 @@ export default async function ClientsPage({
     currentPage = Math.min(requestedPage, totalPages);
     pageItems = sorted.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
     revenue = await Promise.all(
-      pageItems.map(async (ws) => ({ id: ws.id, totals: await shopTotals(ws.id, range) })),
+      pageItems.map(async (ws) => ({ id: ws.id, totals: await getClientRevenueTotals(ws.id, range) })),
     );
   }
 
@@ -113,12 +104,23 @@ export default async function ClientsPage({
     return qs ? `/dashboard/clients?${qs}` : "/dashboard/clients";
   }
 
+  /** Same q/status/sort as clientsPageHref, minus page — export is always
+   *  "every matching client," not just the page currently on screen. */
+  function clientsExportHref(): string {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (statusFilter !== "all") params.set("status", statusFilter);
+    if (sortKey !== "name") params.set("sort", sortKey);
+    const qs = params.toString();
+    return qs ? `/api/export/clients?${qs}` : "/api/export/clients";
+  }
+
   return (
     <>
       <Topbar title="Clients" />
       <main className="space-y-6 px-6 py-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <form method="GET" className="flex flex-wrap items-center gap-2">
+          <form method="GET" className="flex flex-wrap items-center gap-2 print:hidden">
             <input
               type="search"
               name="q"
@@ -151,7 +153,11 @@ export default async function ClientsPage({
               </Link>
             ) : null}
           </form>
-          <div className="flex gap-2">
+          <div className="flex gap-2 print:hidden">
+            <LinkButton variant="outline" href={clientsExportHref()}>
+              <Download size={13} /> Export CSV
+            </LinkButton>
+            <PrintButton />
             <NewWorkspaceForm />
             <NewContactForm workspaces={workspaces} />
           </div>
@@ -232,7 +238,7 @@ export default async function ClientsPage({
                   </Link>
                 </div>
                 {!isDemoMode ? (
-                  <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3">
+                  <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3 print:hidden">
                     <EditWorkspaceForm
                       workspace={{ id: ws.id, name: ws.name, website: ws.website }}
                     />
@@ -246,7 +252,7 @@ export default async function ClientsPage({
         </div>
 
         {totalPages > 1 ? (
-          <div className="flex items-center justify-center gap-3 pt-1">
+          <div className="flex items-center justify-center gap-3 pt-1 print:hidden">
             {currentPage > 1 ? (
               <Link
                 href={clientsPageHref(currentPage - 1)}
@@ -288,7 +294,9 @@ export default async function ClientsPage({
                       {ws.archivedAt ? new Date(ws.archivedAt).toLocaleDateString("en-IN") : ""}
                     </p>
                   </div>
-                  <RestoreWorkspaceForm workspaceId={ws.id} />
+                  <span className="print:hidden">
+                    <RestoreWorkspaceForm workspaceId={ws.id} />
+                  </span>
                 </Card>
               ))}
             </div>

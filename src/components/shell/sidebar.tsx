@@ -125,8 +125,10 @@ export function Sidebar() {
 
   return (
     <>
-      {/* Desktop rail — unchanged from before, just the ≥md breakpoint. */}
-      <aside className="fixed inset-y-0 left-0 z-20 hidden w-56 flex-col border-r border-border bg-surface md:flex">
+      {/* Desktop rail — unchanged from before, just the ≥md breakpoint.
+       *  print:hidden — pure nav chrome, no reason to appear on a printed
+       *  report (see globals.css for the rest of the print rules). */}
+      <aside className="fixed inset-y-0 left-0 z-20 hidden w-56 flex-col border-r border-border bg-surface md:flex print:hidden">
         <div className="flex h-14 items-center px-5">
           <Wordmark />
         </div>
@@ -141,7 +143,7 @@ export function Sidebar() {
        *  This is a normal (non-fixed) bar so it scrolls away naturally and
        *  lets each page's own sticky Topbar take over the top of the
        *  viewport, exactly like it does on desktop. */}
-      <div className="flex h-12 items-center justify-between border-b border-border bg-surface px-4 md:hidden">
+      <div className="flex h-12 items-center justify-between border-b border-border bg-surface px-4 md:hidden print:hidden">
         <Wordmark />
         <button
           type="button"
@@ -155,7 +157,7 @@ export function Sidebar() {
 
       {/* Mobile drawer + backdrop */}
       {mobileOpen ? (
-        <div className="fixed inset-0 z-40 md:hidden">
+        <div className="fixed inset-0 z-40 md:hidden print:hidden">
           <button
             type="button"
             aria-label="Close navigation menu"

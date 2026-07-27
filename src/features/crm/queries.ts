@@ -6,6 +6,9 @@ import {
   demoTasks,
   demoWorkspaces,
 } from "@/features/demo-data/generator";
+import { getShopDaily, type DateRange } from "@/features/metrics/queries";
+import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
+import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
 
 /**
  * CRM read facade: demo generator or live tables, one return shape.
@@ -76,6 +79,39 @@ export async function getArchivedWorkspaces(orgId: string): Promise<WorkspaceRow
     orderBy: (w, { desc }) => desc(w.archivedAt),
   });
   return rows.map((r) => ({ ...r, archivedAt: r.archivedAt ? r.archivedAt.toISOString() : null }));
+}
+
+/**
+ * Net revenue/orders for one client's storefront over a range — shared by
+ * the Clients roster cards and its CSV export, so the two numbers can
+ * never silently drift apart. Moved here from a page-local helper once the
+ * export route needed the exact same figures: this used to call
+ * getShopDaily() even in live mode, which reads a table nothing writes to
+ * any more (Shopify is pulled live now, see shopify-live.ts), so every
+ * client's revenue/orders silently showed $0/0 in production
+ * (AUDIT_REPORT.md, Bug #1 — Critical, fixed earlier). Demo mode keeps
+ * using the deterministic generator since there's no real store to pull
+ * from.
+ */
+export async function getClientRevenueTotals(workspaceId: string, range: DateRange): Promise<ShopFacts> {
+  return isDemoMode
+    ? sumShopFacts(await getShopDaily(workspaceId, range))
+    : (await getLiveShopifyReport(workspaceId, range)).totals;
+}
+
+/** Pure filter shared by the Clients roster page and its CSV export, so
+ *  "what you see is what you export" can never silently drift apart. */
+export function filterAndSortWorkspaces(
+  workspaces: WorkspaceRow[],
+  opts: { search?: string; status?: "all" | "active" | "suspended" },
+): WorkspaceRow[] {
+  const search = (opts.search ?? "").trim().toLowerCase();
+  const status = opts.status ?? "all";
+  return workspaces.filter((ws) => {
+    if (status !== "all" && ws.status !== status) return false;
+    if (search && !ws.name.toLowerCase().includes(search)) return false;
+    return true;
+  });
 }
 
 export async function getContacts(orgId: string): Promise<ContactRow[]> {

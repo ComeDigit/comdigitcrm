@@ -1,4 +1,5 @@
 import { DateRangePicker } from "@/components/charts/date-range-picker";
+import { PrintButton } from "@/components/shared/print-button";
 import { ShopifyReport } from "@/features/shopify/report";
 import { resolveDateRange } from "@/features/metrics/queries";
 import { requireClientSession } from "@/lib/auth/client-session";
@@ -15,7 +16,10 @@ export default async function ClientShopifyPage({
 
   return (
     <main className="space-y-6 px-6 py-6">
-      <DateRangePicker preset={preset} range={range} />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <DateRangePicker preset={preset} range={range} />
+        <PrintButton />
+      </div>
       <ShopifyReport workspaceId={session.workspaceId} range={range} preset={preset} />
     </main>
   );

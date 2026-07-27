@@ -36,7 +36,7 @@ export function DateRangePicker({
   range: { since: string; until: string };
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-2">
+    <div className="flex flex-wrap items-center gap-2 print:hidden">
       {PRESETS.map((p) => (
         <a key={p.key} href={`?preset=${p.key}`} className={pillCls(preset === p.key)}>
           {p.label}

@@ -44,7 +44,7 @@ export function ClientNav({ workspaceName, username }: { workspaceName: string; 
   const [pending, startTransition] = useTransition();
 
   return (
-    <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur">
+    <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur print:hidden">
       <div className="flex h-14 items-center justify-between px-6">
         <div className="flex items-center gap-2 overflow-hidden">
           <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent text-[11px] font-bold text-accent-foreground">
