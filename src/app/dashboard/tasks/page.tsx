@@ -6,6 +6,16 @@ import { NewTaskForm, AdvanceTaskButton } from "@/features/crm/components/forms"
 import { redirect } from "next/navigation";
 
 export const metadata = { title: "Tasks" };
+/** Same reasoning as dashboard/activity/page.tsx: getPrincipal() reads no
+ *  cookie (no login wall by design) and this page has no searchParams, so
+ *  Next.js had no signal to render it per-request — it tried to
+ *  statically prerender it at build time and crashed the whole deploy the
+ *  moment workspaces.status was missing in production. Every other
+ *  /dashboard/* page is already safe: they either read searchParams or
+ *  call getActiveWorkspaceId()/getClientSession() (both read a cookie,
+ *  which auto-forces dynamic rendering) — this was the one page with
+ *  neither signal. */
+export const dynamic = "force-dynamic";
 
 const COLUMNS: Array<{ key: TaskRow["status"]; label: string }> = [
   { key: "todo", label: "To do" },
