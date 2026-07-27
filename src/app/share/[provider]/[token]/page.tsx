@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { AdsReport } from "@/features/ads/channel-page";
+import { AdsReport, resolveCampaignTableParams } from "@/features/ads/channel-page";
 import { resolveShareLink } from "@/features/share/actions";
 import { resolveDateRange } from "@/features/metrics/queries";
 import { getWorkspaceName } from "@/lib/workspace";
@@ -34,11 +34,13 @@ export default async function SharedReportPage({
   searchParams,
 }: {
   params: Promise<{ provider: string; token: string }>;
-  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
+  searchParams: Promise<{ preset?: string; since?: string; until?: string; sort?: string; dir?: string; page?: string }>;
 }) {
   const { provider, token } = await params;
   if (!isDemoProvider(provider)) notFound();
-  const { range, preset } = resolveDateRange(await searchParams);
+  const resolvedParams = await searchParams;
+  const { range, preset } = resolveDateRange(resolvedParams);
+  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
 
   const link = await resolveShareLink(provider, token);
   if (!link) {
@@ -73,6 +75,9 @@ export default async function SharedReportPage({
         label={providerLabel}
         range={range}
         preset={preset}
+        sortKey={sortKey}
+        sortDir={sortDir}
+        page={page}
       />
     </>
   );

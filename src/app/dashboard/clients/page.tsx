@@ -2,7 +2,7 @@ import Link from "next/link";
 import { Topbar } from "@/components/shell/topbar";
 import { Card, CardHeader, Badge, EmptyState } from "@/components/ui/primitives";
 import { getPrincipal } from "@/lib/auth/principal";
-import { getContacts, getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
+import { getContacts, getWorkspaces, getArchivedWorkspaces, type WorkspaceRow } from "@/features/crm/queries";
 import {
   NewContactForm,
   NewWorkspaceForm,
@@ -13,7 +13,7 @@ import {
 } from "@/features/crm/components/forms";
 import { getShopDaily, lastNDays } from "@/features/metrics/queries";
 import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
-import { sumShopFacts } from "@/lib/metrics/definitions";
+import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
 import { formatMoney } from "@/lib/utils";
 import { isDemoMode } from "@/lib/env";
 
@@ -22,16 +22,37 @@ export const metadata = { title: "Clients" };
 const filterInputCls =
   "h-9 rounded-lg border border-border bg-surface px-3 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
+// AUDIT_REPORT.md — Medium: "Pagination and sorting absent everywhere;
+// every list (clients, campaigns) renders unpaginated and unsorted." 12
+// per page matches the 3-column grid (4 full rows on desktop).
+const PAGE_SIZE = 12;
+type ClientSort = "name" | "name_desc" | "revenue";
+
+async function shopTotals(workspaceId: string, range: { since: string; until: string }): Promise<ShopFacts> {
+  // Shopify is pulled live now (features/integrations/shopify-live.ts) —
+  // nothing syncs orders into the database anymore, same "pull-on-demand"
+  // shape as every ad channel. This used to call getShopDaily() even in
+  // live mode, which reads a table nothing writes to any more, so every
+  // client's revenue/orders here silently showed $0/0 in production
+  // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
+  // deterministic generator since there's no real store to pull from.
+  return isDemoMode
+    ? sumShopFacts(await getShopDaily(workspaceId, range))
+    : (await getLiveShopifyReport(workspaceId, range)).totals;
+}
+
 /** Agency client roster: every workspace is one client brand. */
 export default async function ClientsPage({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string; status?: string }>;
+  searchParams: Promise<{ q?: string; status?: string; sort?: string; page?: string }>;
 }) {
   const principal = await getPrincipal();
-  const { q, status } = await searchParams;
+  const { q, status, sort, page } = await searchParams;
   const search = (q ?? "").trim().toLowerCase();
   const statusFilter = status === "active" || status === "suspended" ? status : "all";
+  const sortKey: ClientSort = sort === "revenue" || sort === "name_desc" ? sort : "name";
+  const requestedPage = Math.max(1, parseInt(page ?? "1", 10) || 1);
 
   const [workspaces, archivedWorkspaces, contacts] = await Promise.all([
     getWorkspaces(principal.orgId),
@@ -40,21 +61,6 @@ export default async function ClientsPage({
   ]);
 
   const range = lastNDays(30);
-  const revenue = await Promise.all(
-    workspaces.map(async (ws) => {
-      // Shopify is pulled live now (features/integrations/shopify-live.ts) —
-      // nothing syncs orders into the database anymore, same "pull-on-demand"
-      // shape as every ad channel. This used to call getShopDaily() even in
-      // live mode, which reads a table nothing writes to any more, so every
-      // client's revenue/orders here silently showed $0/0 in production
-      // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
-      // deterministic generator since there's no real store to pull from.
-      const totals = isDemoMode
-        ? sumShopFacts(await getShopDaily(ws.id, range))
-        : (await getLiveShopifyReport(ws.id, range)).totals;
-      return { id: ws.id, totals };
-    }),
-  );
 
   const filtered = workspaces.filter((ws) => {
     if (statusFilter !== "all" && ws.status !== statusFilter) return false;
@@ -62,6 +68,50 @@ export default async function ClientsPage({
     return true;
   });
   const isFiltered = Boolean(search) || statusFilter !== "all";
+
+  // Sorting by revenue needs every filtered workspace's totals up front —
+  // you can't sort by a number you haven't fetched yet. Sorting by name
+  // doesn't, so that path only fetches revenue for the page actually being
+  // shown, which is the real fix for "renders unpaginated" costing one
+  // live Shopify pull per client on every page load regardless of filters.
+  let pageItems: WorkspaceRow[];
+  let revenue: Array<{ id: string; totals: ShopFacts }>;
+  let totalPages: number;
+  let currentPage: number;
+
+  if (sortKey === "revenue") {
+    const withRevenue = await Promise.all(
+      filtered.map(async (ws) => ({ ws, totals: await shopTotals(ws.id, range) })),
+    );
+    withRevenue.sort((a, b) => b.totals.netSalesMinor - a.totals.netSalesMinor);
+    totalPages = Math.max(1, Math.ceil(withRevenue.length / PAGE_SIZE));
+    currentPage = Math.min(requestedPage, totalPages);
+    const slice = withRevenue.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+    pageItems = slice.map((s) => s.ws);
+    revenue = slice.map((s) => ({ id: s.ws.id, totals: s.totals }));
+  } else {
+    const sorted = [...filtered].sort((a, b) =>
+      sortKey === "name_desc" ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name),
+    );
+    totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
+    currentPage = Math.min(requestedPage, totalPages);
+    pageItems = sorted.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+    revenue = await Promise.all(
+      pageItems.map(async (ws) => ({ id: ws.id, totals: await shopTotals(ws.id, range) })),
+    );
+  }
+
+  /** Prev/Next links carry q/status/sort forward and only set an explicit
+   *  page when it isn't page 1, keeping URLs clean for the common case. */
+  function clientsPageHref(targetPage: number): string {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (statusFilter !== "all") params.set("status", statusFilter);
+    if (sortKey !== "name") params.set("sort", sortKey);
+    if (targetPage > 1) params.set("page", String(targetPage));
+    const qs = params.toString();
+    return qs ? `/dashboard/clients?${qs}` : "/dashboard/clients";
+  }
 
   return (
     <>
@@ -80,6 +130,11 @@ export default async function ClientsPage({
               <option value="all">All statuses</option>
               <option value="active">Active</option>
               <option value="suspended">Suspended</option>
+            </select>
+            <select name="sort" defaultValue={sortKey} className={filterInputCls}>
+              <option value="name">Name A–Z</option>
+              <option value="name_desc">Name Z–A</option>
+              <option value="revenue">Revenue (30d, high to low)</option>
             </select>
             <button
               type="submit"
@@ -110,7 +165,7 @@ export default async function ClientsPage({
         ) : null}
 
         <div className="grid gap-4 lg:grid-cols-3">
-          {filtered.map((ws) => {
+          {pageItems.map((ws) => {
             const totals = revenue.find((r) => r.id === ws.id)?.totals;
             const wsContacts = contacts.filter((c) => c.workspaceId === ws.id);
             return (
@@ -189,6 +244,34 @@ export default async function ClientsPage({
             );
           })}
         </div>
+
+        {totalPages > 1 ? (
+          <div className="flex items-center justify-center gap-3 pt-1">
+            {currentPage > 1 ? (
+              <Link
+                href={clientsPageHref(currentPage - 1)}
+                className="text-xs font-medium underline-offset-4 hover:underline"
+              >
+                ← Previous
+              </Link>
+            ) : (
+              <span className="text-xs text-muted/50">← Previous</span>
+            )}
+            <span className="text-xs text-muted">
+              Page {currentPage} of {totalPages}
+            </span>
+            {currentPage < totalPages ? (
+              <Link
+                href={clientsPageHref(currentPage + 1)}
+                className="text-xs font-medium underline-offset-4 hover:underline"
+              >
+                Next →
+              </Link>
+            ) : (
+              <span className="text-xs text-muted/50">Next →</span>
+            )}
+          </div>
+        ) : null}
 
         {archivedWorkspaces.length > 0 ? (
           <div className="space-y-3">

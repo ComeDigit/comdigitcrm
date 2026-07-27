@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { Topbar } from "@/components/shell/topbar";
 import { KpiCard } from "@/components/charts/kpi-card";
 import { DateRangePicker } from "@/components/charts/date-range-picker";
@@ -40,7 +41,49 @@ import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
 import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
 import { isDemoMode } from "@/lib/env";
 
-type ReportSearchParams = Promise<{ preset?: string; since?: string; until?: string }>;
+type ReportSearchParams = Promise<{
+  preset?: string;
+  since?: string;
+  until?: string;
+  sort?: string;
+  dir?: string;
+  page?: string;
+}>;
+
+// AUDIT_REPORT.md — Medium: "Pagination and sorting absent everywhere;
+// every list (clients, campaigns) renders unpaginated and unsorted." The
+// campaign table is the one this targets — the newer ad set/ad/keyword/
+// audience/product breakdown tables added elsewhere this pass already cap
+// + sort by spend server-side, which covers the same underlying risk
+// (an unbounded table) without needing full pagination on every one of
+// them too.
+export type CampaignSortKey = "name" | "spend" | "revenue" | "roas" | "purchases" | "impressions" | "clicks";
+const CAMPAIGN_SORT_KEYS: CampaignSortKey[] = [
+  "name",
+  "spend",
+  "revenue",
+  "roas",
+  "purchases",
+  "impressions",
+  "clicks",
+];
+const CAMPAIGN_PAGE_SIZE = 25;
+
+/** Parses ?sort=/?dir=/?page= — shared by AdsChannelPage and the public
+ *  share page, the two callers that resolve raw searchParams into props
+ *  for AdsReport. Unknown/missing values fall back to spend-desc, page 1. */
+export function resolveCampaignTableParams(params: {
+  sort?: string;
+  dir?: string;
+  page?: string;
+}): { sortKey: CampaignSortKey; sortDir: "asc" | "desc"; page: number } {
+  const sortKey = CAMPAIGN_SORT_KEYS.includes(params.sort as CampaignSortKey)
+    ? (params.sort as CampaignSortKey)
+    : "spend";
+  const sortDir = params.dir === "asc" ? "asc" : "desc";
+  const page = Math.max(1, parseInt(params.page ?? "1", 10) || 1);
+  return { sortKey, sortDir, page };
+}
 
 /**
  * The read-only report body — KPI grid + spend/revenue chart + campaign
@@ -58,12 +101,18 @@ export async function AdsReport({
   label,
   range,
   preset,
+  sortKey,
+  sortDir,
+  page,
 }: {
   workspaceId: string;
   provider: DemoProvider;
   label: string;
   range: DateRange;
   preset: RangePreset;
+  sortKey: CampaignSortKey;
+  sortDir: "asc" | "desc";
+  page: number;
 }) {
   const rangeLabel = formatRangeLabel(range, preset);
 
@@ -206,12 +255,83 @@ export async function AdsReport({
     return invert ? -d : d;
   };
 
-  campaigns.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+  // Friendly names in the ad set / ad tables below instead of raw Meta IDs
+  // — built before the campaign list gets sorted/paginated below, but that
+  // doesn't matter since sorting/slicing never changes which campaigns
+  // exist, just their order.
+  const campaignNameById = new Map(campaigns.map((c) => [c.id, c.name]));
   adSets.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
   ads.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
-  // Friendly names in the ad set / ad tables below instead of raw Meta IDs.
-  const campaignNameById = new Map(campaigns.map((c) => [c.id, c.name]));
   const adSetNameById = new Map(adSets.map((a) => [a.id, a.name]));
+
+  // Campaign table sorting/pagination — the one list AUDIT_REPORT.md names
+  // explicitly ("every list (clients, campaigns) renders unpaginated and
+  // unsorted"). sortKey/sortDir/page come from the URL, resolved by the
+  // caller via resolveCampaignTableParams.
+  const campaignSortValue = (c: CampaignWithFacts): number | string => {
+    switch (sortKey) {
+      case "name":
+        return c.name.toLowerCase();
+      case "revenue":
+        return c.facts.revenueMinor;
+      case "roas":
+        return adMetrics.roas(c.facts);
+      case "purchases":
+        return c.facts.purchases;
+      case "impressions":
+        return c.facts.impressions;
+      case "clicks":
+        return c.facts.clicks;
+      case "spend":
+      default:
+        return c.facts.spendMinor;
+    }
+  };
+  campaigns.sort((a, b) => {
+    const av = campaignSortValue(a);
+    const bv = campaignSortValue(b);
+    const cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
+    return sortDir === "asc" ? cmp : -cmp;
+  });
+  const campaignTotalPages = Math.max(1, Math.ceil(campaigns.length / CAMPAIGN_PAGE_SIZE));
+  const campaignPage = Math.min(page, campaignTotalPages);
+  const campaignsShown = campaigns.slice(
+    (campaignPage - 1) * CAMPAIGN_PAGE_SIZE,
+    campaignPage * CAMPAIGN_PAGE_SIZE,
+  );
+
+  /** Builds a link that preserves the current date range and overrides
+   *  sort/dir/page — used by both the sortable column headers and the
+   *  Prev/Next controls below the campaign table. */
+  function campaignTableHref(overrides: { sort?: CampaignSortKey; dir?: "asc" | "desc"; page?: number }): string {
+    const params = new URLSearchParams();
+    if (preset !== "custom") params.set("preset", preset);
+    else {
+      params.set("since", range.since);
+      params.set("until", range.until);
+    }
+    const newSort = overrides.sort ?? sortKey;
+    const newDir = overrides.dir ?? sortDir;
+    const newPage = overrides.page ?? campaignPage;
+    if (newSort !== "spend") params.set("sort", newSort);
+    if (newDir !== "desc") params.set("dir", newDir);
+    if (newPage > 1) params.set("page", String(newPage));
+    return `?${params.toString()}`;
+  }
+
+  function sortableHeader(key: CampaignSortKey, headerLabel: string) {
+    const isActive = sortKey === key;
+    const nextDir: "asc" | "desc" = isActive ? (sortDir === "desc" ? "asc" : "desc") : key === "name" ? "asc" : "desc";
+    return (
+      <Link
+        href={campaignTableHref({ sort: key, dir: nextDir, page: 1 })}
+        className={isActive ? "text-foreground" : "hover:text-foreground"}
+      >
+        {headerLabel}
+        {isActive ? (sortDir === "desc" ? " ↓" : " ↑") : ""}
+      </Link>
+    );
+  }
   // Ad sets/ads aren't capped server-side (unlike the top-25 country
   // breakdown) since a typical account has far fewer of them than
   // countries — but a handful of large accounts can still return hundreds,
@@ -372,30 +492,34 @@ export async function AdsReport({
         <Card>
           <CardHeader
             title="Campaigns"
-            subtitle={`${rangeLabel} · all key KPIs per campaign · sorted by spend`}
+            subtitle={
+              campaigns.length > CAMPAIGN_PAGE_SIZE
+                ? `${rangeLabel} · all key KPIs per campaign · page ${campaignPage} of ${campaignTotalPages}`
+                : `${rangeLabel} · all key KPIs per campaign · click a column to sort`
+            }
           />
           <div className="overflow-x-auto px-2 pb-3">
             <table className="w-full text-[13px]">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted">
-                  <th className="px-3 py-2 font-medium">Campaign</th>
-                  <th className={th}>Spend</th>
-                  <th className={th}>Revenue</th>
-                  <th className={th}>ROAS</th>
-                  <th className={th}>Purchases</th>
+                  <th className="px-3 py-2 font-medium">{sortableHeader("name", "Campaign")}</th>
+                  <th className={th}>{sortableHeader("spend", "Spend")}</th>
+                  <th className={th}>{sortableHeader("revenue", "Revenue")}</th>
+                  <th className={th}>{sortableHeader("roas", "ROAS")}</th>
+                  <th className={th}>{sortableHeader("purchases", "Purchases")}</th>
                   <th className={th}>CPA</th>
                   <th className={th}>CPC</th>
                   <th className={th}>CPM</th>
                   <th className={th}>CTR</th>
-                  <th className={th}>Impressions</th>
-                  <th className={th}>Clicks</th>
+                  <th className={th}>{sortableHeader("impressions", "Impressions")}</th>
+                  <th className={th}>{sortableHeader("clicks", "Clicks")}</th>
                   <th className={th}>Freq</th>
                   <th className={th} title="Quality / engagement / conversion rate rankings">Rankings</th>
                   <th className={th}>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {campaigns.length === 0 ? (
+                {campaignsShown.length === 0 ? (
                   <tr>
                     <td colSpan={14} className="px-3 py-6 text-center text-xs text-muted">
                       {!isDemoMode
@@ -404,7 +528,7 @@ export async function AdsReport({
                     </td>
                   </tr>
                 ) : null}
-                {campaigns.map((c) => {
+                {campaignsShown.map((c) => {
                   const f = c.facts;
                   const roas = adMetrics.roas(f);
                   return (
@@ -454,6 +578,33 @@ export async function AdsReport({
               </tbody>
             </table>
           </div>
+          {campaignTotalPages > 1 ? (
+            <div className="flex items-center justify-center gap-3 border-t border-border py-3">
+              {campaignPage > 1 ? (
+                <Link
+                  href={campaignTableHref({ page: campaignPage - 1 })}
+                  className="text-xs font-medium underline-offset-4 hover:underline"
+                >
+                  ← Previous
+                </Link>
+              ) : (
+                <span className="text-xs text-muted/50">← Previous</span>
+              )}
+              <span className="text-xs text-muted">
+                Page {campaignPage} of {campaignTotalPages}
+              </span>
+              {campaignPage < campaignTotalPages ? (
+                <Link
+                  href={campaignTableHref({ page: campaignPage + 1 })}
+                  className="text-xs font-medium underline-offset-4 hover:underline"
+                >
+                  Next →
+                </Link>
+              ) : (
+                <span className="text-xs text-muted/50">Next →</span>
+              )}
+            </div>
+          ) : null}
         </Card>
 
         {provider === "meta" && !isDemoMode ? (
@@ -942,7 +1093,9 @@ export async function AdsChannelPage({
 }) {
   const workspaceId = await getActiveWorkspaceId();
   const workspaceName = await getWorkspaceName(workspaceId);
-  const { range, preset } = resolveDateRange(await searchParams);
+  const resolvedParams = await searchParams;
+  const { range, preset } = resolveDateRange(resolvedParams);
+  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
   return (
     <>
       <Topbar title={`${label} — ${workspaceName}`} />
@@ -952,6 +1105,9 @@ export async function AdsChannelPage({
         label={label}
         range={range}
         preset={preset}
+        sortKey={sortKey}
+        sortDir={sortDir}
+        page={page}
       />
     </>
   );
