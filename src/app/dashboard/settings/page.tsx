@@ -1,6 +1,6 @@
 import { Topbar } from "@/components/shell/topbar";
 import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
-import { env, isDemoMode } from "@/lib/env";
+import { isDemoMode } from "@/lib/env";
 import { getPrincipal } from "@/lib/auth/principal";
 import { getActiveWorkspaceId } from "@/lib/workspace";
 import { getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
@@ -21,35 +21,15 @@ import { checkGoogleAdsAccountsHealth } from "@/features/integrations/google-ads
 import { checkTikTokAccountsHealth } from "@/features/integrations/tiktok-live";
 import { ShareLinksManager } from "@/features/share/components/manager";
 import { ClientPortalManager } from "@/features/client-portal/components/manager";
+import { PROVIDERS, getProviderAvailability } from "@/features/integrations/provider-config";
+import { getOrgConnections } from "@/features/integrations/connection-queries";
 
 export const metadata = { title: "Settings" };
-
-const PROVIDERS: Array<{
-  key: string;
-  label: string;
-  phase: string;
-  envVar?: string;
-}> = [
-  { key: "shopify", label: "Shopify", phase: "Phase 6" },
-  { key: "meta", label: "Meta Ads", phase: "Phase 7", envVar: "META_APP_ID" },
-  { key: "google_ads", label: "Google Ads", phase: "Phase 8", envVar: "GOOGLE_ADS_CLIENT_ID" },
-  { key: "tiktok", label: "TikTok Ads", phase: "Phase 9", envVar: "TIKTOK_APP_ID" },
-  { key: "ga4", label: "Google Analytics 4", phase: "Phase 10" },
-  { key: "search_console", label: "Search Console", phase: "Phase 10" },
-];
-
-async function getConnections(orgId: string) {
-  if (isDemoMode) return [];
-  const { getDb } = await import("@/lib/db");
-  return getDb().query.integrationConnections.findMany({
-    where: (c, { eq }) => eq(c.orgId, orgId),
-  });
-}
 
 export default async function SettingsPage() {
   const principal = await getPrincipal();
   const workspaceId = await getActiveWorkspaceId();
-  const connections = await getConnections(principal.orgId);
+  const connections = await getOrgConnections(principal.orgId);
   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
   const archivedWorkspaces = isDemoMode ? [] : await getArchivedWorkspaces(principal.orgId);
   // Connections span every client — without this label, a Meta/Shopify/
@@ -58,15 +38,14 @@ export default async function SettingsPage() {
   // — Partial: "global connected-accounts view doesn't label by client").
   const workspaceNameById = new Map<string, string>();
   for (const w of [...workspaces, ...archivedWorkspaces]) workspaceNameById.set(w.id, w.name);
-  const metaConfigured = Boolean(process.env.META_APP_ID);
-  const shopifyOAuthConfigured = Boolean(process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET);
-  const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
-  const googleAdsConfigured = Boolean(process.env.GOOGLE_ADS_CLIENT_ID);
-  const googleAdsAgencyConfigured = Boolean(env.GOOGLE_ADS_REFRESH_TOKEN);
-  // Both vars are required: unlike Meta's manual-token form (which only
-  // needs the pasted token itself), TikTok's advertiser lookup needs the
-  // app id/secret alongside any pasted token — see previewTikTokAccessToken.
-  const tiktokConfigured = Boolean(process.env.TIKTOK_APP_ID && process.env.TIKTOK_APP_SECRET);
+  const {
+    metaConfigured,
+    shopifyOAuthConfigured,
+    agencyTokenConfigured,
+    googleAdsConfigured,
+    googleAdsAgencyConfigured,
+    tiktokConfigured,
+  } = getProviderAvailability();
   const agencyTokenHealth = agencyTokenConfigured
     ? await checkAgencyMetaTokenHealth()
     : null;

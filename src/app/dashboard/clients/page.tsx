@@ -231,10 +231,18 @@ export default async function ClientsPage({
                       {ws.website}
                     </a>
                   ) : null}
-                  <OpenClientDashboardLink
-                    workspaceId={ws.id}
-                    className="inline-block text-xs font-medium underline-offset-4 hover:underline"
-                  />
+                  <div className="flex flex-wrap gap-x-3 gap-y-1">
+                    <OpenClientDashboardLink
+                      workspaceId={ws.id}
+                      className="inline-block text-xs font-medium underline-offset-4 hover:underline"
+                    />
+                    <Link
+                      href={`/dashboard/clients/${ws.id}`}
+                      className="inline-block text-xs font-medium underline-offset-4 hover:underline"
+                    >
+                      Connect accounts & create login →
+                    </Link>
+                  </div>
                 </div>
                 {!isDemoMode ? (
                   <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3 print:hidden">
