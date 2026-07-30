@@ -119,7 +119,12 @@ export async function fetchMetaAgeGenderBreakdown(
   currency: string,
 ): Promise<MetaAgeGenderInsight[]> {
   const timeRange = encodeURIComponent(JSON.stringify({ since: range.since, until: range.until }));
-  const fields = ["age", "gender", ...FACT_FIELDS].join(",");
+  // age/gender belong in `breakdowns`, not `fields` — Meta's API rejects a
+  // breakdown dimension that's also listed as a field ("(#100) age, gender
+  // are not valid for fields param"). The breakdown values still land on
+  // each row automatically because of `breakdowns=age,gender` below; no
+  // need to (and no way to) also request them via `fields`.
+  const fields = FACT_FIELDS.join(",");
   const rows = await fetchAllPages<MetaInsightRow & { age: string; gender: string }>(
     `/act_${accountId}/insights?level=account&breakdowns=age,gender&time_range=${timeRange}&fields=${fields}&limit=200`,
     accessToken,
@@ -141,7 +146,11 @@ export async function fetchMetaCountryBreakdown(
   currency: string,
 ): Promise<MetaCountryInsight[]> {
   const timeRange = encodeURIComponent(JSON.stringify({ since: range.since, until: range.until }));
-  const fields = ["country", ...FACT_FIELDS].join(",");
+  // Same fix as fetchMetaAgeGenderBreakdown above: `country` is a breakdown
+  // dimension, not a valid `fields` entry — listing it in both throws
+  // "(#100) country is not valid for fields param". The breakdown value
+  // still lands on each row automatically via `breakdowns=country` below.
+  const fields = FACT_FIELDS.join(",");
   const rows = await fetchAllPages<MetaInsightRow & { country: string }>(
     `/act_${accountId}/insights?level=account&breakdowns=country&time_range=${timeRange}&fields=${fields}&limit=200`,
     accessToken,
