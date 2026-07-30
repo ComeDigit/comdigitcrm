@@ -93,29 +93,49 @@ const GRAPH = "https://graph.facebook.com/v21.0";
  *  by the paste-a-token flow and the shared agency-token flow below. */
 async function listMetaAdAccounts(accessToken: string): Promise<PreviewResult> {
   try {
-    const res = await fetch(
-      `${GRAPH}/me/adaccounts?fields=account_id,name,currency,timezone_name&access_token=${encodeURIComponent(accessToken)}`,
-    );
-    if (!res.ok) {
-      return {
-        error:
-          "Meta rejected this token — check it hasn't expired and includes the ads_read permission.",
+    const accounts: MetaAccountPreview[] = [];
+    // Graph API paginates /me/adaccounts — an agency's Business Manager
+    // can easily have more ad accounts than one page holds, and every
+    // account past the first page was silently dropped before this loop
+    // existed (some clients' ad accounts just never showed up in the
+    // picker, with no error to explain why). paging.next is already a
+    // complete, ready-to-fetch URL — follow it until Meta stops sending one.
+    let url: string | undefined =
+      `${GRAPH}/me/adaccounts?fields=account_id,name,currency,timezone_name&limit=100&access_token=${encodeURIComponent(accessToken)}`;
+    let pages = 0;
+    while (url && pages < 50) {
+      const res: Response = await fetch(url);
+      if (!res.ok) {
+        // First page failing means the token itself is bad. A later page
+        // failing (rate limit, transient hiccup) shouldn't throw away every
+        // account already fetched — return what we have instead.
+        if (pages === 0) {
+          return {
+            error:
+              "Meta rejected this token — check it hasn't expired and includes the ads_read permission.",
+          };
+        }
+        break;
+      }
+      const body = (await res.json()) as {
+        data?: Array<{ account_id: string; name: string; currency: string; timezone_name: string }>;
+        paging?: { next?: string };
       };
+      for (const a of body.data ?? []) {
+        accounts.push({
+          accountId: a.account_id,
+          name: a.name,
+          currency: a.currency,
+          timezone: a.timezone_name,
+        });
+      }
+      url = body.paging?.next;
+      pages++;
     }
-    const body = (await res.json()) as {
-      data?: Array<{ account_id: string; name: string; currency: string; timezone_name: string }>;
-    };
-    if (!body.data || body.data.length === 0) {
+    if (accounts.length === 0) {
       return { error: "This token has no ad accounts attached to it." };
     }
-    return {
-      accounts: body.data.map((a) => ({
-        accountId: a.account_id,
-        name: a.name,
-        currency: a.currency,
-        timezone: a.timezone_name,
-      })),
-    };
+    return { accounts };
   } catch {
     return { error: "Could not reach Meta right now. Try again in a moment." };
   }
