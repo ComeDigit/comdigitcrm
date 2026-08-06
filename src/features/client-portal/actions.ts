@@ -77,30 +77,64 @@ export interface ClientLoginSummary {
   lockedUntil: string | null;
 }
 
+/**
+ * The three outcomes of looking a login up, kept distinct on purpose.
+ * The old signature returned `ClientLoginSummary | null` and swallowed
+ * every failure into that same `null`, so an auth hiccup or a database
+ * error rendered as the confident sentence "No client login yet for this
+ * workspace." — which is the one thing an admin must not be told wrongly.
+ * It hides the Disable/Delete controls for a login that really exists and
+ * really can sign in.
+ */
+export type ClientLoginLookup =
+  | { state: "found"; login: ClientLoginSummary }
+  | { state: "none" }
+  | { state: "error"; reason: string };
+
 /** Admin: fetch the client login for a workspace, if one exists. */
-export async function getClientLogin(workspaceId: string): Promise<ClientLoginSummary | null> {
-  if (isDemoMode) return null;
+export async function getClientLogin(workspaceId: string): Promise<ClientLoginLookup> {
+  if (isDemoMode) return { state: "none" };
   try {
     const principal = await getPrincipal();
     authorize(principal, "client_users.manage", workspaceId);
-  } catch {
-    return null;
+  } catch (e) {
+    console.error(`[client-portal] getClientLogin authorize failed for ${workspaceId}`, e);
+    return {
+      state: "error",
+      reason:
+        e instanceof AuthorizationError
+          ? "You don't have permission to manage this client's login."
+          : "Couldn't verify your session just now — reload the page.",
+    };
   }
 
-  const db = getDb();
-  const row = await db.query.clientUsers.findFirst({
-    where: (u, { eq: eqOp }) => eqOp(u.workspaceId, workspaceId),
-    orderBy: (u, { desc }) => [desc(u.createdAt)],
-  });
-  if (!row) return null;
-  return {
-    id: row.id,
-    username: row.username,
-    status: row.status,
-    lastLoginAt: row.lastLoginAt ? row.lastLoginAt.toISOString() : null,
-    createdAt: row.createdAt.toISOString(),
-    lockedUntil: row.lockedUntil ? row.lockedUntil.toISOString() : null,
-  };
+  try {
+    const db = getDb();
+    const row = await db.query.clientUsers.findFirst({
+      where: (u, { eq: eqOp }) => eqOp(u.workspaceId, workspaceId),
+      orderBy: (u, { desc }) => [desc(u.createdAt)],
+    });
+    if (!row) return { state: "none" };
+    return {
+      state: "found",
+      login: {
+        id: row.id,
+        username: row.username,
+        status: row.status,
+        lastLoginAt: row.lastLoginAt ? row.lastLoginAt.toISOString() : null,
+        createdAt: row.createdAt.toISOString(),
+        lockedUntil: row.lockedUntil ? row.lockedUntil.toISOString() : null,
+      },
+    };
+  } catch (e) {
+    // A failed read must never be reported as "no login exists" — see the
+    // ClientLoginLookup doc comment.
+    console.error(`[client-portal] getClientLogin query failed for ${workspaceId}`, e);
+    return {
+      state: "error",
+      reason: e instanceof Error ? `Couldn't load this login: ${e.message}` : "Couldn't load this login.",
+    };
+  }
 }
 
 const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/;

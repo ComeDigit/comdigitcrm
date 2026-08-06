@@ -9,6 +9,7 @@ import {
   unlockClientLogin,
   deleteClientLogin,
   type ClientLoginSummary,
+  type ClientLoginLookup,
 } from "@/features/client-portal/actions";
 import { Badge, Button } from "@/components/ui/primitives";
 
@@ -49,7 +50,23 @@ export function ClientPortalManager({
   workspaces: Array<{ id: string; name: string }>;
 }) {
   const [workspaceId, setWorkspaceId] = useState(workspaces[0]?.id ?? "");
-  const [login, setLogin] = useState<ClientLoginSummary | null>(null);
+  /**
+   * `null` means "haven't heard back yet" and is deliberately distinct from
+   * `{ state: "none" }`. Rendering the initial state as "No client login
+   * yet" — the old behaviour — told the admin a login didn't exist every
+   * time the lookup was slow or failed, while the client could sign in
+   * with it perfectly well.
+   */
+  const [lookupFor, setLookupFor] = useState<{ ws: string; result: ClientLoginLookup } | null>(null);
+  /**
+   * Tagged with the workspace it describes, so switching clients shows
+   * "checking…" immediately instead of briefly showing the previous
+   * client's login — and so a slow response for the workspace you just
+   * navigated away from can never overwrite the one you're looking at.
+   */
+  const lookup: ClientLoginLookup | null =
+    lookupFor && lookupFor.ws === workspaceId ? lookupFor.result : null;
+  const login: ClientLoginSummary | null = lookup?.state === "found" ? lookup.login : null;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -66,10 +83,16 @@ export function ClientPortalManager({
   const [handoff, setHandoff] = useState<{ username: string; password: string } | null>(null);
 
   function refresh(ws: string) {
+    // No synchronous "clear" here on purpose: staleness is derived from
+    // `lookupFor.ws !== workspaceId`, so switching workspaces already reads
+    // as "checking…" without a setState inside the effect that calls this.
     startTransition(async () => {
-      const existing = await getClientLogin(ws);
-      setLogin(existing);
-      setUsername(existing?.username ?? "");
+      const result = await getClientLogin(ws);
+      setLookupFor({ ws, result });
+      // Only overwrite what the admin sees when the answer is authoritative.
+      // On an error we leave the username box alone rather than blanking it.
+      if (result.state === "found") setUsername(result.login.username);
+      else if (result.state === "none") setUsername("");
       setPassword("");
       setShowPassword(false);
     });
@@ -198,6 +221,13 @@ export function ClientPortalManager({
             </Button>
           </div>
         </div>
+      ) : lookup === null ? (
+        <p className="text-xs text-muted">Checking for an existing login…</p>
+      ) : lookup.state === "error" ? (
+        <p className="text-xs text-negative">
+          {lookup.reason} Don&apos;t create a new login until this loads — this
+          workspace may already have one.
+        </p>
       ) : (
         <p className="text-xs text-muted">No client login yet for this workspace.</p>
       )}
@@ -246,7 +276,11 @@ export function ClientPortalManager({
           </div>
         </div>
         <Button disabled={pending || !workspaceId} onClick={save}>
-          <KeyRound size={13} /> {login ? "Update login" : "Create login"}
+          {/* "Save login" while the lookup is unresolved: the server upserts
+              by workspace either way, so promising "Create" when a login may
+              already exist would be a lie the button can't keep. */}
+          <KeyRound size={13} />{" "}
+          {login ? "Update login" : lookup?.state === "none" ? "Create login" : "Save login"}
         </Button>
       </div>
 
