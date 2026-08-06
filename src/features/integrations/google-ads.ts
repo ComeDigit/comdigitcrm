@@ -99,12 +99,55 @@ function authHeaders(creds: GoogleAdsCreds): Record<string, string> {
     "Content-Type": "application/json",
   };
   if (creds.extra?.developerToken) headers["developer-token"] = creds.extra.developerToken;
-  if (creds.extra?.loginCustomerId) headers["login-customer-id"] = creds.extra.loginCustomerId;
+  if (creds.extra?.loginCustomerId) {
+    headers["login-customer-id"] = normalizeCustomerId(creds.extra.loginCustomerId);
+  }
   return headers;
 }
 
+interface GoogleAdsFailureDetail {
+  errors?: Array<{ message?: string; errorCode?: Record<string, string>; location?: unknown }>;
+}
+
 interface GoogleAdsErrorBody {
-  error?: { code?: number; message?: string; status?: string };
+  error?: {
+    code?: number;
+    message?: string;
+    status?: string;
+    details?: GoogleAdsFailureDetail[];
+  };
+}
+
+/**
+ * Google's REST envelope puts a useless generic string in `error.message`
+ * ("Request contains an invalid argument.") and the actual cause in
+ * `error.details[].errors[]` as a GoogleAdsFailure. Reading only the
+ * envelope message makes every 400 look identical and undiagnosable, so
+ * flatten the detail errors into the message we throw.
+ */
+export function describeGoogleAdsError(body: GoogleAdsErrorBody, fallback: string): string {
+  const detailed = (body.error?.details ?? [])
+    .flatMap((d) => d.errors ?? [])
+    .map((e) => {
+      const code = e.errorCode ? Object.values(e.errorCode).filter(Boolean).join("/") : "";
+      return [code, e.message].filter(Boolean).join(": ");
+    })
+    .filter(Boolean);
+  if (detailed.length > 0) return detailed.join(" | ");
+  return body.error?.message ?? fallback;
+}
+
+/**
+ * Google Ads customer ids are 10 digits. Humans copy them out of the UI
+ * with dashes ("349-276-3366"), and that form is rejected everywhere it's
+ * used — both in the `customers/{id}` URL path and in the
+ * `login-customer-id` header — with a generic INVALID_ARGUMENT that gives
+ * no hint about the formatting. Since the values reach us from env vars
+ * and a DB column that a human typed, normalise at the boundary rather
+ * than trusting every caller to have stripped them.
+ */
+export function normalizeCustomerId(id: string): string {
+  return id.replace(/\D/g, "");
 }
 
 /** Defense in depth: `range.since`/`range.until` ultimately trace back to a
@@ -127,10 +170,12 @@ export async function gaqlSearch<T>(
   creds: GoogleAdsCreds,
   pageToken?: string,
 ): Promise<{ results: T[]; nextPageToken?: string }> {
-  const res = await fetch(`${API_BASE}/customers/${customerId}/googleAds:search`, {
+  // pageSize was deprecated and is ignored from v17 onward — sending it
+  // risks an unknown-field rejection for no benefit, so let Google page.
+  const res = await fetch(`${API_BASE}/customers/${normalizeCustomerId(customerId)}/googleAds:search`, {
     method: "POST",
     headers: authHeaders(creds),
-    body: JSON.stringify({ query, pageToken, pageSize: 10_000 }),
+    body: JSON.stringify(pageToken ? { query, pageToken } : { query }),
   });
   if (res.status === 401) throw new ProviderAuthError("Google Ads rejected the access token");
   if (res.status === 429) throw new ProviderRateLimitError(60);
@@ -138,10 +183,12 @@ export async function gaqlSearch<T>(
     GoogleAdsErrorBody;
   if (!res.ok) {
     if (res.status === 403) {
-      throw new ProviderAuthError(body.error?.message ?? "Google Ads permission denied for this account");
+      throw new ProviderAuthError(
+        describeGoogleAdsError(body, "Google Ads permission denied for this account"),
+      );
     }
     if (res.status === 503) throw new ProviderRateLimitError(30);
-    throw new Error(`Google Ads API error: ${body.error?.message ?? res.statusText}`);
+    throw new Error(`Google Ads API error: ${describeGoogleAdsError(body, res.statusText)}`);
   }
   return { results: body.results ?? [], nextPageToken: body.nextPageToken };
 }
@@ -174,7 +221,7 @@ export async function listAccessibleCustomers(
   if (res.status === 401) throw new ProviderAuthError("Google Ads rejected the access token");
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as GoogleAdsErrorBody;
-    throw new Error(`Google Ads API error: ${body.error?.message ?? res.statusText}`);
+    throw new Error(`Google Ads API error: ${describeGoogleAdsError(body, res.statusText)}`);
   }
   const body = (await res.json()) as { resourceNames?: string[] };
   const ids = (body.resourceNames ?? []).map((rn) => rn.replace("customers/", ""));
@@ -229,7 +276,7 @@ interface CustomerClientRow {
     currencyCode?: string;
     timeZone?: string;
     manager?: boolean;
-    level?: string;
+    level?: string | number;
   };
 }
 
@@ -262,7 +309,10 @@ export async function listLinkedClientAccounts(
     "FROM customer_client WHERE customer_client.level <= 1";
   const { results } = await gaqlSearch<CustomerClientRow>(managerCustomerId, query, creds);
   return results
-    .filter((r) => r.customerClient.level !== "0" && !r.customerClient.manager)
+    // level comes back as a string over REST but has been observed as a
+    // number too — compare stringified so the MCC's own row (level 0) is
+    // always excluded rather than silently listed as its own client.
+    .filter((r) => String(r.customerClient.level ?? "0") !== "0" && !r.customerClient.manager)
     .map((r) => ({
       customerId: r.customerClient.id,
       descriptiveName: r.customerClient.descriptiveName ?? r.customerClient.id,
