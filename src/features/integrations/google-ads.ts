@@ -383,6 +383,10 @@ export function mapGoogleAdsFacts(
   m: GoogleAdsMetricsFields,
   currency: string,
 ): Omit<DailyInsightRecord, "campaignExternalId" | "date"> {
+  // Stays 0 in practice — see the query in getDailyInsights for why
+  // video_views is no longer selected. Kept as an optional field rather
+  // than deleted so a future `video`-resource query can populate it
+  // without touching every caller.
   const videoViews = parseInt(m.videoViews ?? "0", 10) || 0;
   return {
     currencyCode: currency,
@@ -466,8 +470,15 @@ export function createGoogleAdsProvider(): AdsProvider {
       const since = assertIsoDate(range.since);
       const until = assertIsoDate(range.until);
       const query =
+        // metrics.video_views is deliberately absent: v24 rejects it on the
+        // campaign resource with UNRECOGNIZED_FIELD, and because GAQL
+        // validates the whole SELECT before running, that one optional field
+        // failed every Google Ads pull — spend, clicks and conversions
+        // included. Video views are a nice-to-have on a cross-channel
+        // dashboard; total spend is not. If they're wanted back, they live
+        // on the `video` resource and need their own query.
         "SELECT campaign.id, segments.date, metrics.cost_micros, metrics.impressions, metrics.clicks, " +
-        "metrics.conversions, metrics.conversions_value, metrics.video_views FROM campaign " +
+        "metrics.conversions, metrics.conversions_value FROM campaign " +
         `WHERE segments.date BETWEEN '${since}' AND '${until}'`;
       const { results, nextPageToken } = await gaqlSearch<GoogleAdsMetricsRow>(
         accountId,
