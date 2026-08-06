@@ -1,0 +1,36 @@
+Every client dashboard now pulls real-time data from all four channels
+(Meta, Shopify, Google Ads, TikTok) instead of just Meta — same
+on-demand "pull, don't sync" pattern as the existing Meta integration:
+
+- Shopify: Admin API client + manual store-connect flow (no OAuth app
+  review needed) + live daily-metrics pull.
+- Google Ads: OAuth client (API v24) + agency-wide MCC flow using the
+  customer_client GAQL hierarchy query (listAccessibleCustomers only
+  returns directly-granted accounts, not an MCC's client list) + live
+  report/pacing pull with proactive token refresh.
+- TikTok: OAuth client + manual token-paste flow (primary path, given
+  ambiguity in TikTok's OAuth docs) + live report/pacing pull with
+  reactive refresh-on-auth-error.
+- Both Google Ads and TikTok OAuth callbacks refuse to auto-connect
+  when the account list is ambiguous (0 or >1 accounts) rather than
+  guessing, since a wrong guess would attribute one client's ad data
+  to a different client's workspace.
+- New shared getLiveAdsReport() blends Meta+Google+TikTok into one
+  report for Overview and AI Copilot; channel-page.tsx calls each
+  provider directly since it only ever shows one channel at a time.
+- AI Copilot's insight engine now also pulls Shopify live (it was
+  still reading the database table that live mode stopped populating)
+  and skips ROAS-change insights for any provider whose fetch failed,
+  so a failed pull can't masquerade as a real performance drop.
+- Settings page has connect UI, health checks, and partial-failure
+  banners for all four providers now, not just Meta.
+
+Documented, honest scope gaps: Shopify sessions (no ShopifyQL Plus),
+Google Ads reach/funnel fields, TikTok revenue/funnel fields, and
+Quality-Score-style rankings for Google Ads/TikTok are all 0/absent
+without deeper API access this pass — same as Meta's existing gaps.
+
+tsc, lint, tests (11/11), and production build all pass clean.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

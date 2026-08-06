@@ -1,0 +1,1167 @@
+From 711cc4082853082f7cb7898a1917acc205546fae Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 27 Jul 2026 06:10:54 +0000
+Subject: [PATCH] Add CSV and PDF export for campaigns, clients, and reports
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+AUDIT_REPORT.md, Medium: "CSV/PDF export — neither exists anywhere."
+
+PDF is the browser's own Print dialog (PrintButton + @media print CSS)
+rather than a server-rendered file, added to the Ads report (admin,
+client portal, and public share page), Shopify report (admin + client
+portal), and the Clients list (admin).
+
+CSV is Route Handlers, not client-side blobs: /api/export/campaigns
+(admin), /client/export/campaigns (client portal — lives under /client/*
+because the session cookie is path-scoped there), and /api/export/clients
+(admin-only roster). Each surface resolves workspaceId through its own
+existing auth exactly as its page does, never a query param, to keep this
+from becoming a cross-tenant export hole. Public share links get Print
+but not CSV.
+
+An adversarial review pass before shipping caught and fixed two real
+bugs: unvalidated since/until could crash the route via a CRLF-in-header
+error (now rejected with a 400), and campaign/contact names starting
+with =+-@ could execute as spreadsheet formulas on open (CSV/formula
+injection, CWE-1236) — now neutralized with a leading apostrophe.
+
+Extracted clients/page.tsx's page-local shopTotals/inline-filter into
+shared, exported crm/queries.ts functions so the roster page and its CSV
+export can never silently drift apart.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ src/app/api/export/campaigns/route.ts       |  51 ++++++++
+ src/app/api/export/clients/route.ts         |  59 +++++++++
+ src/app/client/(portal)/ads/google/page.tsx |   1 +
+ src/app/client/(portal)/ads/meta/page.tsx   |   1 +
+ src/app/client/(portal)/ads/tiktok/page.tsx |   1 +
+ src/app/client/(portal)/shopify/page.tsx    |   6 +-
+ src/app/client/export/campaigns/route.ts    |  49 +++++++
+ src/app/dashboard/clients/page.tsx          |  68 +++++-----
+ src/app/dashboard/shopify/page.tsx          |   6 +-
+ src/app/globals.css                         |  34 +++++
+ src/app/share/[provider]/[token]/page.tsx   |   2 +-
+ src/components/charts/date-range-picker.tsx |   2 +-
+ src/components/shared/print-button.tsx      |  28 ++++
+ src/components/shell/client-nav.tsx         |   2 +-
+ src/components/shell/sidebar.tsx            |  10 +-
+ src/components/shell/topbar.tsx             |   2 +-
+ src/components/ui/primitives.tsx            |  27 ++++
+ src/features/ads/campaigns-export.ts        | 137 ++++++++++++++++++++
+ src/features/ads/channel-page.tsx           |  36 ++++-
+ src/features/crm/clients-export.ts          |  41 ++++++
+ src/features/crm/queries.ts                 |  36 +++++
+ src/lib/csv.ts                              |  67 ++++++++++
+ tests/csv.test.ts                           |  66 ++++++++++
+ 23 files changed, 687 insertions(+), 45 deletions(-)
+ create mode 100644 src/app/api/export/campaigns/route.ts
+ create mode 100644 src/app/api/export/clients/route.ts
+ create mode 100644 src/app/client/export/campaigns/route.ts
+ create mode 100644 src/components/shared/print-button.tsx
+ create mode 100644 src/features/ads/campaigns-export.ts
+ create mode 100644 src/features/crm/clients-export.ts
+ create mode 100644 src/lib/csv.ts
+ create mode 100644 tests/csv.test.ts
+
+diff --git a/src/app/api/export/campaigns/route.ts b/src/app/api/export/campaigns/route.ts
+new file mode 100644
+index 0000000..204b7f0
+--- /dev/null
++++ b/src/app/api/export/campaigns/route.ts
+@@ -0,0 +1,51 @@
++import { NextResponse, type NextRequest } from "next/server";
++import {
++  getCampaignsForExport,
++  campaignsToCsv,
++  campaignExportFilename,
++  isExportableProvider,
++  isValidDateParam,
++} from "@/features/ads/campaigns-export";
++import { resolveDateRange } from "@/features/metrics/queries";
++import { csvResponse } from "@/lib/csv";
++import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
++
++/**
++ * Campaigns CSV for the internal dashboard. Auth is exactly the "ws"
++ * cookie every /dashboard/* page already trusts (getActiveWorkspaceId) —
++ * never a client-supplied workspaceId param — so this can only ever export
++ * whichever workspace the agency currently has selected in its own
++ * switcher. See features/ads/campaigns-export.ts for why the client-portal
++ * export isn't this same route.
++ */
++export async function GET(request: NextRequest) {
++  const { searchParams } = new URL(request.url);
++  const provider = searchParams.get("provider");
++  if (!isExportableProvider(provider)) {
++    return NextResponse.json({ error: "invalid or missing provider" }, { status: 400 });
++  }
++
++  const workspaceId = await getActiveWorkspaceId();
++  if (!workspaceId) {
++    return NextResponse.json({ error: "no active workspace" }, { status: 400 });
++  }
++
++  const since = searchParams.get("since");
++  const until = searchParams.get("until");
++  if (!isValidDateParam(since) || !isValidDateParam(until)) {
++    return NextResponse.json({ error: "since/until must be YYYY-MM-DD" }, { status: 400 });
++  }
++
++  const { range } = resolveDateRange({
++    preset: searchParams.get("preset") ?? undefined,
++    since: since ?? undefined,
++    until: until ?? undefined,
++  });
++
++  const [campaigns, workspaceName] = await Promise.all([
++    getCampaignsForExport(workspaceId, provider, range),
++    getWorkspaceName(workspaceId),
++  ]);
++
++  return csvResponse(campaignsToCsv(campaigns), campaignExportFilename(workspaceName, provider, range));
++}
+diff --git a/src/app/api/export/clients/route.ts b/src/app/api/export/clients/route.ts
+new file mode 100644
+index 0000000..2e467d5
+--- /dev/null
++++ b/src/app/api/export/clients/route.ts
+@@ -0,0 +1,59 @@
++import { type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import {
++  getWorkspaces,
++  getContacts,
++  getClientRevenueTotals,
++  filterAndSortWorkspaces,
++  type WorkspaceRow,
++  type ContactRow,
++} from "@/features/crm/queries";
++import { lastNDays } from "@/features/metrics/queries";
++import { clientsToCsv } from "@/features/crm/clients-export";
++import { csvResponse } from "@/lib/csv";
++import type { ShopFacts } from "@/lib/metrics/definitions";
++
++/**
++ * Client roster CSV — admin only, no client-portal equivalent (a client
++ * has no reason to see the whole agency's roster). Same 30-day window and
++ * same filter/sort semantics as the Clients page cards, via the shared
++ * filterAndSortWorkspaces()/getClientRevenueTotals() helpers in
++ * features/crm/queries.ts, so the CSV always matches what's on screen.
++ * Unlike the page, this always fetches revenue for every filtered client
++ * rather than only the current page — a CSV export is inherently a
++ * "give me everything that matches" action, not a paginated view.
++ */
++export async function GET(request: NextRequest) {
++  const { searchParams } = new URL(request.url);
++  const principal = await getPrincipal();
++  const range = lastNDays(30);
++
++  const [workspaces, contacts] = await Promise.all([
++    getWorkspaces(principal.orgId),
++    getContacts(principal.orgId),
++  ]);
++
++  const statusParam = searchParams.get("status");
++  const status = statusParam === "active" || statusParam === "suspended" ? statusParam : "all";
++  const filtered = filterAndSortWorkspaces(workspaces, {
++    search: searchParams.get("q") ?? undefined,
++    status,
++  });
++
++  const withTotals: Array<{ workspace: WorkspaceRow; totals: ShopFacts; contacts: ContactRow[] }> = await Promise.all(
++    filtered.map(async (ws) => ({
++      workspace: ws,
++      totals: await getClientRevenueTotals(ws.id, range),
++      contacts: contacts.filter((c) => c.workspaceId === ws.id),
++    })),
++  );
++
++  const sort = searchParams.get("sort");
++  withTotals.sort((a, b) => {
++    if (sort === "revenue") return b.totals.netSalesMinor - a.totals.netSalesMinor;
++    if (sort === "name_desc") return b.workspace.name.localeCompare(a.workspace.name);
++    return a.workspace.name.localeCompare(b.workspace.name);
++  });
++
++  return csvResponse(clientsToCsv(withTotals), `clients-${range.since}-to-${range.until}.csv`);
++}
+diff --git a/src/app/client/(portal)/ads/google/page.tsx b/src/app/client/(portal)/ads/google/page.tsx
+index ff83d97..3e822aa 100644
+--- a/src/app/client/(portal)/ads/google/page.tsx
++++ b/src/app/client/(portal)/ads/google/page.tsx
+@@ -24,6 +24,7 @@ export default async function ClientGoogleAdsPage({
+       sortKey={sortKey}
+       sortDir={sortDir}
+       page={page}
++      exportBase="/client/export/campaigns"
+     />
+   );
+ }
+diff --git a/src/app/client/(portal)/ads/meta/page.tsx b/src/app/client/(portal)/ads/meta/page.tsx
+index 97dfe47..3c26c3a 100644
+--- a/src/app/client/(portal)/ads/meta/page.tsx
++++ b/src/app/client/(portal)/ads/meta/page.tsx
+@@ -24,6 +24,7 @@ export default async function ClientMetaAdsPage({
+       sortKey={sortKey}
+       sortDir={sortDir}
+       page={page}
++      exportBase="/client/export/campaigns"
+     />
+   );
+ }
+diff --git a/src/app/client/(portal)/ads/tiktok/page.tsx b/src/app/client/(portal)/ads/tiktok/page.tsx
+index d117954..e4704f6 100644
+--- a/src/app/client/(portal)/ads/tiktok/page.tsx
++++ b/src/app/client/(portal)/ads/tiktok/page.tsx
+@@ -24,6 +24,7 @@ export default async function ClientTikTokAdsPage({
+       sortKey={sortKey}
+       sortDir={sortDir}
+       page={page}
++      exportBase="/client/export/campaigns"
+     />
+   );
+ }
+diff --git a/src/app/client/(portal)/shopify/page.tsx b/src/app/client/(portal)/shopify/page.tsx
+index cb9117a..06123d7 100644
+--- a/src/app/client/(portal)/shopify/page.tsx
++++ b/src/app/client/(portal)/shopify/page.tsx
+@@ -1,4 +1,5 @@
+ import { DateRangePicker } from "@/components/charts/date-range-picker";
++import { PrintButton } from "@/components/shared/print-button";
+ import { ShopifyReport } from "@/features/shopify/report";
+ import { resolveDateRange } from "@/features/metrics/queries";
+ import { requireClientSession } from "@/lib/auth/client-session";
+@@ -15,7 +16,10 @@ export default async function ClientShopifyPage({
+ 
+   return (
+     <main className="space-y-6 px-6 py-6">
+-      <DateRangePicker preset={preset} range={range} />
++      <div className="flex flex-wrap items-center justify-between gap-3">
++        <DateRangePicker preset={preset} range={range} />
++        <PrintButton />
++      </div>
+       <ShopifyReport workspaceId={session.workspaceId} range={range} preset={preset} />
+     </main>
+   );
+diff --git a/src/app/client/export/campaigns/route.ts b/src/app/client/export/campaigns/route.ts
+new file mode 100644
+index 0000000..2d7ce31
+--- /dev/null
++++ b/src/app/client/export/campaigns/route.ts
+@@ -0,0 +1,49 @@
++import { NextResponse, type NextRequest } from "next/server";
++import {
++  getCampaignsForExport,
++  campaignsToCsv,
++  campaignExportFilename,
++  isExportableProvider,
++  isValidDateParam,
++} from "@/features/ads/campaigns-export";
++import { resolveDateRange } from "@/features/metrics/queries";
++import { csvResponse } from "@/lib/csv";
++import { requireClientSession } from "@/lib/auth/client-session";
++import { getWorkspaceName } from "@/lib/workspace";
++
++/**
++ * Same export as the admin dashboard's, scoped to the logged-in client's
++ * own workspace via requireClientSession() — never a query-param
++ * workspaceId — so one client can never pull another's data by editing the
++ * URL. Deliberately lives under /client/* rather than /api/*: the
++ * client_session cookie is set with path=/client (see client-session.ts),
++ * so it's never even sent to a route outside that prefix — putting this
++ * under /api/export would silently see no session at all.
++ */
++export async function GET(request: NextRequest) {
++  const session = await requireClientSession();
++  const { searchParams } = new URL(request.url);
++  const provider = searchParams.get("provider");
++  if (!isExportableProvider(provider)) {
++    return NextResponse.json({ error: "invalid or missing provider" }, { status: 400 });
++  }
++
++  const since = searchParams.get("since");
++  const until = searchParams.get("until");
++  if (!isValidDateParam(since) || !isValidDateParam(until)) {
++    return NextResponse.json({ error: "since/until must be YYYY-MM-DD" }, { status: 400 });
++  }
++
++  const { range } = resolveDateRange({
++    preset: searchParams.get("preset") ?? undefined,
++    since: since ?? undefined,
++    until: until ?? undefined,
++  });
++
++  const [campaigns, workspaceName] = await Promise.all([
++    getCampaignsForExport(session.workspaceId, provider, range),
++    getWorkspaceName(session.workspaceId),
++  ]);
++
++  return csvResponse(campaignsToCsv(campaigns), campaignExportFilename(workspaceName, provider, range));
++}
+diff --git a/src/app/dashboard/clients/page.tsx b/src/app/dashboard/clients/page.tsx
+index 224b27f..69ce8b6 100644
+--- a/src/app/dashboard/clients/page.tsx
++++ b/src/app/dashboard/clients/page.tsx
+@@ -1,8 +1,17 @@
+ import Link from "next/link";
++import { Download } from "lucide-react";
+ import { Topbar } from "@/components/shell/topbar";
+-import { Card, CardHeader, Badge, EmptyState } from "@/components/ui/primitives";
++import { Card, CardHeader, Badge, EmptyState, LinkButton } from "@/components/ui/primitives";
++import { PrintButton } from "@/components/shared/print-button";
+ import { getPrincipal } from "@/lib/auth/principal";
+-import { getContacts, getWorkspaces, getArchivedWorkspaces, type WorkspaceRow } from "@/features/crm/queries";
++import {
++  getContacts,
++  getWorkspaces,
++  getArchivedWorkspaces,
++  getClientRevenueTotals,
++  filterAndSortWorkspaces,
++  type WorkspaceRow,
++} from "@/features/crm/queries";
+ import {
+   NewContactForm,
+   NewWorkspaceForm,
+@@ -11,9 +20,8 @@ import {
+   ArchiveWorkspaceForm,
+   RestoreWorkspaceForm,
+ } from "@/features/crm/components/forms";
+-import { getShopDaily, lastNDays } from "@/features/metrics/queries";
+-import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
+-import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
++import { lastNDays } from "@/features/metrics/queries";
++import type { ShopFacts } from "@/lib/metrics/definitions";
+ import { formatMoney } from "@/lib/utils";
+ import { isDemoMode } from "@/lib/env";
+ 
+@@ -28,19 +36,6 @@ const filterInputCls =
+ const PAGE_SIZE = 12;
+ type ClientSort = "name" | "name_desc" | "revenue";
+ 
+-async function shopTotals(workspaceId: string, range: { since: string; until: string }): Promise<ShopFacts> {
+-  // Shopify is pulled live now (features/integrations/shopify-live.ts) —
+-  // nothing syncs orders into the database anymore, same "pull-on-demand"
+-  // shape as every ad channel. This used to call getShopDaily() even in
+-  // live mode, which reads a table nothing writes to any more, so every
+-  // client's revenue/orders here silently showed $0/0 in production
+-  // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
+-  // deterministic generator since there's no real store to pull from.
+-  return isDemoMode
+-    ? sumShopFacts(await getShopDaily(workspaceId, range))
+-    : (await getLiveShopifyReport(workspaceId, range)).totals;
+-}
+-
+ /** Agency client roster: every workspace is one client brand. */
+ export default async function ClientsPage({
+   searchParams,
+@@ -62,11 +57,7 @@ export default async function ClientsPage({
+ 
+   const range = lastNDays(30);
+ 
+-  const filtered = workspaces.filter((ws) => {
+-    if (statusFilter !== "all" && ws.status !== statusFilter) return false;
+-    if (search && !ws.name.toLowerCase().includes(search)) return false;
+-    return true;
+-  });
++  const filtered = filterAndSortWorkspaces(workspaces, { search, status: statusFilter });
+   const isFiltered = Boolean(search) || statusFilter !== "all";
+ 
+   // Sorting by revenue needs every filtered workspace's totals up front —
+@@ -81,7 +72,7 @@ export default async function ClientsPage({
+ 
+   if (sortKey === "revenue") {
+     const withRevenue = await Promise.all(
+-      filtered.map(async (ws) => ({ ws, totals: await shopTotals(ws.id, range) })),
++      filtered.map(async (ws) => ({ ws, totals: await getClientRevenueTotals(ws.id, range) })),
+     );
+     withRevenue.sort((a, b) => b.totals.netSalesMinor - a.totals.netSalesMinor);
+     totalPages = Math.max(1, Math.ceil(withRevenue.length / PAGE_SIZE));
+@@ -97,7 +88,7 @@ export default async function ClientsPage({
+     currentPage = Math.min(requestedPage, totalPages);
+     pageItems = sorted.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+     revenue = await Promise.all(
+-      pageItems.map(async (ws) => ({ id: ws.id, totals: await shopTotals(ws.id, range) })),
++      pageItems.map(async (ws) => ({ id: ws.id, totals: await getClientRevenueTotals(ws.id, range) })),
+     );
+   }
+ 
+@@ -113,12 +104,23 @@ export default async function ClientsPage({
+     return qs ? `/dashboard/clients?${qs}` : "/dashboard/clients";
+   }
+ 
++  /** Same q/status/sort as clientsPageHref, minus page — export is always
++   *  "every matching client," not just the page currently on screen. */
++  function clientsExportHref(): string {
++    const params = new URLSearchParams();
++    if (q) params.set("q", q);
++    if (statusFilter !== "all") params.set("status", statusFilter);
++    if (sortKey !== "name") params.set("sort", sortKey);
++    const qs = params.toString();
++    return qs ? `/api/export/clients?${qs}` : "/api/export/clients";
++  }
++
+   return (
+     <>
+       <Topbar title="Clients" />
+       <main className="space-y-6 px-6 py-6">
+         <div className="flex flex-wrap items-center justify-between gap-3">
+-          <form method="GET" className="flex flex-wrap items-center gap-2">
++          <form method="GET" className="flex flex-wrap items-center gap-2 print:hidden">
+             <input
+               type="search"
+               name="q"
+@@ -151,7 +153,11 @@ export default async function ClientsPage({
+               </Link>
+             ) : null}
+           </form>
+-          <div className="flex gap-2">
++          <div className="flex gap-2 print:hidden">
++            <LinkButton variant="outline" href={clientsExportHref()}>
++              <Download size={13} /> Export CSV
++            </LinkButton>
++            <PrintButton />
+             <NewWorkspaceForm />
+             <NewContactForm workspaces={workspaces} />
+           </div>
+@@ -232,7 +238,7 @@ export default async function ClientsPage({
+                   </Link>
+                 </div>
+                 {!isDemoMode ? (
+-                  <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3">
++                  <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3 print:hidden">
+                     <EditWorkspaceForm
+                       workspace={{ id: ws.id, name: ws.name, website: ws.website }}
+                     />
+@@ -246,7 +252,7 @@ export default async function ClientsPage({
+         </div>
+ 
+         {totalPages > 1 ? (
+-          <div className="flex items-center justify-center gap-3 pt-1">
++          <div className="flex items-center justify-center gap-3 pt-1 print:hidden">
+             {currentPage > 1 ? (
+               <Link
+                 href={clientsPageHref(currentPage - 1)}
+@@ -288,7 +294,9 @@ export default async function ClientsPage({
+                       {ws.archivedAt ? new Date(ws.archivedAt).toLocaleDateString("en-IN") : ""}
+                     </p>
+                   </div>
+-                  <RestoreWorkspaceForm workspaceId={ws.id} />
++                  <span className="print:hidden">
++                    <RestoreWorkspaceForm workspaceId={ws.id} />
++                  </span>
+                 </Card>
+               ))}
+             </div>
+diff --git a/src/app/dashboard/shopify/page.tsx b/src/app/dashboard/shopify/page.tsx
+index 4e42269..dafe973 100644
+--- a/src/app/dashboard/shopify/page.tsx
++++ b/src/app/dashboard/shopify/page.tsx
+@@ -1,5 +1,6 @@
+ import { Topbar } from "@/components/shell/topbar";
+ import { DateRangePicker } from "@/components/charts/date-range-picker";
++import { PrintButton } from "@/components/shared/print-button";
+ import { ShopifyReport } from "@/features/shopify/report";
+ import { resolveDateRange } from "@/features/metrics/queries";
+ import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
+@@ -19,7 +20,10 @@ export default async function ShopifyPage({
+     <>
+       <Topbar title={`Shopify — ${workspaceName}`} />
+       <main className="space-y-6 px-6 py-6">
+-        <DateRangePicker preset={preset} range={range} />
++        <div className="flex flex-wrap items-center justify-between gap-3">
++          <DateRangePicker preset={preset} range={range} />
++          <PrintButton />
++        </div>
+         <ShopifyReport workspaceId={workspaceId} range={range} preset={preset} />
+       </main>
+     </>
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 499a047..b82d2c6 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -81,3 +81,37 @@ body {
+   scrollbar-width: thin;
+   scrollbar-color: var(--border) transparent;
+ }
++
++/* ─── Print: reports render clean on paper — no chrome, no dark bg. ───
++   Hiding nav/forms/buttons/pagination uses Tailwind's built-in `print:`
++   variant (e.g. `print:hidden`) directly on those elements — only the
++   parts Tailwind utilities can't express live here: forcing light colors
++   regardless of the viewer's dark-mode choice (printing white text on a
++   near-black background would waste ink or be unreadable), and keeping
++   table rows from splitting across a page break. */
++@media print {
++  :root,
++  .dark {
++    --background: #ffffff;
++    --surface: #ffffff;
++    --surface-2: #fafafa;
++    --border: #d4d4d8;
++    --foreground: #18181b;
++    --muted: #52525b;
++  }
++
++  body {
++    background: #ffffff;
++  }
++
++  table {
++    break-inside: auto;
++  }
++  tr {
++    break-inside: avoid;
++    break-after: auto;
++  }
++  thead {
++    display: table-header-group;
++  }
++}
+diff --git a/src/app/share/[provider]/[token]/page.tsx b/src/app/share/[provider]/[token]/page.tsx
+index d6faa2e..cad602d 100644
+--- a/src/app/share/[provider]/[token]/page.tsx
++++ b/src/app/share/[provider]/[token]/page.tsx
+@@ -62,7 +62,7 @@ export default async function SharedReportPage({
+ 
+   return (
+     <>
+-      <header className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background/80 px-6 backdrop-blur">
++      <header className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background/80 px-6 backdrop-blur print:hidden">
+         <h1 className="text-sm font-semibold tracking-tight">{heading}</h1>
+         <div className="flex items-center gap-3">
+           <span className="text-xs text-muted">Shared report · read-only</span>
+diff --git a/src/components/charts/date-range-picker.tsx b/src/components/charts/date-range-picker.tsx
+index 55ffc74..fbb100c 100644
+--- a/src/components/charts/date-range-picker.tsx
++++ b/src/components/charts/date-range-picker.tsx
+@@ -36,7 +36,7 @@ export function DateRangePicker({
+   range: { since: string; until: string };
+ }) {
+   return (
+-    <div className="flex flex-wrap items-center gap-2">
++    <div className="flex flex-wrap items-center gap-2 print:hidden">
+       {PRESETS.map((p) => (
+         <a key={p.key} href={`?preset=${p.key}`} className={pillCls(preset === p.key)}>
+           {p.label}
+diff --git a/src/components/shared/print-button.tsx b/src/components/shared/print-button.tsx
+new file mode 100644
+index 0000000..e665e17
+--- /dev/null
++++ b/src/components/shared/print-button.tsx
+@@ -0,0 +1,28 @@
++"use client";
++
++import { Printer } from "lucide-react";
++import { Button } from "@/components/ui/primitives";
++
++/**
++ * AUDIT_REPORT.md — Medium: "CSV/PDF export — neither exists anywhere."
++ * PDF export is the browser's own Print dialog (Save as PDF), not a
++ * server-rendered file: no Puppeteer/headless-browser dependency, no
++ * Vercel serverless timeout/memory risk, and it reuses the exact page the
++ * user is already looking at instead of a second rendering path that could
++ * drift out of sync. Pairs with the `@media print` rules in globals.css
++ * (forces light colors so a report printed from dark mode doesn't come out
++ * black-on-black) and the `print:hidden` utility applied to nav chrome,
++ * forms, and per-row action buttons throughout the report pages.
++ */
++export function PrintButton() {
++  return (
++    <Button
++      type="button"
++      variant="outline"
++      className="print:hidden"
++      onClick={() => window.print()}
++    >
++      <Printer size={13} /> Print / Save PDF
++    </Button>
++  );
++}
+diff --git a/src/components/shell/client-nav.tsx b/src/components/shell/client-nav.tsx
+index 1d421d9..caa48d3 100644
+--- a/src/components/shell/client-nav.tsx
++++ b/src/components/shell/client-nav.tsx
+@@ -44,7 +44,7 @@ export function ClientNav({ workspaceName, username }: { workspaceName: string;
+   const [pending, startTransition] = useTransition();
+ 
+   return (
+-    <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur">
++    <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur print:hidden">
+       <div className="flex h-14 items-center justify-between px-6">
+         <div className="flex items-center gap-2 overflow-hidden">
+           <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-accent text-[11px] font-bold text-accent-foreground">
+diff --git a/src/components/shell/sidebar.tsx b/src/components/shell/sidebar.tsx
+index 017b7e8..12f35dc 100644
+--- a/src/components/shell/sidebar.tsx
++++ b/src/components/shell/sidebar.tsx
+@@ -125,8 +125,10 @@ export function Sidebar() {
+ 
+   return (
+     <>
+-      {/* Desktop rail — unchanged from before, just the ≥md breakpoint. */}
+-      <aside className="fixed inset-y-0 left-0 z-20 hidden w-56 flex-col border-r border-border bg-surface md:flex">
++      {/* Desktop rail — unchanged from before, just the ≥md breakpoint.
++       *  print:hidden — pure nav chrome, no reason to appear on a printed
++       *  report (see globals.css for the rest of the print rules). */}
++      <aside className="fixed inset-y-0 left-0 z-20 hidden w-56 flex-col border-r border-border bg-surface md:flex print:hidden">
+         <div className="flex h-14 items-center px-5">
+           <Wordmark />
+         </div>
+@@ -141,7 +143,7 @@ export function Sidebar() {
+        *  This is a normal (non-fixed) bar so it scrolls away naturally and
+        *  lets each page's own sticky Topbar take over the top of the
+        *  viewport, exactly like it does on desktop. */}
+-      <div className="flex h-12 items-center justify-between border-b border-border bg-surface px-4 md:hidden">
++      <div className="flex h-12 items-center justify-between border-b border-border bg-surface px-4 md:hidden print:hidden">
+         <Wordmark />
+         <button
+           type="button"
+@@ -155,7 +157,7 @@ export function Sidebar() {
+ 
+       {/* Mobile drawer + backdrop */}
+       {mobileOpen ? (
+-        <div className="fixed inset-0 z-40 md:hidden">
++        <div className="fixed inset-0 z-40 md:hidden print:hidden">
+           <button
+             type="button"
+             aria-label="Close navigation menu"
+diff --git a/src/components/shell/topbar.tsx b/src/components/shell/topbar.tsx
+index 332a0b3..a6089a7 100644
+--- a/src/components/shell/topbar.tsx
++++ b/src/components/shell/topbar.tsx
+@@ -9,7 +9,7 @@ export async function Topbar({ title }: { title: string }) {
+   ]);
+ 
+   return (
+-    <header className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background/80 px-6 backdrop-blur">
++    <header className="sticky top-0 z-10 flex h-14 items-center justify-between border-b border-border bg-background/80 px-6 backdrop-blur print:hidden">
+       <h1 className="text-sm font-semibold tracking-tight">{title}</h1>
+       <div className="flex items-center gap-2">
+         <WorkspaceSwitcher workspaces={workspaces} activeId={activeId} />
+diff --git a/src/components/ui/primitives.tsx b/src/components/ui/primitives.tsx
+index 16a6658..44c51fe 100644
+--- a/src/components/ui/primitives.tsx
++++ b/src/components/ui/primitives.tsx
+@@ -91,6 +91,33 @@ export function Button({
+   );
+ }
+ 
++/** Same look as Button, rendered as an <a> — for actions that are really
++ *  navigations (CSV export downloads, "open in new tab") and shouldn't be
++ *  wrapped in a <button onClick> just to get button styling. */
++export function LinkButton({
++  variant = "primary",
++  className,
++  ...props
++}: ComponentPropsWithoutRef<"a"> & {
++  variant?: "primary" | "ghost" | "outline";
++}) {
++  return (
++    <a
++      className={cn(
++        "inline-flex h-8 items-center justify-center gap-1.5 rounded-lg px-3 text-[13px] font-medium transition-colors",
++        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
++        variant === "primary" &&
++          "bg-accent text-accent-foreground hover:opacity-90",
++        variant === "outline" &&
++          "border border-border bg-surface hover:bg-surface-2",
++        variant === "ghost" && "text-muted hover:bg-surface-2 hover:text-foreground",
++        className,
++      )}
++      {...props}
++    />
++  );
++}
++
+ export function Skeleton({ className }: { className?: string }) {
+   return (
+     <div
+diff --git a/src/features/ads/campaigns-export.ts b/src/features/ads/campaigns-export.ts
+new file mode 100644
+index 0000000..1656599
+--- /dev/null
++++ b/src/features/ads/campaigns-export.ts
+@@ -0,0 +1,137 @@
++import "server-only";
++import {
++  getCampaignsWithFacts,
++  type DateRange,
++  type RangePreset,
++  type CampaignWithFacts,
++} from "@/features/metrics/queries";
++import { getLiveMetaReport } from "@/features/integrations/meta-live";
++import { getLiveGoogleAdsReport } from "@/features/integrations/google-ads-live";
++import { getLiveTikTokReport } from "@/features/integrations/tiktok-live";
++import { adMetrics } from "@/lib/metrics/definitions";
++import { csvRow, csvDocument, slugifyForFilename } from "@/lib/csv";
++import type { DemoProvider } from "@/features/demo-data/generator";
++import { isDemoMode } from "@/lib/env";
++
++/**
++ * Campaign rows for CSV export — the same data AdsReport's Campaigns table
++ * renders, but only the single current-range pull: no previous-period
++ * comparison, no pacing, no ad set/keyword/audience breakdowns, none of
++ * which a spend/revenue-per-campaign CSV needs. Kept as a plain data fetch
++ * (no JSX, no auth) so the admin and client-portal export routes can share
++ * it despite resolving workspaceId completely differently — see the two
++ * route.ts files that call this for why they aren't one shared handler
++ * (AdsReport itself spans three different auth surfaces; a single generic
++ * route trusting a query-param workspaceId would risk cross-tenant leaks).
++ */
++export async function getCampaignsForExport(
++  workspaceId: string,
++  provider: DemoProvider,
++  range: DateRange,
++): Promise<CampaignWithFacts[]> {
++  if (isDemoMode) return getCampaignsWithFacts(workspaceId, provider, range);
++  if (provider === "meta") return (await getLiveMetaReport(workspaceId, range)).campaigns;
++  if (provider === "google_ads") return (await getLiveGoogleAdsReport(workspaceId, range)).campaigns;
++  return (await getLiveTikTokReport(workspaceId, range)).campaigns;
++}
++
++export function isExportableProvider(value: string | null): value is DemoProvider {
++  return value === "meta" || value === "google_ads" || value === "tiktok";
++}
++
++const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
++
++/**
++ * Rejects anything that isn't a plain YYYY-MM-DD. Every OTHER caller of
++ * resolveDateRange only ever sees since/until via <input type="date">
++ * (browser-constrained to this exact shape) or a server-computed
++ * lastNDays() — this is the first place they arrive as a raw query-string
++ * value an attacker fully controls. Without this check, a crafted
++ * since/until containing a CR/LF flows straight into
++ * campaignExportFilename() and crashes NextResponse's header construction
++ * (verified against this app's Next.js version: it throws "invalid header
++ * value" on a raw \r\n inside Content-Disposition) — an unauthenticated
++ * crash on the admin export route, since that surface has no login wall
++ * by design. null (param not supplied) is valid — resolveDateRange falls
++ * back to the preset/default range in that case.
++ */
++export function isValidDateParam(value: string | null): boolean {
++  return value === null || ISO_DATE_RE.test(value);
++}
++
++/** Mirrors campaignTableHref's preset-vs-custom logic in channel-page.tsx
++ *  (custom range → explicit since/until, named preset → just the key) —
++ *  keep the two in sync if that logic ever changes. */
++export function campaignExportHref(
++  base: "/api/export/campaigns" | "/client/export/campaigns",
++  provider: DemoProvider,
++  preset: RangePreset,
++  range: DateRange,
++): string {
++  const params = new URLSearchParams({ provider });
++  if (preset !== "custom") params.set("preset", preset);
++  else {
++    params.set("since", range.since);
++    params.set("until", range.until);
++  }
++  return `${base}?${params.toString()}`;
++}
++
++export function campaignExportFilename(workspaceName: string, provider: DemoProvider, range: DateRange): string {
++  return `${slugifyForFilename(workspaceName)}-${provider}-campaigns-${range.since}-to-${range.until}.csv`;
++}
++
++const CSV_HEADERS = [
++  "Campaign",
++  "Status",
++  "Spend",
++  "Revenue",
++  "ROAS",
++  "Purchases",
++  "CPA",
++  "CPC",
++  "CPM",
++  "CTR (%)",
++  "Impressions",
++  "Clicks",
++  "Frequency",
++  "Quality ranking",
++  "Engagement rate ranking",
++  "Conversion rate ranking",
++];
++
++const toMajor = (minor: number): string => (minor / 100).toFixed(2);
++
++/**
++ * Plain CSV text (RFC 4180) mirroring the Campaigns table on the ads
++ * report. Money is decimal major units (not minor/paise) — a spreadsheet
++ * is for further math, not display formatting, so raw precision beats the
++ * UI's abbreviated "₹1.2L" style here.
++ */
++export function campaignsToCsv(campaigns: CampaignWithFacts[]): string {
++  const rows = [csvRow(CSV_HEADERS)];
++  for (const c of campaigns) {
++    const f = c.facts;
++    rows.push(
++      csvRow([
++        c.name,
++        c.status,
++        toMajor(f.spendMinor),
++        toMajor(f.revenueMinor),
++        adMetrics.roas(f).toFixed(2),
++        f.purchases,
++        toMajor(adMetrics.cpa(f)),
++        toMajor(adMetrics.cpc(f)),
++        toMajor(adMetrics.cpm(f)),
++        (adMetrics.ctr(f) * 100).toFixed(2),
++        f.impressions,
++        f.clicks,
++        adMetrics.frequency(f).toFixed(2),
++        c.qualityRanking ?? "",
++        c.engagementRateRanking ?? "",
++        c.conversionRateRanking ?? "",
++      ]),
++    );
++  }
++  return csvDocument(rows);
++}
+diff --git a/src/features/ads/channel-page.tsx b/src/features/ads/channel-page.tsx
+index 8b187f5..0df096a 100644
+--- a/src/features/ads/channel-page.tsx
++++ b/src/features/ads/channel-page.tsx
+@@ -1,9 +1,12 @@
+ import Link from "next/link";
++import { Download } from "lucide-react";
+ import { Topbar } from "@/components/shell/topbar";
+ import { KpiCard } from "@/components/charts/kpi-card";
+ import { DateRangePicker } from "@/components/charts/date-range-picker";
+ import { MoneyAreaChart } from "@/components/charts/charts";
+-import { Card, CardHeader, Badge } from "@/components/ui/primitives";
++import { Card, CardHeader, Badge, LinkButton } from "@/components/ui/primitives";
++import { PrintButton } from "@/components/shared/print-button";
++import { campaignExportHref } from "@/features/ads/campaigns-export";
+ import {
+   getAdDaily,
+   getCampaignsWithFacts,
+@@ -92,8 +95,10 @@ export function resolveCampaignTableParams(params: {
+  * identically for an internal dashboard route (current cookie-selected
+  * workspace) and a public share link (one fixed workspace baked into the
+  * share token, with no cross-workspace navigation exposed to strangers).
+- * `AdsChannelPage` below and the public /share/meta/[token] route are the
+- * only two callers — never duplicate this markup a third time.
++ * Callers: `AdsChannelPage` below (internal dashboard), the three
++ * client-portal ads pages (client/(portal)/ads/meta|google|tiktok), and
++ * the public /share/[provider]/[token] route — never duplicate this
++ * markup again for a fourth surface.
+  */
+ export async function AdsReport({
+   workspaceId,
+@@ -104,6 +109,7 @@ export async function AdsReport({
+   sortKey,
+   sortDir,
+   page,
++  exportBase,
+ }: {
+   workspaceId: string;
+   provider: DemoProvider;
+@@ -113,8 +119,17 @@ export async function AdsReport({
+   sortKey: CampaignSortKey;
+   sortDir: "asc" | "desc";
+   page: number;
++  /** Which surface is rendering this report — determines the Campaigns
++   *  CSV export link's base path (each surface has its own Route Handler
++   *  with its own auth, see campaigns-export.ts), or no Export CSV button
++   *  at all when omitted (the public share page: AUDIT_REPORT.md's export
++   *  request was scoped to the admin dashboard + client portal, not the
++   *  no-login share link). Print/PDF has no such restriction — it's pure
++   *  CSS, so PrintButton below always renders regardless of this prop. */
++  exportBase?: "/api/export/campaigns" | "/client/export/campaigns";
+ }) {
+   const rangeLabel = formatRangeLabel(range, preset);
++  const exportHref = exportBase ? campaignExportHref(exportBase, provider, preset, range) : null;
+ 
+   let totals: AdFacts;
+   let prev: AdFacts;
+@@ -437,7 +452,17 @@ export async function AdsReport({
+ 
+   return (
+     <main className="space-y-6 px-6 py-6">
+-        <DateRangePicker preset={preset} range={range} />
++        <div className="flex flex-wrap items-center justify-between gap-3">
++          <DateRangePicker preset={preset} range={range} />
++          <div className="flex items-center gap-2 print:hidden">
++            {exportHref ? (
++              <LinkButton variant="outline" href={exportHref}>
++                <Download size={13} /> Export CSV
++              </LinkButton>
++            ) : null}
++            <PrintButton />
++          </div>
++        </div>
+ 
+         {partialFailure ? (
+           <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
+@@ -579,7 +604,7 @@ export async function AdsReport({
+             </table>
+           </div>
+           {campaignTotalPages > 1 ? (
+-            <div className="flex items-center justify-center gap-3 border-t border-border py-3">
++            <div className="flex items-center justify-center gap-3 border-t border-border py-3 print:hidden">
+               {campaignPage > 1 ? (
+                 <Link
+                   href={campaignTableHref({ page: campaignPage - 1 })}
+@@ -1108,6 +1133,7 @@ export async function AdsChannelPage({
+         sortKey={sortKey}
+         sortDir={sortDir}
+         page={page}
++        exportBase="/api/export/campaigns"
+       />
+     </>
+   );
+diff --git a/src/features/crm/clients-export.ts b/src/features/crm/clients-export.ts
+new file mode 100644
+index 0000000..6d6455f
+--- /dev/null
++++ b/src/features/crm/clients-export.ts
+@@ -0,0 +1,41 @@
++import "server-only";
++import { csvRow, csvDocument } from "@/lib/csv";
++import type { WorkspaceRow, ContactRow } from "@/features/crm/queries";
++import type { ShopFacts } from "@/lib/metrics/definitions";
++
++export interface ClientExportRow {
++  workspace: WorkspaceRow;
++  totals: ShopFacts;
++  contacts: ContactRow[];
++}
++
++const toMajor = (minor: number): string => (minor / 100).toFixed(2);
++
++const HEADERS = ["Client", "Status", "Vertical", "Website", "Net revenue (30d)", "Orders (30d)", "Contacts"];
++
++/**
++ * Mirrors the Clients roster cards: same fields, same 30-day window, one
++ * row per client with every contact joined into a single cell (name
++ * <email>; name <email>...) rather than one row per contact — keeps "one
++ * row per client" simple, matching the roster's one-card-per-client shape.
++ */
++export function clientsToCsv(rows: ClientExportRow[]): string {
++  const lines = [csvRow(HEADERS)];
++  for (const r of rows) {
++    const contactsStr = r.contacts
++      .map((c) => (c.email ? `${c.fullName} <${c.email}>` : c.fullName))
++      .join("; ");
++    lines.push(
++      csvRow([
++        r.workspace.name,
++        r.workspace.status,
++        r.workspace.vertical ?? "",
++        r.workspace.website ?? "",
++        toMajor(r.totals.netSalesMinor),
++        r.totals.orders,
++        contactsStr,
++      ]),
++    );
++  }
++  return csvDocument(lines);
++}
+diff --git a/src/features/crm/queries.ts b/src/features/crm/queries.ts
+index 3b39676..40120cc 100644
+--- a/src/features/crm/queries.ts
++++ b/src/features/crm/queries.ts
+@@ -6,6 +6,9 @@ import {
+   demoTasks,
+   demoWorkspaces,
+ } from "@/features/demo-data/generator";
++import { getShopDaily, type DateRange } from "@/features/metrics/queries";
++import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
++import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
+ 
+ /**
+  * CRM read facade: demo generator or live tables, one return shape.
+@@ -78,6 +81,39 @@ export async function getArchivedWorkspaces(orgId: string): Promise<WorkspaceRow
+   return rows.map((r) => ({ ...r, archivedAt: r.archivedAt ? r.archivedAt.toISOString() : null }));
+ }
+ 
++/**
++ * Net revenue/orders for one client's storefront over a range — shared by
++ * the Clients roster cards and its CSV export, so the two numbers can
++ * never silently drift apart. Moved here from a page-local helper once the
++ * export route needed the exact same figures: this used to call
++ * getShopDaily() even in live mode, which reads a table nothing writes to
++ * any more (Shopify is pulled live now, see shopify-live.ts), so every
++ * client's revenue/orders silently showed $0/0 in production
++ * (AUDIT_REPORT.md, Bug #1 — Critical, fixed earlier). Demo mode keeps
++ * using the deterministic generator since there's no real store to pull
++ * from.
++ */
++export async function getClientRevenueTotals(workspaceId: string, range: DateRange): Promise<ShopFacts> {
++  return isDemoMode
++    ? sumShopFacts(await getShopDaily(workspaceId, range))
++    : (await getLiveShopifyReport(workspaceId, range)).totals;
++}
++
++/** Pure filter shared by the Clients roster page and its CSV export, so
++ *  "what you see is what you export" can never silently drift apart. */
++export function filterAndSortWorkspaces(
++  workspaces: WorkspaceRow[],
++  opts: { search?: string; status?: "all" | "active" | "suspended" },
++): WorkspaceRow[] {
++  const search = (opts.search ?? "").trim().toLowerCase();
++  const status = opts.status ?? "all";
++  return workspaces.filter((ws) => {
++    if (status !== "all" && ws.status !== status) return false;
++    if (search && !ws.name.toLowerCase().includes(search)) return false;
++    return true;
++  });
++}
++
+ export async function getContacts(orgId: string): Promise<ContactRow[]> {
+   if (isDemoMode) {
+     return demoContacts().map((c) => ({
+diff --git a/src/lib/csv.ts b/src/lib/csv.ts
+new file mode 100644
+index 0000000..90ae7e7
+--- /dev/null
++++ b/src/lib/csv.ts
+@@ -0,0 +1,67 @@
++import { NextResponse } from "next/server";
++
++/**
++ * Shared CSV building blocks for every export route (AUDIT_REPORT.md,
++ * Medium: "CSV/PDF export — neither exists anywhere in the codebase").
++ * One place for RFC 4180 escaping so no individual export route can get it
++ * wrong or forget it on a one-off field. No "server-only" guard, unlike
++ * most of features/* — same reasoning as lib/utils.ts's formatMoney/etc:
++ * these are pure string helpers with no secrets or DB access, safe to ever
++ * touch from a client bundle by mistake. Only csvResponse() needs
++ * next/server, and only route.ts files (which can't be client-bundled by
++ * construction) ever call it.
++ */
++
++/** Leading characters that Excel/Google Sheets treat as "this cell is a
++ *  formula" — a field starting with one of these gets neutralized with a
++ *  leading apostrophe (CWE-1236 / "CSV injection"). Every string field we
++ *  export (contact names, campaign names, ...) is free text someone else
++ *  typed or an ad platform returned, not something we generated, so this
++ *  isn't hypothetical: a contact literally named
++ *  `=HYPERLINK("http://evil","x")` is valid input today (contactSchema
++ *  only checks length, see features/crm/actions.ts) and would otherwise
++ *  execute as a formula the moment the exported CSV is opened. */
++const FORMULA_TRIGGER_RE = /^[=+\-@\t\r]/;
++
++/** Escapes one CSV field per RFC 4180 (quote if it contains a comma,
++ *  quote, or newline, doubling any embedded quotes) and neutralizes
++ *  leading formula-trigger characters — see FORMULA_TRIGGER_RE. */
++export function csvField(value: string | number): string {
++  let s = String(value);
++  if (FORMULA_TRIGGER_RE.test(s)) s = `'${s}`;
++  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
++}
++
++/** One CSV line from raw values. */
++export function csvRow(values: Array<string | number>): string {
++  return values.map(csvField).join(",");
++}
++
++/** Joins pre-built rows (from csvRow) with CRLF line endings — RFC 4180's
++ *  wire format, which Excel and most spreadsheet tools expect over a bare
++ *  LF. */
++export function csvDocument(rows: string[]): string {
++  return rows.join("\r\n") + "\r\n";
++}
++
++/** text/csv response with a download-triggering Content-Disposition —
++ *  every CSV export route in the app returns exactly this. */
++export function csvResponse(csv: string, filename: string): NextResponse {
++  return new NextResponse(csv, {
++    headers: {
++      "Content-Type": "text/csv; charset=utf-8",
++      "Content-Disposition": `attachment; filename="${filename}"`,
++    },
++  });
++}
++
++/** Filesystem/header-safe filename fragment from arbitrary display text
++ *  (e.g. a workspace name) — lowercase, alphanumeric-and-hyphen only. */
++export function slugifyForFilename(value: string): string {
++  return (
++    value
++      .toLowerCase()
++      .replace(/[^a-z0-9]+/g, "-")
++      .replace(/(^-+|-+$)/g, "") || "export"
++  );
++}
+diff --git a/tests/csv.test.ts b/tests/csv.test.ts
+new file mode 100644
+index 0000000..36d2b95
+--- /dev/null
++++ b/tests/csv.test.ts
+@@ -0,0 +1,66 @@
++import { describe, expect, it } from "vitest";
++import { csvField, csvRow, csvDocument, slugifyForFilename } from "../src/lib/csv";
++
++describe("csvField", () => {
++  it("passes plain values through unquoted", () => {
++    expect(csvField("Black Friday")).toBe("Black Friday");
++    expect(csvField(42)).toBe("42");
++    expect(csvField(3.5)).toBe("3.5");
++  });
++  it("quotes and escapes a field containing a comma — the exact bug a raw CSV builder would hit on a campaign name like this", () => {
++    expect(csvField("Black Friday, 2026")).toBe('"Black Friday, 2026"');
++  });
++  it("quotes and doubles embedded quotes", () => {
++    expect(csvField('Say "hi"')).toBe('"Say ""hi"""');
++  });
++  it("quotes a field containing a newline", () => {
++    expect(csvField("line1\nline2")).toBe('"line1\nline2"');
++  });
++  it("leaves an empty string as an empty (unquoted) field", () => {
++    expect(csvField("")).toBe("");
++  });
++  it("neutralizes a leading formula-trigger character with an apostrophe (CSV/formula injection — CWE-1236)", () => {
++    // A contact literally named this is valid input today (contactSchema
++    // only checks length) — must not execute as a formula when the
++    // exported CSV is opened in Excel/Sheets.
++    expect(csvField("=1+1")).toBe("'=1+1");
++    expect(csvField("+1 (555) 000-0000")).toBe("'+1 (555) 000-0000");
++    expect(csvField("-100")).toBe("'-100");
++    expect(csvField("@mention")).toBe("'@mention");
++  });
++  it("combines the formula guard with RFC 4180 quoting when the field also needs escaping", () => {
++    expect(csvField('=HYPERLINK("http://evil","x")')).toBe('"\'=HYPERLINK(""http://evil"",""x"")"');
++  });
++  it("does not touch a field that merely contains (not starts with) a trigger character", () => {
++    expect(csvField("Revenue = Spend x ROAS")).toBe("Revenue = Spend x ROAS");
++  });
++});
++
++describe("csvRow", () => {
++  it("joins fields with commas, escaping only where needed", () => {
++    expect(csvRow(["Campaign A", 100, "spend, revenue"])).toBe('Campaign A,100,"spend, revenue"');
++  });
++});
++
++describe("csvDocument", () => {
++  it("joins rows with CRLF and ends with a trailing CRLF", () => {
++    const doc = csvDocument(["a,b", "c,d"]);
++    expect(doc).toBe("a,b\r\nc,d\r\n");
++  });
++  it("a single row still gets a trailing CRLF", () => {
++    expect(csvDocument(["header"])).toBe("header\r\n");
++  });
++});
++
++describe("slugifyForFilename", () => {
++  it("lowercases and hyphenates arbitrary display text", () => {
++    expect(slugifyForFilename("Evo Labs / Client Co.")).toBe("evo-labs-client-co");
++  });
++  it("trims leading/trailing hyphens produced by leading/trailing punctuation", () => {
++    expect(slugifyForFilename("  !!Weird Name!!  ")).toBe("weird-name");
++  });
++  it("falls back to a safe default for input with no alphanumeric characters", () => {
++    expect(slugifyForFilename("***")).toBe("export");
++    expect(slugifyForFilename("")).toBe("export");
++  });
++});
+-- 
+2.43.0
+

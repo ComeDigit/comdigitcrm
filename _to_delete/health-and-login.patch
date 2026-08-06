@@ -1,0 +1,534 @@
+diff --git a/src/app/dashboard/clients/[id]/page.tsx b/src/app/dashboard/clients/[id]/page.tsx
+index e7c1bca..eab04d9 100644
+--- a/src/app/dashboard/clients/[id]/page.tsx
++++ b/src/app/dashboard/clients/[id]/page.tsx
+@@ -81,6 +81,9 @@ export default async function ClientDetailPage({
+   // runs, just scoped to this one workspace instead of every workspace
+   // that has a connection for each provider.
+   const healthByConnection = new Map<string, AccountHealth>();
++  // Connection ids are unique across providers, so one reason map serves all
++  // four probes. It explains a "no_access" without a trip to the Vercel log.
++  const healthReasonByConnection = new Map<string, string>();
+   if (!isDemoMode) {
+     const lists = await Promise.all([
+       connections.some((c) => c.provider === "meta")
+@@ -96,7 +99,11 @@ export default async function ClientDetailPage({
+         ? checkTikTokAccountsHealth(workspace.id)
+         : Promise.resolve([]),
+     ]);
+-    for (const list of lists) for (const r of list) healthByConnection.set(r.connectionId, r.health);
++    for (const list of lists)
++      for (const r of list) {
++        healthByConnection.set(r.connectionId, r.health);
++        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
++      }
+   }
+   const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
+     if (h === "live") return "positive";
+@@ -191,9 +198,19 @@ export default async function ClientDetailPage({
+                               {c.status}
+                             </span>
+                           </span>
+-                          <Badge tone={healthTone(healthByConnection.get(c.id))}>
+-                            {healthLabel(healthByConnection.get(c.id))}
+-                          </Badge>
++                          <>
++                            <Badge
++                              tone={healthTone(healthByConnection.get(c.id))}
++                              title={healthReasonByConnection.get(c.id)}
++                            >
++                              {healthLabel(healthByConnection.get(c.id))}
++                            </Badge>
++                            {healthReasonByConnection.get(c.id) ? (
++                              <span className="text-negative">
++                                {healthReasonByConnection.get(c.id)}
++                              </span>
++                            ) : null}
++                          </>
+                           {c.status === "active" ? (
+                             <DisconnectConnectionButton connectionId={c.id} workspaceId={c.workspaceId} />
+                           ) : null}
+diff --git a/src/app/dashboard/settings/page.tsx b/src/app/dashboard/settings/page.tsx
+index cd01ca8..1e1de77 100644
+--- a/src/app/dashboard/settings/page.tsx
++++ b/src/app/dashboard/settings/page.tsx
+@@ -61,10 +61,16 @@ export default async function SettingsPage() {
+     ...new Set(connections.filter((c) => c.provider === "meta").map((c) => c.workspaceId)),
+   ];
+   const metaHealthByConnection = new Map<string, AccountHealth>();
++  // Connection ids are unique across providers, so one reason map serves all
++  // four probes. It backs the badge tooltip that explains a "no_access".
++  const healthReasonByConnection = new Map<string, string>();
+   if (!isDemoMode) {
+     const healthResults = await Promise.all(metaWorkspaceIds.map((wsId) => checkMetaAccountsHealth(wsId)));
+     for (const list of healthResults) {
+-      for (const r of list) metaHealthByConnection.set(r.connectionId, r.health);
++      for (const r of list) {
++        metaHealthByConnection.set(r.connectionId, r.health);
++        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
++      }
+     }
+   }
+ 
+@@ -80,7 +86,10 @@ export default async function SettingsPage() {
+       shopifyWorkspaceIds.map((wsId) => checkShopifyAccountsHealth(wsId)),
+     );
+     for (const list of shopifyHealthResults) {
+-      for (const r of list) shopifyHealthByConnection.set(r.connectionId, r.health);
++      for (const r of list) {
++        shopifyHealthByConnection.set(r.connectionId, r.health);
++        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
++      }
+     }
+   }
+ 
+@@ -95,7 +104,10 @@ export default async function SettingsPage() {
+       googleAdsWorkspaceIds.map((wsId) => checkGoogleAdsAccountsHealth(wsId)),
+     );
+     for (const list of googleAdsHealthResults) {
+-      for (const r of list) googleAdsHealthByConnection.set(r.connectionId, r.health);
++      for (const r of list) {
++        googleAdsHealthByConnection.set(r.connectionId, r.health);
++        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
++      }
+     }
+   }
+ 
+@@ -109,7 +121,10 @@ export default async function SettingsPage() {
+       tiktokWorkspaceIds.map((wsId) => checkTikTokAccountsHealth(wsId)),
+     );
+     for (const list of tiktokHealthResults) {
+-      for (const r of list) tiktokHealthByConnection.set(r.connectionId, r.health);
++      for (const r of list) {
++        tiktokHealthByConnection.set(r.connectionId, r.health);
++        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
++      }
+     }
+   }
+   const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
+@@ -226,9 +241,22 @@ export default async function SettingsPage() {
+                           </span>
+                         </span>
+                         {healthMap ? (
+-                          <Badge tone={healthTone(healthMap.get(c.id))}>
+-                            {healthLabel(healthMap.get(c.id))}
+-                          </Badge>
++                          <>
++                            <Badge
++                              tone={healthTone(healthMap.get(c.id))}
++                              title={healthReasonByConnection.get(c.id)}
++                            >
++                              {healthLabel(healthMap.get(c.id))}
++                            </Badge>
++                            {healthReasonByConnection.get(c.id) ? (
++                              // Shown inline rather than tooltip-only: a
++                              // failing account is exactly the case where
++                              // the operator shouldn't have to go hunting.
++                              <span className="text-negative">
++                                {healthReasonByConnection.get(c.id)}
++                              </span>
++                            ) : null}
++                          </>
+                         ) : c.lastSyncAt ? (
+                           `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
+                         ) : null}
+diff --git a/src/features/client-portal/components/manager.tsx b/src/features/client-portal/components/manager.tsx
+index 7db7d78..2ab299a 100644
+--- a/src/features/client-portal/components/manager.tsx
++++ b/src/features/client-portal/components/manager.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useEffect, useState, useTransition } from "react";
+-import { KeyRound, Power, Trash2, LockOpen } from "lucide-react";
++import { KeyRound, Power, Trash2, LockOpen, Shuffle, Copy, Check, Eye, EyeOff } from "lucide-react";
+ import {
+   getClientLogin,
+   saveClientLogin,
+@@ -15,6 +15,27 @@ import { Badge, Button } from "@/components/ui/primitives";
+ const inputCls =
+   "h-9 w-full rounded-lg border border-border bg-surface px-3 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring";
+ 
++/**
++ * Deliberately excludes the characters that get misread when a password is
++ * read aloud or retyped off a screenshot: 0/O, 1/l/I, and the symbols that
++ * need escaping when pasted into a shell or a chat app. 20 chars from this
++ * 60-char alphabet is ~118 bits, which is plenty for a portal login.
++ */
++const PASSWORD_ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
++
++/**
++ * Generated in the browser via the Web Crypto API so the plaintext never
++ * travels anywhere except into the form field the admin is already typing
++ * into. Math.random would be wrong here — it's not a CSPRNG.
++ */
++function generatePassword(length = 20): string {
++  const bytes = new Uint32Array(length);
++  crypto.getRandomValues(bytes);
++  // Modulo bias is negligible at 2^32 % 56, and the alternative (rejection
++  // sampling) buys nothing at this alphabet size.
++  return Array.from(bytes, (b) => PASSWORD_ALPHABET[b % PASSWORD_ALPHABET.length]).join("");
++}
++
+ /**
+  * Manage the ONE client login per workspace — the login-based portal at
+  * /client, alongside (not replacing) the public share-link tier above.
+@@ -33,7 +54,16 @@ export function ClientPortalManager({
+   const [password, setPassword] = useState("");
+   const [error, setError] = useState<string | null>(null);
+   const [success, setSuccess] = useState<string | null>(null);
++  const [showPassword, setShowPassword] = useState(false);
++  const [copied, setCopied] = useState(false);
+   const [pending, startTransition] = useTransition();
++  /**
++   * The credentials to hand the client, held only until the admin navigates
++   * away. The server hashes the password and can never show it again, so
++   * clearing the field on save (the old behaviour) meant a generated
++   * password was destroyed before anyone could copy it.
++   */
++  const [handoff, setHandoff] = useState<{ username: string; password: string } | null>(null);
+ 
+   function refresh(ws: string) {
+     startTransition(async () => {
+@@ -41,6 +71,7 @@ export function ClientPortalManager({
+       setLogin(existing);
+       setUsername(existing?.username ?? "");
+       setPassword("");
++      setShowPassword(false);
+     });
+   }
+ 
+@@ -51,6 +82,8 @@ export function ClientPortalManager({
+   function save() {
+     setError(null);
+     setSuccess(null);
++    setCopied(false);
++    const submitted = { username: username.trim().toLowerCase(), password };
+     startTransition(async () => {
+       const result = await saveClientLogin(workspaceId, username, password);
+       if (result.error) {
+@@ -58,11 +91,30 @@ export function ClientPortalManager({
+         return;
+       }
+       setSuccess(login ? "Login updated." : "Login created.");
+-      setPassword("");
++      setHandoff(submitted);
+       refresh(workspaceId);
+     });
+   }
+ 
++  const workspaceName = workspaces.find((w) => w.id === workspaceId)?.name ?? "your account";
++  const portalUrl = typeof window === "undefined" ? "/client/login" : `${window.location.origin}/client/login`;
++  const handoffMessage = handoff
++    ? `Your ${workspaceName} reporting dashboard is ready.\n\n` +
++      `Sign in: ${portalUrl}\n` +
++      `Username: ${handoff.username}\n` +
++      `Password: ${handoff.password}\n\n` +
++      `You'll see live ad spend, performance and store numbers for your account. ` +
++      `Please change nothing about this link — it's specific to you.`
++    : "";
++
++  function copyHandoff() {
++    if (!handoffMessage) return;
++    void navigator.clipboard.writeText(handoffMessage).then(() => {
++      setCopied(true);
++      setTimeout(() => setCopied(false), 2000);
++    });
++  }
++
+   function toggleStatus() {
+     if (!login) return;
+     const next = login.status === "active" ? "disabled" : "active";
+@@ -161,16 +213,37 @@ export function ClientPortalManager({
+             autoComplete="off"
+           />
+         </div>
+-        <div className="min-w-[10rem]">
++        <div className="min-w-[14rem]">
+           <label className="mb-1 block text-xs text-muted">Password</label>
+-          <input
+-            className={inputCls}
+-            type="password"
+-            value={password}
+-            onChange={(e) => setPassword(e.target.value)}
+-            placeholder="At least 8 characters"
+-            autoComplete="new-password"
+-          />
++          <div className="flex items-center gap-1">
++            <input
++              className={inputCls}
++              type={showPassword ? "text" : "password"}
++              value={password}
++              onChange={(e) => setPassword(e.target.value)}
++              placeholder="At least 8 characters"
++              autoComplete="new-password"
++            />
++            <Button
++              variant="outline"
++              type="button"
++              title={showPassword ? "Hide password" : "Show password"}
++              onClick={() => setShowPassword((v) => !v)}
++            >
++              {showPassword ? <EyeOff size={13} /> : <Eye size={13} />}
++            </Button>
++            <Button
++              variant="outline"
++              type="button"
++              title="Generate a strong password"
++              onClick={() => {
++                setPassword(generatePassword());
++                setShowPassword(true);
++              }}
++            >
++              <Shuffle size={13} /> Generate
++            </Button>
++          </div>
+         </div>
+         <Button disabled={pending || !workspaceId} onClick={save}>
+           <KeyRound size={13} /> {login ? "Update login" : "Create login"}
+@@ -179,6 +252,26 @@ export function ClientPortalManager({
+ 
+       {error ? <p className="text-xs text-negative">{error}</p> : null}
+       {success ? <p className="text-xs text-positive">{success}</p> : null}
++
++      {handoff ? (
++        <div className="space-y-2 rounded-lg border border-positive/40 bg-positive/5 px-3 py-3">
++          <p className="text-xs font-medium">
++            Copy this now — the password is hashed on save and can never be shown again.
++          </p>
++          <pre className="whitespace-pre-wrap break-all rounded bg-surface-2 px-2 py-2 text-[12px]">
++            {handoffMessage}
++          </pre>
++          <div className="flex items-center gap-2">
++            <Button variant="outline" type="button" onClick={copyHandoff}>
++              {copied ? <Check size={13} /> : <Copy size={13} />} {copied ? "Copied" : "Copy message"}
++            </Button>
++            <Button variant="ghost" type="button" onClick={() => setHandoff(null)}>
++              Dismiss
++            </Button>
++          </div>
++        </div>
++      ) : null}
++
+       <p className="text-xs text-muted">
+         Share the username and password with your client directly — this app
+         never emails or displays the password again after you set it.
+diff --git a/src/features/integrations/google-ads-live.ts b/src/features/integrations/google-ads-live.ts
+index 08325e1..d5db210 100644
+--- a/src/features/integrations/google-ads-live.ts
++++ b/src/features/integrations/google-ads-live.ts
+@@ -318,6 +318,18 @@ export interface AccountHealthResult {
+   connectionId: string;
+   displayName: string;
+   health: AccountHealth;
++  /**
++   * Why the probe failed, when it did. "unreachable — check token" on its
++   * own sends an operator to the Vercel function log to find out which of a
++   * dozen causes it was; carrying the reason to the UI answers that in the
++   * place the problem is visible.
++   */
++  reason?: string;
++}
++
++interface HealthProbe {
++  health: AccountHealth;
++  reason?: string;
+ }
+ 
+ /** Cheap per-account health probe — mirrors checkMetaAccountsHealth. */
+@@ -338,20 +350,30 @@ export async function checkGoogleAdsAccountsHealth(workspaceId: string): Promise
+ 
+   return Promise.all(
+     connections.map(async (connection) => {
+-      const cacheKey = `google_ads-health:${connection.id}`;
+-      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++      // v2 key: the cached shape changed from a bare string to an object,
++      // so reusing the old key would hand back a string where callers now
++      // read `.health` and every account would read as "checking…".
++      const cacheKey = `google_ads-health2:${connection.id}`;
++      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
+         try {
+           const creds = await resolveCreds(connection);
+-          if (!creds) return "no_access";
++          if (!creds) {
++            return { health: "no_access", reason: "No refresh token — set GOOGLE_ADS_REFRESH_TOKEN or reconnect this account." };
++          }
+           const page = await provider.getDailyInsights(creds, connection.externalAccountId, range);
+           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
+-          return spend > 0 ? "live" : "idle";
++          return { health: spend > 0 ? "live" : "idle" };
+         } catch (e) {
+           logGoogleAdsFailure(connection.displayName, e);
+-          return "no_access";
++          return { health: "no_access", reason: reasonFor(e) };
+         }
+       });
+-      return { connectionId: connection.id, displayName: connection.displayName, health };
++      return {
++        connectionId: connection.id,
++        displayName: connection.displayName,
++        health: probe.health,
++        reason: probe.reason,
++      };
+     }),
+   );
+ }
+diff --git a/src/features/integrations/meta-live.ts b/src/features/integrations/meta-live.ts
+index 659eff9..cf7f690 100644
+--- a/src/features/integrations/meta-live.ts
++++ b/src/features/integrations/meta-live.ts
+@@ -312,6 +312,14 @@ export interface AccountHealthResult {
+   connectionId: string;
+   displayName: string;
+   health: AccountHealth;
++  /** Why the probe failed, when it did — surfaced in the UI so an operator
++   * doesn't have to open the Vercel function log to tell causes apart. */
++  reason?: string;
++}
++
++interface HealthProbe {
++  health: AccountHealth;
++  reason?: string;
+ }
+ 
+ /**
+@@ -337,20 +345,28 @@ export async function checkMetaAccountsHealth(workspaceId: string): Promise<Acco
+ 
+   return Promise.all(
+     connections.map(async (connection) => {
+-      const cacheKey = `meta-health:${connection.id}`;
+-      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++      // v2 key: the cached shape changed from a bare string to an object.
++      const cacheKey = `meta-health2:${connection.id}`;
++      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
+         const creds = await resolveCreds(connection);
+-        if (!creds) return "no_access";
++        if (!creds) {
++          return { health: "no_access", reason: "No token for this account — set META_USER_TOKEN or reconnect it." };
++        }
+         try {
+           const page = await provider.getDailyInsights(creds, connection.externalAccountId, range);
+           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
+-          return spend > 0 ? "live" : "idle";
++          return { health: spend > 0 ? "live" : "idle" };
+         } catch (e) {
+           logMetaFailure(connection.displayName, e);
+-          return "no_access";
++          return { health: "no_access", reason: reasonFor(e) };
+         }
+       });
+-      return { connectionId: connection.id, displayName: connection.displayName, health };
++      return {
++        connectionId: connection.id,
++        displayName: connection.displayName,
++        health: probe.health,
++        reason: probe.reason,
++      };
+     }),
+   );
+ }
+diff --git a/src/features/integrations/shopify-live.ts b/src/features/integrations/shopify-live.ts
+index 18d9b0d..8aaf3b4 100644
+--- a/src/features/integrations/shopify-live.ts
++++ b/src/features/integrations/shopify-live.ts
+@@ -161,6 +161,14 @@ export interface ShopifyAccountHealthResult {
+   connectionId: string;
+   displayName: string;
+   health: ShopifyAccountHealth;
++  /** Why the probe failed, when it did — surfaced in the UI so an operator
++   * doesn't have to open the Vercel function log to tell causes apart. */
++  reason?: string;
++}
++
++interface HealthProbe {
++  health: ShopifyAccountHealth;
++  reason?: string;
+ }
+ 
+ /**
+@@ -185,20 +193,28 @@ export async function checkShopifyAccountsHealth(workspaceId: string): Promise<S
+ 
+   return Promise.all(
+     connections.map(async (connection) => {
+-      const cacheKey = `shopify-health:${connection.id}`;
+-      const health = await cached<ShopifyAccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++      // v2 key: the cached shape changed from a bare string to an object.
++      const cacheKey = `shopify-health2:${connection.id}`;
++      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
+         const creds = await resolveCreds(connection);
+-        if (!creds) return "no_access";
++        if (!creds) {
++          return { health: "no_access", reason: "No access token stored for this store — reconnect it in Settings." };
++        }
+         try {
+           const facts = await fetchShopifyDailyFacts(creds.shopDomain, creds.accessToken, range);
+           const orders = [...facts.values()].reduce((sum, f) => sum + f.orders, 0);
+-          return orders > 0 ? "live" : "idle";
++          return { health: orders > 0 ? "live" : "idle" };
+         } catch (e) {
+           logShopifyFailure(connection.displayName, e);
+-          return "no_access";
++          return { health: "no_access", reason: reasonFor(e) };
+         }
+       });
+-      return { connectionId: connection.id, displayName: connection.displayName, health };
++      return {
++        connectionId: connection.id,
++        displayName: connection.displayName,
++        health: probe.health,
++        reason: probe.reason,
++      };
+     }),
+   );
+ }
+diff --git a/src/features/integrations/tiktok-live.ts b/src/features/integrations/tiktok-live.ts
+index 8960319..191b0ce 100644
+--- a/src/features/integrations/tiktok-live.ts
++++ b/src/features/integrations/tiktok-live.ts
+@@ -310,6 +310,14 @@ export interface AccountHealthResult {
+   connectionId: string;
+   displayName: string;
+   health: AccountHealth;
++  /** Why the probe failed, when it did — surfaced in the UI so an operator
++   * doesn't have to open the Vercel function log to tell causes apart. */
++  reason?: string;
++}
++
++interface HealthProbe {
++  health: AccountHealth;
++  reason?: string;
+ }
+ 
+ /** Cheap per-account health probe — mirrors checkMetaAccountsHealth. */
+@@ -329,20 +337,26 @@ export async function checkTikTokAccountsHealth(workspaceId: string): Promise<Ac
+ 
+   return Promise.all(
+     connections.map(async (connection) => {
+-      const cacheKey = `tiktok-health:${connection.id}`;
+-      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++      // v2 key: the cached shape changed from a bare string to an object.
++      const cacheKey = `tiktok-health2:${connection.id}`;
++      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
+         try {
+           const page = await withCreds(connection, (creds) =>
+             provider.getDailyInsights(creds, connection.externalAccountId, range),
+           );
+           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
+-          return spend > 0 ? "live" : "idle";
++          return { health: spend > 0 ? "live" : "idle" };
+         } catch (e) {
+           logTikTokFailure(connection.displayName, e);
+-          return "no_access";
++          return { health: "no_access", reason: reasonFor(e) };
+         }
+       });
+-      return { connectionId: connection.id, displayName: connection.displayName, health };
++      return {
++        connectionId: connection.id,
++        displayName: connection.displayName,
++        health: probe.health,
++        reason: probe.reason,
++      };
+     }),
+   );
+ }

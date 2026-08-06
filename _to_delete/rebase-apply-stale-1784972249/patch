@@ -1,0 +1,4247 @@
+---
+ .../integrations/google_ads/callback/route.ts | 142 ++++++
+ .../integrations/google_ads/start/route.ts    |  71 +++
+ .../api/integrations/tiktok/callback/route.ts | 125 +++++
+ .../api/integrations/tiktok/start/route.ts    |  64 +++
+ src/app/dashboard/settings/page.tsx           | 102 +++-
+ src/features/ads/channel-page.tsx             |  56 ++-
+ src/features/ai/insights.tsx                  | 129 +++--
+ src/features/integrations/actions.ts          | 434 ++++++++++++++++
+ .../integrations/components/forms.tsx         | 476 +++++++++++++++++-
+ src/features/integrations/google-ads-live.ts  | 351 +++++++++++++
+ src/features/integrations/google-ads.ts       | 419 +++++++++++++++
+ src/features/integrations/live-ads.ts         | 136 +++++
+ src/features/integrations/shopify-live.ts     | 199 ++++++++
+ src/features/integrations/shopify.ts          | 190 +++++++
+ src/features/integrations/tiktok-live.ts      | 343 +++++++++++++
+ src/features/integrations/tiktok.ts           | 381 ++++++++++++++
+ src/features/overview/report.tsx              | 113 +++--
+ src/features/shopify/report.tsx               |  56 ++-
+ src/lib/env.ts                                |  40 ++
+ 19 files changed, 3722 insertions(+), 105 deletions(-)
+ create mode 100644 src/app/api/integrations/google_ads/callback/route.ts
+ create mode 100644 src/app/api/integrations/google_ads/start/route.ts
+ create mode 100644 src/app/api/integrations/tiktok/callback/route.ts
+ create mode 100644 src/app/api/integrations/tiktok/start/route.ts
+ create mode 100644 src/features/integrations/google-ads-live.ts
+ create mode 100644 src/features/integrations/google-ads.ts
+ create mode 100644 src/features/integrations/live-ads.ts
+ create mode 100644 src/features/integrations/shopify-live.ts
+ create mode 100644 src/features/integrations/shopify.ts
+ create mode 100644 src/features/integrations/tiktok-live.ts
+ create mode 100644 src/features/integrations/tiktok.ts
+
+diff --git a/src/app/api/integrations/google_ads/callback/route.ts b/src/app/api/integrations/google_ads/callback/route.ts
+new file mode 100644
+index 0000000..22e01a7
+--- /dev/null
++++ b/src/app/api/integrations/google_ads/callback/route.ts
+@@ -0,0 +1,142 @@
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { NextResponse, type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import { authorize } from "@/lib/auth/authorize";
++import { encryptSecret } from "@/lib/crypto";
++import { getDb } from "@/lib/db";
++import { integrationConnections, integrationSecrets } from "@/db/schema";
++import { listAccessibleCustomers } from "@/features/integrations/google-ads";
++
++/**
++ * Google Ads OAuth — step 2. Verifies signed state + nonce cookie,
++ * exchanges the code for tokens (server-to-server), and records the
++ * connection. Google Ads reporting is on-demand (see
++ * features/integrations/google-ads-live.ts) — nothing is enqueued here.
++ *
++ * Account selection: listAccessibleCustomers only ever returns accounts
++ * this login was granted DIRECT access to (confirmed against Google's
++ * docs — it does not walk an MCC's client hierarchy). For the common
++ * "client authorizes their own account" case that's exactly one account,
++ * so this auto-connects it. If it's ambiguous (zero or multiple), this
++ * deliberately does NOT guess — picking the wrong one would attribute one
++ * client's ad data to a different client's workspace, which is worse than
++ * asking the admin to use the agency-wide flow instead (Settings → "Use
++ * agency token"), which lets them pick explicitly from a full client list.
++ */
++export async function GET(request: NextRequest) {
++  const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
++  const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET;
++  const developerToken = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
++  if (!clientId || !clientSecret) {
++    return NextResponse.json({ error: "Google Ads connector not configured" }, { status: 501 });
++  }
++
++  const principal = await getPrincipal();
++  if (!principal) return NextResponse.redirect(new URL("/login", request.url));
++
++  const { searchParams, origin } = new URL(request.url);
++  const code = searchParams.get("code");
++  const state = searchParams.get("state") ?? "";
++  const nonceCookie = request.cookies.get("google_ads_oauth_nonce")?.value;
++
++  const [workspaceId, nonce, sig] = state.split(":");
++  if (!code || !workspaceId || !nonce || !sig || nonce !== nonceCookie) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=invalid_state`);
++  }
++  const expected = createHmac("sha256", clientSecret).update(`${workspaceId}:${nonce}`).digest("hex");
++  const sigBuf = Buffer.from(sig, "hex");
++  const expBuf = Buffer.from(expected, "hex");
++  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=invalid_state`);
++  }
++
++  try {
++    authorize(principal, "connections.manage", workspaceId);
++  } catch {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=forbidden`);
++  }
++
++  if (!developerToken) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=no_developer_token`);
++  }
++
++  const redirectUri = `${origin}/api/integrations/google_ads/callback`;
++  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
++    method: "POST",
++    headers: { "Content-Type": "application/x-www-form-urlencoded" },
++    body: new URLSearchParams({
++      client_id: clientId,
++      client_secret: clientSecret,
++      redirect_uri: redirectUri,
++      code,
++      grant_type: "authorization_code",
++    }),
++  });
++  if (!tokenRes.ok) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=token_error`);
++  }
++  const token = (await tokenRes.json()) as { access_token: string; refresh_token?: string };
++  if (!token.refresh_token) {
++    // Shouldn't happen with access_type=offline&prompt=consent, but if
++    // Google ever omits it there's nothing durable to store — bail clearly
++    // rather than saving a connection that stops working in an hour.
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=no_refresh_token`);
++  }
++
++  let accounts;
++  try {
++    accounts = (await listAccessibleCustomers(token.access_token, developerToken)).filter((a) => !a.isManager);
++  } catch {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=account_list_error`);
++  }
++
++  if (accounts.length === 0) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=no_accounts`);
++  }
++  if (accounts.length > 1) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?google_ads=multiple_accounts`);
++  }
++  const account = accounts[0];
++
++  const db = getDb();
++  const [connection] = await db
++    .insert(integrationConnections)
++    .values({
++      orgId: principal.orgId,
++      workspaceId,
++      provider: "google_ads",
++      externalAccountId: account.customerId,
++      displayName: account.descriptiveName,
++      status: "active",
++      grantedScopes: ["adwords"],
++      currencyCode: account.currencyCode,
++      timezone: account.timeZone,
++    })
++    .onConflictDoUpdate({
++      target: [
++        integrationConnections.workspaceId,
++        integrationConnections.provider,
++        integrationConnections.externalAccountId,
++      ],
++      set: { status: "active", lastError: null },
++    })
++    .returning();
++
++  await db
++    .insert(integrationSecrets)
++    .values({
++      connectionId: connection.id,
++      encryptedPayload: encryptSecret(JSON.stringify({ refreshToken: token.refresh_token })),
++    })
++    .onConflictDoUpdate({
++      target: integrationSecrets.connectionId,
++      set: {
++        encryptedPayload: encryptSecret(JSON.stringify({ refreshToken: token.refresh_token })),
++        rotatedAt: new Date(),
++      },
++    });
++
++  const response = NextResponse.redirect(`${origin}/dashboard/settings?google_ads=connected`);
++  response.cookies.delete("google_ads_oauth_nonce");
++  return response;
++}
+diff --git a/src/app/api/integrations/google_ads/start/route.ts b/src/app/api/integrations/google_ads/start/route.ts
+new file mode 100644
+index 0000000..ed34f17
+--- /dev/null
++++ b/src/app/api/integrations/google_ads/start/route.ts
+@@ -0,0 +1,71 @@
++import { createHmac, randomBytes } from "node:crypto";
++import { NextResponse, type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import { can } from "@/lib/auth/authorize";
++
++/**
++ * Google Ads OAuth — step 1. Redirects to Google's consent dialog with a
++ * signed, single-use state (CSRF), mirroring the Meta OAuth start route.
++ * Env-gated: returns a clear message until GOOGLE_ADS_CLIENT_ID /
++ * GOOGLE_ADS_CLIENT_SECRET exist. access_type=offline + prompt=consent are
++ * both required — without them Google only issues a refresh token on a
++ * user's very first consent ever, which makes reconnecting after a revoke
++ * silently fail to produce one the second time.
++ *
++ * This path is for a client (or the admin) granting direct access to ONE
++ * specific Google Ads account for ONE workspace — see the callback route
++ * for why it refuses to guess when the authorizing login can see more than
++ * one account. For an agency connecting several clients under its own MCC
++ * from one login, the agency-wide flow (Settings → "Use agency token", see
++ * actions.ts's previewAgencyGoogleAdsAccounts) is the better fit and
++ * doesn't require running this OAuth dance per client at all.
++ */
++export async function GET(request: NextRequest) {
++  const clientId = process.env.GOOGLE_ADS_CLIENT_ID;
++  const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET;
++  if (!clientId || !clientSecret) {
++    return NextResponse.json(
++      {
++        error:
++          "Google Ads connector not configured. Set GOOGLE_ADS_CLIENT_ID and GOOGLE_ADS_CLIENT_SECRET (create an OAuth client in Google Cloud Console).",
++      },
++      { status: 501 },
++    );
++  }
++
++  const principal = await getPrincipal();
++  if (!principal || !can(principal, "connections.manage")) {
++    return NextResponse.json({ error: "Not allowed" }, { status: 403 });
++  }
++
++  const workspaceId = request.nextUrl.searchParams.get("workspace");
++  if (!workspaceId) {
++    return NextResponse.json({ error: "workspace is required" }, { status: 400 });
++  }
++
++  const { origin } = new URL(request.url);
++  const nonce = randomBytes(16).toString("hex");
++  const payload = `${workspaceId}:${nonce}`;
++  const sig = createHmac("sha256", clientSecret).update(payload).digest("hex");
++  const state = `${payload}:${sig}`;
++
++  const redirectUri = `${origin}/api/integrations/google_ads/callback`;
++  const dialog = new URL("https://accounts.google.com/o/oauth2/v2/auth");
++  dialog.searchParams.set("client_id", clientId);
++  dialog.searchParams.set("redirect_uri", redirectUri);
++  dialog.searchParams.set("state", state);
++  dialog.searchParams.set("response_type", "code");
++  dialog.searchParams.set("scope", "https://www.googleapis.com/auth/adwords");
++  dialog.searchParams.set("access_type", "offline");
++  dialog.searchParams.set("prompt", "consent");
++
++  const response = NextResponse.redirect(dialog);
++  response.cookies.set("google_ads_oauth_nonce", nonce, {
++    httpOnly: true,
++    secure: true,
++    sameSite: "lax",
++    maxAge: 600,
++    path: "/api/integrations/google_ads",
++  });
++  return response;
++}
+diff --git a/src/app/api/integrations/tiktok/callback/route.ts b/src/app/api/integrations/tiktok/callback/route.ts
+new file mode 100644
+index 0000000..f8cda6e
+--- /dev/null
++++ b/src/app/api/integrations/tiktok/callback/route.ts
+@@ -0,0 +1,125 @@
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { NextResponse, type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import { authorize } from "@/lib/auth/authorize";
++import { encryptSecret } from "@/lib/crypto";
++import { getDb } from "@/lib/db";
++import { integrationConnections, integrationSecrets } from "@/db/schema";
++import { exchangeAuthCode, fetchAdvertiserInfo } from "@/features/integrations/tiktok";
++
++/**
++ * TikTok OAuth — step 2. Verifies signed state + nonce cookie, exchanges
++ * the auth_code for an access (+ maybe refresh) token, and records the
++ * connection. TikTok reporting is on-demand (see
++ * features/integrations/tiktok-live.ts) — nothing is enqueued here.
++ *
++ * Auto-connects only when the token exchange returns exactly one
++ * advertiser id — same "never guess which client an ambiguous account
++ * list belongs to" rule as the Google Ads callback. If TikTok returns
++ * more than one (the authorizing user granted several accounts on
++ * TikTok's own consent screen instead of just this workspace's one), this
++ * bails with clear guidance rather than risking one client seeing
++ * another's numbers.
++ */
++export async function GET(request: NextRequest) {
++  const appId = process.env.TIKTOK_APP_ID;
++  const appSecret = process.env.TIKTOK_APP_SECRET;
++  if (!appId || !appSecret) {
++    return NextResponse.json({ error: "TikTok connector not configured" }, { status: 501 });
++  }
++
++  const principal = await getPrincipal();
++  if (!principal) return NextResponse.redirect(new URL("/login", request.url));
++
++  const { searchParams, origin } = new URL(request.url);
++  const code = searchParams.get("auth_code") ?? searchParams.get("code");
++  const state = searchParams.get("state") ?? "";
++  const nonceCookie = request.cookies.get("tiktok_oauth_nonce")?.value;
++
++  const [workspaceId, nonce, sig] = state.split(":");
++  if (!code || !workspaceId || !nonce || !sig || nonce !== nonceCookie) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=invalid_state`);
++  }
++  const expected = createHmac("sha256", appSecret).update(`${workspaceId}:${nonce}`).digest("hex");
++  const sigBuf = Buffer.from(sig, "hex");
++  const expBuf = Buffer.from(expected, "hex");
++  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=invalid_state`);
++  }
++
++  try {
++    authorize(principal, "connections.manage", workspaceId);
++  } catch {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=forbidden`);
++  }
++
++  let token;
++  try {
++    token = await exchangeAuthCode(appId, appSecret, code);
++  } catch {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=token_error`);
++  }
++
++  if (token.advertiserIds.length === 0) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=no_accounts`);
++  }
++  if (token.advertiserIds.length > 1) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=multiple_accounts`);
++  }
++
++  let info;
++  try {
++    info = (await fetchAdvertiserInfo(token.accessToken, token.advertiserIds))[0];
++  } catch {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=account_info_error`);
++  }
++  if (!info) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?tiktok=no_accounts`);
++  }
++
++  const db = getDb();
++  const [connection] = await db
++    .insert(integrationConnections)
++    .values({
++      orgId: principal.orgId,
++      workspaceId,
++      provider: "tiktok",
++      externalAccountId: info.advertiserId,
++      displayName: info.name,
++      status: "active",
++      grantedScopes: ["reporting"],
++      currencyCode: info.currency,
++      timezone: info.timezone,
++    })
++    .onConflictDoUpdate({
++      target: [
++        integrationConnections.workspaceId,
++        integrationConnections.provider,
++        integrationConnections.externalAccountId,
++      ],
++      set: { status: "active", lastError: null },
++    })
++    .returning();
++
++  await db
++    .insert(integrationSecrets)
++    .values({
++      connectionId: connection.id,
++      encryptedPayload: encryptSecret(
++        JSON.stringify({ accessToken: token.accessToken, refreshToken: token.refreshToken }),
++      ),
++    })
++    .onConflictDoUpdate({
++      target: integrationSecrets.connectionId,
++      set: {
++        encryptedPayload: encryptSecret(
++          JSON.stringify({ accessToken: token.accessToken, refreshToken: token.refreshToken }),
++        ),
++        rotatedAt: new Date(),
++      },
++    });
++
++  const response = NextResponse.redirect(`${origin}/dashboard/settings?tiktok=connected`);
++  response.cookies.delete("tiktok_oauth_nonce");
++  return response;
++}
+diff --git a/src/app/api/integrations/tiktok/start/route.ts b/src/app/api/integrations/tiktok/start/route.ts
+new file mode 100644
+index 0000000..6a60af7
+--- /dev/null
++++ b/src/app/api/integrations/tiktok/start/route.ts
+@@ -0,0 +1,64 @@
++import { createHmac, randomBytes } from "node:crypto";
++import { NextResponse, type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import { can } from "@/lib/auth/authorize";
++
++/**
++ * TikTok OAuth — step 1. Redirects to TikTok's advertiser authorization
++ * page with a signed, single-use state (CSRF), mirroring the Meta/Google
++ * Ads OAuth start routes. Env-gated on TIKTOK_APP_ID/TIKTOK_APP_SECRET.
++ *
++ * TikTok's own consent screen lets the authorizing user pick WHICH of
++ * their ad accounts to grant — selecting just one there is what keeps the
++ * callback's "exactly one account" auto-connect path simple. For
++ * connecting several client accounts under one TikTok Business Center
++ * login at once, the "paste a token" flow in Settings (see
++ * previewTikTokAccessToken) is the better fit — it lists every account a
++ * token can reach and lets an admin pick a workspace per account, same as
++ * Meta's manual-token path.
++ */
++export async function GET(request: NextRequest) {
++  const appId = process.env.TIKTOK_APP_ID;
++  const appSecret = process.env.TIKTOK_APP_SECRET;
++  if (!appId || !appSecret) {
++    return NextResponse.json(
++      {
++        error:
++          "TikTok connector not configured. Set TIKTOK_APP_ID and TIKTOK_APP_SECRET (create an app in the TikTok for Business developer portal).",
++      },
++      { status: 501 },
++    );
++  }
++
++  const principal = await getPrincipal();
++  if (!principal || !can(principal, "connections.manage")) {
++    return NextResponse.json({ error: "Not allowed" }, { status: 403 });
++  }
++
++  const workspaceId = request.nextUrl.searchParams.get("workspace");
++  if (!workspaceId) {
++    return NextResponse.json({ error: "workspace is required" }, { status: 400 });
++  }
++
++  const { origin } = new URL(request.url);
++  const nonce = randomBytes(16).toString("hex");
++  const payload = `${workspaceId}:${nonce}`;
++  const sig = createHmac("sha256", appSecret).update(payload).digest("hex");
++  const state = `${payload}:${sig}`;
++
++  const redirectUri = `${origin}/api/integrations/tiktok/callback`;
++  const dialog = new URL("https://business-api.tiktok.com/portal/auth");
++  dialog.searchParams.set("app_id", appId);
++  dialog.searchParams.set("state", state);
++  dialog.searchParams.set("redirect_uri", redirectUri);
++
++  const response = NextResponse.redirect(dialog);
++  response.cookies.set("tiktok_oauth_nonce", nonce, {
++    httpOnly: true,
++    secure: true,
++    sameSite: "lax",
++    maxAge: 600,
++    path: "/api/integrations/tiktok",
++  });
++  return response;
++}
+diff --git a/src/app/dashboard/settings/page.tsx b/src/app/dashboard/settings/page.tsx
+index 148cab7..d7b94a9 100644
+--- a/src/app/dashboard/settings/page.tsx
++++ b/src/app/dashboard/settings/page.tsx
+@@ -8,9 +8,15 @@ import {
+   ConnectMetaTokenForm,
+   ConnectMetaAgencyForm,
+   AutoProvisionMetaAccountsButton,
++  ConnectShopifyForm,
++  ConnectGoogleAdsAgencyForm,
++  ConnectTikTokTokenForm,
+ } from "@/features/integrations/components/forms";
+ import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
+ import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
++import { checkShopifyAccountsHealth } from "@/features/integrations/shopify-live";
++import { checkGoogleAdsAccountsHealth } from "@/features/integrations/google-ads-live";
++import { checkTikTokAccountsHealth } from "@/features/integrations/tiktok-live";
+ import { ShareLinksManager } from "@/features/share/components/manager";
+ import { ClientPortalManager } from "@/features/client-portal/components/manager";
+ 
+@@ -24,8 +30,8 @@ const PROVIDERS: Array<{
+ }> = [
+   { key: "shopify", label: "Shopify", phase: "Phase 6" },
+   { key: "meta", label: "Meta Ads", phase: "Phase 7", envVar: "META_APP_ID" },
+-  { key: "google_ads", label: "Google Ads", phase: "Phase 8" },
+-  { key: "tiktok", label: "TikTok Ads", phase: "Phase 9" },
++  { key: "google_ads", label: "Google Ads", phase: "Phase 8", envVar: "GOOGLE_ADS_CLIENT_ID" },
++  { key: "tiktok", label: "TikTok Ads", phase: "Phase 9", envVar: "TIKTOK_APP_ID" },
+   { key: "ga4", label: "Google Analytics 4", phase: "Phase 10" },
+   { key: "search_console", label: "Search Console", phase: "Phase 10" },
+ ];
+@@ -45,6 +51,12 @@ export default async function SettingsPage() {
+   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
+   const metaConfigured = Boolean(process.env.META_APP_ID);
+   const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
++  const googleAdsConfigured = Boolean(process.env.GOOGLE_ADS_CLIENT_ID);
++  const googleAdsAgencyConfigured = Boolean(env.GOOGLE_ADS_REFRESH_TOKEN);
++  // Both vars are required: unlike Meta's manual-token form (which only
++  // needs the pasted token itself), TikTok's advertiser lookup needs the
++  // app id/secret alongside any pasted token — see previewTikTokAccessToken.
++  const tiktokConfigured = Boolean(process.env.TIKTOK_APP_ID && process.env.TIKTOK_APP_SECRET);
+   const agencyTokenHealth = agencyTokenConfigured
+     ? await checkAgencyMetaTokenHealth()
+     : null;
+@@ -66,6 +78,51 @@ export default async function SettingsPage() {
+       for (const r of list) metaHealthByConnection.set(r.connectionId, r.health);
+     }
+   }
++
++  // Same on-demand health probe for Shopify — ShopifyAccountHealth is the
++  // same "live" | "idle" | "no_access" shape as Meta's AccountHealth, so it
++  // shares the tone/label helpers below.
++  const shopifyWorkspaceIds = [
++    ...new Set(connections.filter((c) => c.provider === "shopify").map((c) => c.workspaceId)),
++  ];
++  const shopifyHealthByConnection = new Map<string, AccountHealth>();
++  if (!isDemoMode) {
++    const shopifyHealthResults = await Promise.all(
++      shopifyWorkspaceIds.map((wsId) => checkShopifyAccountsHealth(wsId)),
++    );
++    for (const list of shopifyHealthResults) {
++      for (const r of list) shopifyHealthByConnection.set(r.connectionId, r.health);
++    }
++  }
++
++  // Same on-demand health probe for Google Ads — checkGoogleAdsAccountsHealth
++  // returns the same "live" | "idle" | "no_access" shape too.
++  const googleAdsWorkspaceIds = [
++    ...new Set(connections.filter((c) => c.provider === "google_ads").map((c) => c.workspaceId)),
++  ];
++  const googleAdsHealthByConnection = new Map<string, AccountHealth>();
++  if (!isDemoMode) {
++    const googleAdsHealthResults = await Promise.all(
++      googleAdsWorkspaceIds.map((wsId) => checkGoogleAdsAccountsHealth(wsId)),
++    );
++    for (const list of googleAdsHealthResults) {
++      for (const r of list) googleAdsHealthByConnection.set(r.connectionId, r.health);
++    }
++  }
++
++  // Same on-demand health probe for TikTok.
++  const tiktokWorkspaceIds = [
++    ...new Set(connections.filter((c) => c.provider === "tiktok").map((c) => c.workspaceId)),
++  ];
++  const tiktokHealthByConnection = new Map<string, AccountHealth>();
++  if (!isDemoMode) {
++    const tiktokHealthResults = await Promise.all(
++      tiktokWorkspaceIds.map((wsId) => checkTikTokAccountsHealth(wsId)),
++    );
++    for (const list of tiktokHealthResults) {
++      for (const r of list) tiktokHealthByConnection.set(r.connectionId, r.health);
++    }
++  }
+   const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
+     if (h === "live") return "positive";
+     if (h === "no_access") return "negative";
+@@ -140,7 +197,27 @@ export default async function SettingsPage() {
+             ) : null}
+             {PROVIDERS.map((p) => {
+               const existing = connections.filter((c) => c.provider === p.key);
+-              const canConnect = p.key === "meta" && metaConfigured && !isDemoMode;
++              const canConnect =
++                !isDemoMode &&
++                ((p.key === "meta" && metaConfigured) ||
++                  (p.key === "google_ads" && googleAdsConfigured) ||
++                  (p.key === "tiktok" && tiktokConfigured));
++              const hasConnectUi =
++                !isDemoMode &&
++                (p.key === "meta" ||
++                  p.key === "shopify" ||
++                  (p.key === "google_ads" && (googleAdsConfigured || googleAdsAgencyConfigured)) ||
++                  (p.key === "tiktok" && tiktokConfigured));
++              const healthMap =
++                p.key === "meta"
++                  ? metaHealthByConnection
++                  : p.key === "shopify"
++                    ? shopifyHealthByConnection
++                    : p.key === "google_ads"
++                      ? googleAdsHealthByConnection
++                      : p.key === "tiktok"
++                        ? tiktokHealthByConnection
++                        : null;
+               return (
+                 <div
+                   key={p.key}
+@@ -156,9 +233,9 @@ export default async function SettingsPage() {
+                             {c.status}
+                           </span>
+                         </span>
+-                        {p.key === "meta" && !isDemoMode ? (
+-                          <Badge tone={healthTone(metaHealthByConnection.get(c.id))}>
+-                            {healthLabel(metaHealthByConnection.get(c.id))}
++                        {healthMap ? (
++                          <Badge tone={healthTone(healthMap.get(c.id))}>
++                            {healthLabel(healthMap.get(c.id))}
+                           </Badge>
+                         ) : c.lastSyncAt ? (
+                           `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
+@@ -170,14 +247,14 @@ export default async function SettingsPage() {
+                     <Badge tone="outline">
+                       {existing.length > 0
+                         ? `${existing.length} connected`
+-                        : canConnect
++                        : hasConnectUi
+                           ? "Not connected yet"
+                           : p.envVar && !isDemoMode
+                             ? `Set ${p.envVar} to enable`
+                             : `Ready · live in ${p.phase}`}
+                     </Badge>
+                     {canConnect ? (
+-                      <a href={`/api/integrations/meta/start?workspace=${workspaceId}`}>
++                      <a href={`/api/integrations/${p.key}/start?workspace=${workspaceId}`}>
+                         <Button>Connect</Button>
+                       </a>
+                     ) : null}
+@@ -190,6 +267,15 @@ export default async function SettingsPage() {
+                     {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
+                       <AutoProvisionMetaAccountsButton />
+                     ) : null}
++                    {p.key === "shopify" && !isDemoMode ? (
++                      <ConnectShopifyForm workspaces={workspaces} />
++                    ) : null}
++                    {p.key === "google_ads" && !isDemoMode && googleAdsAgencyConfigured ? (
++                      <ConnectGoogleAdsAgencyForm workspaces={workspaces} />
++                    ) : null}
++                    {p.key === "tiktok" && !isDemoMode && tiktokConfigured ? (
++                      <ConnectTikTokTokenForm workspaces={workspaces} />
++                    ) : null}
+                   </div>
+                 </div>
+               );
+diff --git a/src/features/ads/channel-page.tsx b/src/features/ads/channel-page.tsx
+index 72b2502..bf65959 100644
+--- a/src/features/ads/channel-page.tsx
++++ b/src/features/ads/channel-page.tsx
+@@ -13,7 +13,9 @@ import {
+   type RangePreset,
+   type CampaignWithFacts,
+ } from "@/features/metrics/queries";
+-import { getLiveMetaReport, getMetaPacing, type MetaFetchFailure } from "@/features/integrations/meta-live";
++import { getLiveMetaReport, getMetaPacing } from "@/features/integrations/meta-live";
++import { getLiveGoogleAdsReport, getGoogleAdsPacing } from "@/features/integrations/google-ads-live";
++import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
+ import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
+ import type { DemoProvider } from "@/features/demo-data/generator";
+ import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
+@@ -52,16 +54,18 @@ export async function AdsReport({
+   let trend: Array<{ date: string; spend: number; revenue: number }>;
+   let campaigns: CampaignWithFacts[];
+   let partialFailure = false;
+-  let failures: MetaFetchFailure[] = [];
++  let failures: Array<{ displayName: string; reason: string }> = [];
+   let pacing: { activeDailyBudgetMinor: number; spendTodayMinor: number } | null = null;
+ 
++  // All three ad channels are on-demand/live per client instruction — no
++  // local historical storage for any of them. Two live pulls (current +
++  // previous period) so the delta comparisons on every card keep working;
++  // a few extra API calls per page view is an accepted trade-off (see
++  // meta-live.ts / google-ads-live.ts / tiktok-live.ts). Pacing is always
++  // about today regardless of the selected range, so it's a separate
++  // fetch. Kept as one block per provider (rather than a generic dispatch
++  // table) so each live-report/pacing pair's types stay concrete.
+   if (provider === "meta" && !isDemoMode) {
+-    // Meta is on-demand/live per client instruction — no local historical
+-    // storage. Two live pulls (current + previous period) so the delta
+-    // comparisons on every card keep working; a few extra Graph API calls
+-    // per page view is an accepted trade-off (see meta-live.ts). Pacing is
+-    // always about today regardless of the selected range, so it's a
+-    // separate fetch.
+     const [current, previous, pacingResult] = await Promise.all([
+       getLiveMetaReport(workspaceId, range),
+       getLiveMetaReport(workspaceId, previousPeriod(range)),
+@@ -77,7 +81,35 @@ export async function AdsReport({
+     // would just be duplicates for the same underlying reason.
+     failures = current.failures;
+     pacing = pacingResult;
++  } else if (provider === "google_ads" && !isDemoMode) {
++    const [current, previous, pacingResult] = await Promise.all([
++      getLiveGoogleAdsReport(workspaceId, range),
++      getLiveGoogleAdsReport(workspaceId, previousPeriod(range)),
++      getGoogleAdsPacing(workspaceId),
++    ]);
++    totals = current.totals;
++    prev = previous.totals;
++    trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
++    campaigns = current.campaigns;
++    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
++    failures = current.failures;
++    pacing = pacingResult;
++  } else if (provider === "tiktok" && !isDemoMode) {
++    const [current, previous, pacingResult] = await Promise.all([
++      getLiveTikTokReport(workspaceId, range),
++      getLiveTikTokReport(workspaceId, previousPeriod(range)),
++      getTikTokPacing(workspaceId),
++    ]);
++    totals = current.totals;
++    prev = previous.totals;
++    trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
++    campaigns = current.campaigns;
++    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
++    failures = current.failures;
++    pacing = pacingResult;
+   } else {
++    // Demo mode only reaches here now — every real provider has a live
++    // branch above.
+     const [rows, prevRows, dbCampaigns] = await Promise.all([
+       getAdDaily(workspaceId, range, [provider]),
+       getAdDaily(workspaceId, previousPeriod(range), [provider]),
+@@ -148,7 +180,7 @@ export async function AdsReport({
+       : 0;
+     const pacingKpis: Kpi[] = [
+       { label: "Active daily budget", value: formatMoney(pacing.activeDailyBudgetMinor), info: "Total daily budget across every campaign that's currently active — what you're set up to spend today if everything runs at full budget." },
+-      { label: "Spent today", value: formatMoney(pacing.spendTodayMinor), info: "Actual spend so far today, across every active Meta account — resets at midnight." },
++      { label: "Spent today", value: formatMoney(pacing.spendTodayMinor), info: `Actual spend so far today, across every active ${label} account — resets at midnight.` },
+       { label: "Pacing", value: formatPercent(pacingPct), hint: "Spent today ÷ active daily budget", info: "How much of today's active budget has been spent so far. Well under 100% partway through the day is normal; if it's near or over 100% early in the day, campaigns may exhaust budget before midnight." },
+     ];
+     kpiGroups.push({
+@@ -178,7 +210,7 @@ export async function AdsReport({
+         {partialFailure ? (
+           <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
+             <p>
+-              Couldn&apos;t reach {failures.length === 1 ? "one connected Meta account" : `${failures.length || "one or more"} connected Meta account(s)`} just now —
++              Couldn&apos;t reach {failures.length === 1 ? `one connected ${label} account` : `${failures.length || "one or more"} connected ${label} account(s)`} just now —
+               numbers below may be incomplete. This report is pulled live on every page view, so
+               refreshing may resolve it.
+             </p>
+@@ -254,8 +286,8 @@ export async function AdsReport({
+                 {campaigns.length === 0 ? (
+                   <tr>
+                     <td colSpan={14} className="px-3 py-6 text-center text-xs text-muted">
+-                      {provider === "meta" && !isDemoMode
+-                        ? "No campaigns found for this date range — connect a Meta ad account in Settings, or try a wider date range."
++                      {!isDemoMode
++                        ? `No campaigns found for this date range — connect a ${label} account in Settings, or try a wider date range.`
+                         : "No campaigns synced for this client yet — connect an ad account in Settings and wait for the first sync to complete."}
+                     </td>
+                   </tr>
+diff --git a/src/features/ai/insights.tsx b/src/features/ai/insights.tsx
+index eed99db..647b37a 100644
+--- a/src/features/ai/insights.tsx
++++ b/src/features/ai/insights.tsx
+@@ -1,7 +1,14 @@
+ import { Card, CardHeader, Badge } from "@/components/ui/primitives";
+ import { getAdDaily, getShopDaily, lastNDays, previousPeriod } from "@/features/metrics/queries";
+-import { getLiveMetaReport } from "@/features/integrations/meta-live";
+-import { adMetrics, blendedMetrics, sumAdFacts, sumShopFacts, type AdFacts } from "@/lib/metrics/definitions";
++import {
++  getLiveAdsReport,
++  adsReportFromRows,
++  AD_PROVIDER_KEYS,
++  AD_PROVIDER_LABELS,
++  type LiveAdsReport,
++} from "@/features/integrations/live-ads";
++import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
++import { adMetrics, blendedMetrics, sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
+ import { formatMoney, formatPercent } from "@/lib/utils";
+ import { isDemoMode } from "@/lib/env";
+ 
+@@ -11,41 +18,80 @@ interface Insight {
+   detail: string;
+ }
+ 
++interface InsightsResult {
++  insights: Insight[];
++  failures: Array<{ channel: string; displayName: string; reason: string }>;
++}
++
+ /**
+  * Insight engine v0: statistical rules over the SAME metric definitions
+  * the dashboards use. Phase 11 layers LLM narration + Q&A (OpenAI/Gemini
+  * tool-calling) over these exact computations — the numbers never come
+  * from the model.
+  */
+-async function computeInsights(workspaceId: string): Promise<Insight[]> {
++async function computeInsights(workspaceId: string): Promise<InsightsResult> {
+   const range = lastNDays(7);
+   const prevRange = previousPeriod(range);
+-  // Meta is pulled live now (features/integrations/meta-live.ts) — the
+-  // database only carries Google/TikTok in live mode, so it's queried
+-  // separately here and merged in, same pattern as the Overview page.
+-  const dbProviders = isDemoMode
+-    ? (["meta", "google_ads", "tiktok"] as const)
+-    : (["google_ads", "tiktok"] as const);
+-  const [dbAds, prevDbAds, shop, prevShop, metaCurrent, metaPrevious] = await Promise.all([
+-    getAdDaily(workspaceId, range, [...dbProviders]),
+-    getAdDaily(workspaceId, prevRange, [...dbProviders]),
+-    getShopDaily(workspaceId, range),
+-    getShopDaily(workspaceId, prevRange),
+-    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, range),
+-    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, prevRange),
+-  ]);
++
++  // Ads (Meta/Google Ads/TikTok) and Shopify are both pulled live now (see
++  // features/integrations/live-ads.ts and shopify-live.ts) — nothing syncs
++  // to the database anymore. Demo mode keeps reading the deterministic
++  // generator for both, reshaped into the same LiveAdsReport shape via
++  // adsReportFromRows — same branching as OverviewReport/ShopifyReport.
++  let ads: LiveAdsReport;
++  let adsPrev: LiveAdsReport;
++  let shopNow: ShopFacts;
++  let shopBefore: ShopFacts;
++  let failures: Array<{ channel: string; displayName: string; reason: string }> = [];
++
++  if (!isDemoMode) {
++    const [adsCurrent, adsPrevious, shopCurrent, shopPrevious] = await Promise.all([
++      getLiveAdsReport(workspaceId, range),
++      getLiveAdsReport(workspaceId, prevRange),
++      getLiveShopifyReport(workspaceId, range),
++      getLiveShopifyReport(workspaceId, prevRange),
++    ]);
++    ads = adsCurrent;
++    adsPrev = adsPrevious;
++    shopNow = sumShopFacts(shopCurrent.rows);
++    shopBefore = sumShopFacts(shopPrevious.rows);
++    // Only current-period failures are shown — the previous-period pull
++    // uses the same connections/credentials, so its failures would just
++    // repeat the same reason (same call as ShopifyReport makes).
++    failures = [
++      ...adsCurrent.failures.map((f) => ({
++        channel: AD_PROVIDER_LABELS[f.provider],
++        displayName: f.displayName,
++        reason: f.reason,
++      })),
++      ...shopCurrent.failures.map((f) => ({ channel: "Shopify", displayName: f.displayName, reason: f.reason })),
++    ];
++  } else {
++    const [dbAds, prevDbAds, shopRows, prevShopRows] = await Promise.all([
++      getAdDaily(workspaceId, range, [...AD_PROVIDER_KEYS]),
++      getAdDaily(workspaceId, prevRange, [...AD_PROVIDER_KEYS]),
++      getShopDaily(workspaceId, range),
++      getShopDaily(workspaceId, prevRange),
++    ]);
++    ads = adsReportFromRows(dbAds);
++    adsPrev = adsReportFromRows(prevDbAds);
++    shopNow = sumShopFacts(shopRows);
++    shopBefore = sumShopFacts(prevShopRows);
++  }
+ 
+   const insights: Insight[] = [];
+ 
+-  for (const provider of ["meta", "google_ads", "tiktok"] as const) {
+-    const now: AdFacts =
+-      provider === "meta"
+-        ? (metaCurrent?.totals ?? sumAdFacts([]))
+-        : sumAdFacts(dbAds.filter((a) => a.provider === provider));
+-    const before: AdFacts =
+-      provider === "meta"
+-        ? (metaPrevious?.totals ?? sumAdFacts([]))
+-        : sumAdFacts(prevDbAds.filter((a) => a.provider === provider));
++  for (const provider of AD_PROVIDER_KEYS) {
++    // Skip a provider whose current- or previous-period pull failed — its
++    // totals are zeroed/partial, so a "ROAS down 100%" reading would be an
++    // artifact of the failed fetch, not a real performance change.
++    const failed =
++      ads.failures.some((f) => f.provider === provider) ||
++      adsPrev.failures.some((f) => f.provider === provider);
++    if (failed) continue;
++
++    const now = ads.byProvider[provider].totals;
++    const before = adsPrev.byProvider[provider].totals;
+     const roasNow = adMetrics.roas(now);
+     const roasBefore = adMetrics.roas(before);
+     if (roasBefore > 0) {
+@@ -67,18 +113,14 @@ async function computeInsights(workspaceId: string): Promise<Insight[]> {
+     }
+   }
+ 
+-  const shopNow = sumShopFacts(shop);
+-  const shopBefore = sumShopFacts(prevShop);
+-  const adsNow = sumAdFacts(metaCurrent ? [sumAdFacts(dbAds), metaCurrent.totals] : dbAds);
+-  const adsBefore = sumAdFacts(metaPrevious ? [sumAdFacts(prevDbAds), metaPrevious.totals] : prevDbAds);
+-  const merNow = blendedMetrics.mer(shopNow, adsNow);
+-  const merBefore = blendedMetrics.mer(shopBefore, adsBefore);
++  const merNow = blendedMetrics.mer(shopNow, ads.totals);
++  const merBefore = blendedMetrics.mer(shopBefore, adsPrev.totals);
+   if (merBefore > 0) {
+     const change = (merNow - merBefore) / merBefore;
+     insights.push({
+       severity: change < -0.1 ? "negative" : change > 0.1 ? "positive" : "neutral",
+       title: `Blended MER is ${merNow.toFixed(2)}x this week`,
+-      detail: `Net revenue ${formatMoney(shopNow.netSalesMinor)} against ${formatMoney(adsNow.spendMinor)} total ad spend (was ${merBefore.toFixed(2)}x last week).`,
++      detail: `Net revenue ${formatMoney(shopNow.netSalesMinor)} against ${formatMoney(ads.totals.spendMinor)} total ad spend (was ${merBefore.toFixed(2)}x last week).`,
+     });
+   }
+ 
+@@ -92,7 +134,7 @@ async function computeInsights(workspaceId: string): Promise<Insight[]> {
+     detail: `${formatMoney(shopNow.netSalesMinor)} this week vs ${formatMoney(shopBefore.netSalesMinor)} last week across ${shopNow.orders} orders.`,
+   });
+ 
+-  return insights;
++  return { insights, failures };
+ }
+ 
+ /**
+@@ -102,10 +144,27 @@ async function computeInsights(workspaceId: string): Promise<Insight[]> {
+  * portal's own AI Copilot page.
+  */
+ export async function AiInsights({ workspaceId }: { workspaceId: string }) {
+-  const insights = await computeInsights(workspaceId);
++  const { insights, failures } = await computeInsights(workspaceId);
+ 
+   return (
+     <>
++      {failures.length > 0 ? (
++        <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
++          <p>
++            Signals below may be incomplete — couldn&apos;t reach{" "}
++            {failures.length === 1 ? "1 connected account" : `${failures.length} connected accounts`} just
++            now, so that channel&apos;s signals are sitting out this pass. Refreshing may resolve it.
++          </p>
++          <ul className="mt-1 list-inside list-disc space-y-0.5">
++            {failures.map((f, i) => (
++              <li key={`${f.channel}-${f.displayName}-${i}`}>
++                <span className="font-medium">{f.channel} · {f.displayName}:</span> {f.reason}
++              </li>
++            ))}
++          </ul>
++        </div>
++      ) : null}
++
+       <Card>
+         <CardHeader
+           title="This week's signals"
+diff --git a/src/features/integrations/actions.ts b/src/features/integrations/actions.ts
+index 344c146..da8323e 100644
+--- a/src/features/integrations/actions.ts
++++ b/src/features/integrations/actions.ts
+@@ -8,6 +8,9 @@ import { authorize, AuthorizationError } from "@/lib/auth/authorize";
+ import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
+ import { encryptSecret } from "@/lib/crypto";
+ import { checkMetaTokenHealth, type MetaTokenHealth } from "./meta";
++import { verifyShopifyCredentials, type ShopifyShopInfo } from "./shopify";
++import { refreshAccessToken, listLinkedClientAccounts } from "./google-ads";
++import { fetchAuthorizedAdvertiserIds, fetchAdvertiserInfo } from "./tiktok";
+ 
+ /** Same slugify as features/crm/actions.ts's createWorkspace — duplicated
+  *  rather than imported so this file doesn't reach across features for one
+@@ -441,3 +444,434 @@ export async function autoProvisionAgencyMetaAccounts(): Promise<AutoProvisionRe
+ 
+   return { ok: true, createdWorkspaces, connectedAccounts, skippedAccounts };
+ }
++
++/**
++ * Shopify connect — a "custom app" per store (created directly in the
++ * merchant's own Shopify admin), not a public OAuth app. This is the
++ * Shopify-recommended approach for an agency integrating a known, bounded
++ * list of client stores: no App Store review, and the Admin API access
++ * token is available the moment the custom app is installed. Two steps,
++ * mirroring the Meta manual-token flow exactly: preview (verify the
++ * credentials work, show the shop name back) → connect (save it).
++ */
++
++function normalizeShopDomain(input: string): string | null {
++  let v = input.trim().toLowerCase();
++  v = v.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
++  if (!v) return null;
++  if (!v.includes(".")) v = `${v}.myshopify.com`;
++  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(v)) {
++    return null;
++  }
++  return v;
++}
++
++export interface ShopifyPreviewResult {
++  error?: string;
++  shop?: ShopifyShopInfo;
++}
++
++export async function previewShopifyStore(
++  shopDomainRaw: string,
++  accessToken: string,
++): Promise<ShopifyPreviewResult> {
++  if (isDemoMode) {
++    return { error: "Demo mode — connect Supabase to save real connections." };
++  }
++  const shopDomain = normalizeShopDomain(shopDomainRaw);
++  if (!shopDomain) {
++    return { error: "Enter a valid shop domain, e.g. yourstore.myshopify.com" };
++  }
++  const token = accessToken.trim();
++  if (token.length < 10) {
++    return { error: "That doesn't look like a valid Admin API access token." };
++  }
++
++  try {
++    const principal = await getPrincipal();
++    authorize(principal, "connections.manage");
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    return { error: "Could not verify permissions right now." };
++  }
++
++  try {
++    const shop = await verifyShopifyCredentials(shopDomain, token);
++    return { shop: { ...shop, domain: shopDomain } };
++  } catch (e) {
++    return {
++      error:
++        e instanceof Error
++          ? e.message
++          : "Could not reach Shopify with these credentials.",
++    };
++  }
++}
++
++export async function connectShopifyStore(
++  workspaceId: string,
++  shopDomainRaw: string,
++  accessToken: string,
++): Promise<ActionResult> {
++  if (isDemoMode) {
++    return { error: "Demo mode — connect Supabase to save real connections." };
++  }
++  const shopDomain = normalizeShopDomain(shopDomainRaw);
++  if (!shopDomain) {
++    return { error: "Enter a valid shop domain, e.g. yourstore.myshopify.com" };
++  }
++  const token = accessToken.trim();
++  if (token.length < 10) {
++    return { error: "That doesn't look like a valid Admin API access token." };
++  }
++
++  try {
++    const principal = await getPrincipal();
++    authorize(principal, "connections.manage", workspaceId);
++
++    const shop = await verifyShopifyCredentials(shopDomain, token);
++    const db = getDb();
++
++    const [connection] = await db
++      .insert(integrationConnections)
++      .values({
++        orgId: principal.orgId,
++        workspaceId,
++        provider: "shopify",
++        externalAccountId: shopDomain,
++        displayName: shop.name,
++        status: "active",
++        grantedScopes: ["read_orders", "read_customers"],
++        currencyCode: shop.currency,
++        timezone: shop.timezone,
++      })
++      .onConflictDoUpdate({
++        target: [
++          integrationConnections.workspaceId,
++          integrationConnections.provider,
++          integrationConnections.externalAccountId,
++        ],
++        set: {
++          status: "active",
++          lastError: null,
++          displayName: shop.name,
++          currencyCode: shop.currency,
++          timezone: shop.timezone,
++        },
++      })
++      .returning();
++
++    await db
++      .insert(integrationSecrets)
++      .values({
++        connectionId: connection.id,
++        encryptedPayload: encryptSecret(JSON.stringify({ accessToken: token })),
++      })
++      .onConflictDoUpdate({
++        target: integrationSecrets.connectionId,
++        set: {
++          encryptedPayload: encryptSecret(JSON.stringify({ accessToken: token })),
++          rotatedAt: new Date(),
++        },
++      });
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    return {
++      error:
++        e instanceof Error
++          ? `Could not connect this store: ${e.message}`
++          : "Unknown error while connecting.",
++    };
++  }
++
++  revalidatePath("/dashboard/settings");
++  return { ok: true };
++}
++
++/**
++ * Google Ads agency-wide connect — mirrors the Meta agency-token flow
++ * (previewAgencyMetaAccounts/connectAgencyMetaAccounts), but sourced from
++ * GOOGLE_ADS_REFRESH_TOKEN + GOOGLE_ADS_LOGIN_CUSTOMER_ID (the agency's own
++ * MCC) instead of a single long-lived token. This is the recommended path
++ * for connecting client accounts: it needs the admin to mint ONE refresh
++ * token (via Google's OAuth Playground, or by running this app's own
++ * /api/integrations/google_ads/start once and copying the result), then
++ * every client linked under the MCC can be connected just by picking it
++ * from a list — no per-client OAuth consent needed.
++ */
++
++export interface GoogleAdsAccountPreview {
++  customerId: string;
++  name: string;
++  currency: string;
++  timezone: string;
++}
++
++export interface GoogleAdsAccountSelection extends GoogleAdsAccountPreview {
++  workspaceId: string;
++}
++
++export async function previewAgencyGoogleAdsAccounts(): Promise<{
++  error?: string;
++  accounts?: GoogleAdsAccountPreview[];
++}> {
++  if (isDemoMode) {
++    return { error: "Demo mode — connect Supabase to save real connections." };
++  }
++  if (!env.GOOGLE_ADS_REFRESH_TOKEN) {
++    return { error: "GOOGLE_ADS_REFRESH_TOKEN isn't set in this environment yet." };
++  }
++  if (!env.GOOGLE_ADS_DEVELOPER_TOKEN) {
++    return { error: "GOOGLE_ADS_DEVELOPER_TOKEN isn't set in this environment yet." };
++  }
++  if (!env.GOOGLE_ADS_LOGIN_CUSTOMER_ID) {
++    return { error: "GOOGLE_ADS_LOGIN_CUSTOMER_ID isn't set in this environment yet." };
++  }
++
++  try {
++    const principal = await getPrincipal();
++    authorize(principal, "connections.manage");
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    return { error: "Could not verify permissions right now." };
++  }
++
++  try {
++    const { accessToken } = await refreshAccessToken(env.GOOGLE_ADS_REFRESH_TOKEN);
++    const accounts = await listLinkedClientAccounts(
++      accessToken,
++      env.GOOGLE_ADS_DEVELOPER_TOKEN,
++      env.GOOGLE_ADS_LOGIN_CUSTOMER_ID,
++    );
++    if (accounts.length === 0) {
++      return {
++        error:
++          "No client accounts found one level under this MCC — check GOOGLE_ADS_LOGIN_CUSTOMER_ID is the manager account's id (digits only, no dashes).",
++      };
++    }
++    return {
++      accounts: accounts.map((a) => ({
++        customerId: a.customerId,
++        name: a.descriptiveName,
++        currency: a.currencyCode,
++        timezone: a.timeZone,
++      })),
++    };
++  } catch (e) {
++    return {
++      error: e instanceof Error ? e.message : "Could not reach Google Ads right now.",
++    };
++  }
++}
++
++export async function connectAgencyGoogleAdsAccounts(
++  selections: GoogleAdsAccountSelection[],
++): Promise<ActionResult> {
++  if (isDemoMode) {
++    return { error: "Demo mode — connect Supabase to save real connections." };
++  }
++  if (!env.GOOGLE_ADS_REFRESH_TOKEN) {
++    return { error: "GOOGLE_ADS_REFRESH_TOKEN isn't set in this environment yet." };
++  }
++  if (selections.length === 0) {
++    return { error: "Pick at least one account." };
++  }
++  if (selections.some((s) => !s.workspaceId)) {
++    return { error: "Pick a client workspace for every selected account." };
++  }
++
++  try {
++    const principal = await getPrincipal();
++    const db = getDb();
++
++    for (const sel of selections) {
++      authorize(principal, "connections.manage", sel.workspaceId);
++
++      // Google Ads reporting is on-demand (see google-ads-live.ts) — no
++      // integrationSecrets row saved here, same trick
++      // connectAgencyMetaAccounts uses: an empty secret makes
++      // google-ads-live.ts's resolveCreds() fall back to the shared
++      // GOOGLE_ADS_REFRESH_TOKEN at read time.
++      await db
++        .insert(integrationConnections)
++        .values({
++          orgId: principal.orgId,
++          workspaceId: sel.workspaceId,
++          provider: "google_ads",
++          externalAccountId: sel.customerId,
++          displayName: sel.name,
++          status: "active",
++          grantedScopes: ["adwords"],
++          currencyCode: sel.currency,
++          timezone: sel.timezone,
++        })
++        .onConflictDoUpdate({
++          target: [
++            integrationConnections.workspaceId,
++            integrationConnections.provider,
++            integrationConnections.externalAccountId,
++          ],
++          set: { status: "active", lastError: null, displayName: sel.name },
++        });
++    }
++  } catch (e) {
++    if (e instanceof AuthorizationError) {
++      return { error: "Not allowed for one of the selected workspaces." };
++    }
++    return {
++      error:
++        e instanceof Error
++          ? `Could not save this connection: ${e.message}`
++          : "Unknown error while connecting.",
++    };
++  }
++
++  revalidatePath("/dashboard/settings");
++  return { ok: true };
++}
++
++/**
++ * TikTok manual-token connect — mirrors the Meta paste-a-token flow
++ * exactly (previewMetaAccessToken/connectMetaAccounts). Given genuine
++ * uncertainty about TikTok Business API token lifetimes (see tiktok.ts's
++ * file-level comment), this paste flow — not OAuth — is the recommended
++ * default: it works the same way regardless of how long the pasted token
++ * lasts, and re-pasting a fresh one if it ever expires is a one-step fix.
++ * Two steps: previewTikTokAccessToken lists every ad account the token can
++ * reach, connectTikTokAccounts saves the ones picked.
++ */
++
++export interface TikTokAccountPreview {
++  advertiserId: string;
++  name: string;
++  currency: string;
++  timezone: string;
++}
++
++export interface TikTokAccountSelection extends TikTokAccountPreview {
++  workspaceId: string;
++}
++
++export async function previewTikTokAccessToken(rawToken: string): Promise<{
++  error?: string;
++  accounts?: TikTokAccountPreview[];
++}> {
++  if (isDemoMode) {
++    return { error: "Demo mode — connect Supabase to save real connections." };
++  }
++  const accessToken = rawToken.trim();
++  if (accessToken.length < 10) {
++    return { error: "That doesn't look like a valid access token." };
++  }
++  if (!env.TIKTOK_APP_ID || !env.TIKTOK_APP_SECRET) {
++    return { error: "TIKTOK_APP_ID/TIKTOK_APP_SECRET aren't set in this environment yet." };
++  }
++
++  try {
++    const principal = await getPrincipal();
++    authorize(principal, "connections.manage");
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    return { error: "Could not verify permissions right now." };
++  }
++
++  try {
++    const advertiserIds = await fetchAuthorizedAdvertiserIds(accessToken, env.TIKTOK_APP_ID, env.TIKTOK_APP_SECRET);
++    if (advertiserIds.length === 0) {
++      return { error: "This token has no ad accounts attached to it." };
++    }
++    const infos = await fetchAdvertiserInfo(accessToken, advertiserIds);
++    return {
++      accounts: infos.map((a) => ({
++        advertiserId: a.advertiserId,
++        name: a.name,
++        currency: a.currency,
++        timezone: a.timezone,
++      })),
++    };
++  } catch (e) {
++    return { error: e instanceof Error ? e.message : "Could not reach TikTok right now." };
++  }
++}
++
++export async function connectTikTokAccounts(
++  rawToken: string,
++  selections: TikTokAccountSelection[],
++): Promise<ActionResult> {
++  if (isDemoMode) {
++    return { error: "Demo mode — connect Supabase to save real connections." };
++  }
++  const accessToken = rawToken.trim();
++  if (accessToken.length < 10) {
++    return { error: "That doesn't look like a valid access token." };
++  }
++  if (selections.length === 0) {
++    return { error: "Pick at least one ad account." };
++  }
++  if (selections.some((s) => !s.workspaceId)) {
++    return { error: "Pick a client workspace for every selected ad account." };
++  }
++
++  try {
++    const principal = await getPrincipal();
++    const db = getDb();
++
++    for (const sel of selections) {
++      authorize(principal, "connections.manage", sel.workspaceId);
++
++      const [connection] = await db
++        .insert(integrationConnections)
++        .values({
++          orgId: principal.orgId,
++          workspaceId: sel.workspaceId,
++          provider: "tiktok",
++          externalAccountId: sel.advertiserId,
++          displayName: sel.name,
++          status: "active",
++          grantedScopes: ["reporting"],
++          currencyCode: sel.currency,
++          timezone: sel.timezone,
++        })
++        .onConflictDoUpdate({
++          target: [
++            integrationConnections.workspaceId,
++            integrationConnections.provider,
++            integrationConnections.externalAccountId,
++          ],
++          set: { status: "active", lastError: null, displayName: sel.name },
++        })
++        .returning();
++
++      // No refresh token from a pasted-token connect (there was no OAuth
++      // exchange) — if this token ever stops working, tiktok-live.ts
++      // surfaces a normal auth error and re-pasting a fresh one here fixes
++      // it, same as Meta's and Shopify's manual-token paths.
++      await db
++        .insert(integrationSecrets)
++        .values({
++          connectionId: connection.id,
++          encryptedPayload: encryptSecret(JSON.stringify({ accessToken })),
++        })
++        .onConflictDoUpdate({
++          target: integrationSecrets.connectionId,
++          set: {
++            encryptedPayload: encryptSecret(JSON.stringify({ accessToken })),
++            rotatedAt: new Date(),
++          },
++        });
++    }
++  } catch (e) {
++    if (e instanceof AuthorizationError) {
++      return { error: "Not allowed for one of the selected workspaces." };
++    }
++    return {
++      error:
++        e instanceof Error
++          ? `Could not save this connection: ${e.message}`
++          : "Unknown error while connecting.",
++    };
++  }
++
++  revalidatePath("/dashboard/settings");
++  return { ok: true };
++}
+diff --git a/src/features/integrations/components/forms.tsx b/src/features/integrations/components/forms.tsx
+index 97126bc..e641da4 100644
+--- a/src/features/integrations/components/forms.tsx
++++ b/src/features/integrations/components/forms.tsx
+@@ -1,15 +1,24 @@
+ "use client";
+ 
+ import { useState, useTransition } from "react";
+-import { Building2, KeyRound, Sparkles, X } from "lucide-react";
++import { Building2, KeyRound, Music2, Search, ShoppingBag, Sparkles, X } from "lucide-react";
+ import {
+   previewMetaAccessToken,
+   connectMetaAccounts,
+   previewAgencyMetaAccounts,
+   connectAgencyMetaAccounts,
+   autoProvisionAgencyMetaAccounts,
++  previewShopifyStore,
++  connectShopifyStore,
++  previewAgencyGoogleAdsAccounts,
++  connectAgencyGoogleAdsAccounts,
++  previewTikTokAccessToken,
++  connectTikTokAccounts,
+   type MetaAccountPreview,
++  type GoogleAdsAccountPreview,
++  type TikTokAccountPreview,
+ } from "@/features/integrations/actions";
++import type { ShopifyShopInfo } from "@/features/integrations/shopify";
+ import { Button } from "@/components/ui/primitives";
+ 
+ const inputCls =
+@@ -401,3 +410,468 @@ export function AutoProvisionMetaAccountsButton() {
+     </div>
+   );
+ }
++
++/**
++ * Shopify connect — paste a shop domain + Admin API access token from a
++ * custom app created directly in that store's admin (see the Settings
++ * page copy for the exact steps). Mirrors ConnectMetaTokenForm's two-step
++ * shape: preview (verify + show the shop name back) then connect (save).
++ */
++export function ConnectShopifyForm({
++  workspaces,
++}: {
++  workspaces: Array<{ id: string; name: string }>;
++}) {
++  const [open, setOpen] = useState(false);
++  const [workspaceId, setWorkspaceId] = useState(workspaces[0]?.id ?? "");
++  const [shopDomain, setShopDomain] = useState("");
++  const [token, setToken] = useState("");
++  const [shopInfo, setShopInfo] = useState<ShopifyShopInfo | null>(null);
++  const [error, setError] = useState<string | null>(null);
++  const [success, setSuccess] = useState<string | null>(null);
++  const [pending, startTransition] = useTransition();
++
++  function reset() {
++    setShopDomain("");
++    setToken("");
++    setShopInfo(null);
++    setError(null);
++    setSuccess(null);
++  }
++
++  function verify() {
++    setError(null);
++    setSuccess(null);
++    startTransition(async () => {
++      const result = await previewShopifyStore(shopDomain, token);
++      if (result.error || !result.shop) {
++        setError(result.error ?? "Something went wrong.");
++        return;
++      }
++      setShopInfo(result.shop);
++    });
++  }
++
++  function connect() {
++    setError(null);
++    if (!workspaceId) {
++      setError("Pick a client workspace.");
++      return;
++    }
++    startTransition(async () => {
++      const result = await connectShopifyStore(workspaceId, shopDomain, token);
++      if (result.error) {
++        setError(result.error);
++        return;
++      }
++      setSuccess(`Connected ${shopInfo?.name ?? "the store"} — orders start pulling live immediately.`);
++      setShopInfo(null);
++      setToken("");
++    });
++  }
++
++  return (
++    <div className="relative">
++      <Button
++        variant="outline"
++        onClick={() => {
++          setOpen((v) => !v);
++          if (open) reset();
++        }}
++      >
++        {open ? <X size={13} /> : <ShoppingBag size={13} />} Connect a store
++      </Button>
++      {open ? (
++        <div className="absolute right-0 z-30 mt-2 w-96 rounded-xl border border-border bg-surface p-4 shadow-xl">
++          {!shopInfo ? (
++            <div className="space-y-2.5">
++              <p className="text-xs leading-relaxed text-muted">
++                In the store&apos;s Shopify admin: Settings → Apps and sales channels →
++                Develop apps → Create an app → enable{" "}
++                <code className="rounded bg-surface-2 px-1">read_orders</code> and{" "}
++                <code className="rounded bg-surface-2 px-1">read_customers</code> under Admin
++                API scopes → Install app. Paste the access token it shows you (starts with{" "}
++                <code className="rounded bg-surface-2 px-1">shpat_</code>) below.
++              </p>
++              <div>
++                <label className="mb-1 block text-xs text-muted">Shop domain</label>
++                <input
++                  className={inputCls}
++                  value={shopDomain}
++                  onChange={(e) => setShopDomain(e.target.value)}
++                  placeholder="yourstore.myshopify.com"
++                />
++              </div>
++              <div>
++                <label className="mb-1 block text-xs text-muted">Admin API access token</label>
++                <textarea
++                  className={`${inputCls} h-20 py-2`}
++                  value={token}
++                  onChange={(e) => setToken(e.target.value)}
++                  placeholder="shpat_..."
++                />
++              </div>
++              {error ? <p className="text-xs text-negative">{error}</p> : null}
++              {success ? <p className="text-xs text-positive">{success}</p> : null}
++              <Button className="w-full" disabled={pending || !shopDomain || !token} onClick={verify}>
++                {pending ? "Checking…" : "Verify store"}
++              </Button>
++            </div>
++          ) : (
++            <div className="space-y-2.5">
++              <p className="text-xs text-muted">
++                Found <span className="font-medium text-foreground">{shopInfo.name}</span> (
++                {shopInfo.currency}). Pick which client this store belongs to.
++              </p>
++              <select
++                className={inputCls}
++                value={workspaceId}
++                onChange={(e) => setWorkspaceId(e.target.value)}
++              >
++                {workspaces.map((w) => (
++                  <option key={w.id} value={w.id}>
++                    {w.name}
++                  </option>
++                ))}
++              </select>
++              {error ? <p className="text-xs text-negative">{error}</p> : null}
++              <div className="flex gap-2">
++                <Button variant="outline" onClick={() => setShopInfo(null)}>
++                  Back
++                </Button>
++                <Button className="flex-1" disabled={pending || !workspaceId} onClick={connect}>
++                  {pending ? "Connecting…" : "Connect store"}
++                </Button>
++              </div>
++            </div>
++          )}
++        </div>
++      ) : null}
++    </div>
++  );
++}
++
++/**
++ * Google Ads agency-token connect — mirrors ConnectMetaAgencyForm, sourced
++ * from GOOGLE_ADS_REFRESH_TOKEN + GOOGLE_ADS_LOGIN_CUSTOMER_ID (the
++ * agency's own MCC) instead of a single long-lived token. Lists every
++ * client account linked one level under that MCC so an admin can pick
++ * which workspace each belongs to — no per-client OAuth consent needed.
++ * This is the recommended way to connect Google Ads for most clients; the
++ * plain "Connect" OAuth button next to it is for the rarer case of a
++ * client granting direct access to their own account outside the agency's
++ * MCC.
++ */
++export function ConnectGoogleAdsAgencyForm({
++  workspaces,
++}: {
++  workspaces: Array<{ id: string; name: string }>;
++}) {
++  const [open, setOpen] = useState(false);
++  const [accounts, setAccounts] = useState<GoogleAdsAccountPreview[] | null>(null);
++  const [checked, setChecked] = useState<Record<string, boolean>>({});
++  const [workspaceFor, setWorkspaceFor] = useState<Record<string, string>>({});
++  const [error, setError] = useState<string | null>(null);
++  const [success, setSuccess] = useState<string | null>(null);
++  const [pending, startTransition] = useTransition();
++
++  function reset() {
++    setAccounts(null);
++    setChecked({});
++    setWorkspaceFor({});
++    setError(null);
++    setSuccess(null);
++  }
++
++  function fetchAccounts() {
++    setError(null);
++    setSuccess(null);
++    startTransition(async () => {
++      const result = await previewAgencyGoogleAdsAccounts();
++      if (result.error || !result.accounts) {
++        setError(result.error ?? "Something went wrong.");
++        return;
++      }
++      setAccounts(result.accounts);
++      const defaults: Record<string, string> = {};
++      for (const a of result.accounts) defaults[a.customerId] = workspaces[0]?.id ?? "";
++      setWorkspaceFor(defaults);
++    });
++  }
++
++  function connectSelected() {
++    setError(null);
++    const selectedIds = Object.entries(checked)
++      .filter(([, v]) => v)
++      .map(([id]) => id);
++    if (selectedIds.length === 0) {
++      setError("Pick at least one account.");
++      return;
++    }
++    startTransition(async () => {
++      const selections = (accounts ?? [])
++        .filter((a) => selectedIds.includes(a.customerId))
++        .map((a) => ({ ...a, workspaceId: workspaceFor[a.customerId] ?? "" }));
++      const result = await connectAgencyGoogleAdsAccounts(selections);
++      if (result.error) {
++        setError(result.error);
++        return;
++      }
++      setSuccess(
++        `Connected ${selections.length} account${selections.length === 1 ? "" : "s"} under the agency token.`,
++      );
++      setAccounts(null);
++      setChecked({});
++    });
++  }
++
++  return (
++    <div className="relative">
++      <Button
++        variant="outline"
++        onClick={() => {
++          setOpen((v) => !v);
++          if (open) reset();
++        }}
++      >
++        {open ? <X size={13} /> : <Search size={13} />} Use agency token
++      </Button>
++      {open ? (
++        <div className="absolute right-0 z-30 mt-2 w-[26rem] rounded-xl border border-border bg-surface p-4 shadow-xl">
++          {!accounts ? (
++            <div className="space-y-2.5">
++              <p className="text-xs leading-relaxed text-muted">
++                Connect client accounts linked under the agency&apos;s Google Ads manager (MCC)
++                account, using the shared{" "}
++                <code className="rounded bg-surface-2 px-1">GOOGLE_ADS_REFRESH_TOKEN</code>{" "}
++                instead of a per-client OAuth consent. We&apos;ll list every client account linked
++                one level under{" "}
++                <code className="rounded bg-surface-2 px-1">GOOGLE_ADS_LOGIN_CUSTOMER_ID</code> so
++                you can pick which to connect.
++              </p>
++              {error ? <p className="text-xs text-negative">{error}</p> : null}
++              <Button className="w-full" disabled={pending} onClick={fetchAccounts}>
++                {pending ? "Checking…" : "Fetch client accounts"}
++              </Button>
++            </div>
++          ) : (
++            <div className="space-y-2.5">
++              <p className="text-xs text-muted">
++                Found {accounts.length} account{accounts.length === 1 ? "" : "s"}. Pick which to
++                connect and which client each belongs to.
++              </p>
++              <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
++                {accounts.map((a) => (
++                  <div key={a.customerId} className="rounded-lg border border-border px-3 py-2">
++                    <label className="flex items-center gap-2 text-[13px] font-medium">
++                      <input
++                        type="checkbox"
++                        checked={Boolean(checked[a.customerId])}
++                        onChange={(e) =>
++                          setChecked((prev) => ({ ...prev, [a.customerId]: e.target.checked }))
++                        }
++                      />
++                      {a.name}
++                      <span className="text-xs font-normal text-muted">({a.currency})</span>
++                    </label>
++                    <select
++                      className={`${inputCls} mt-1.5`}
++                      value={workspaceFor[a.customerId] ?? ""}
++                      onChange={(e) =>
++                        setWorkspaceFor((prev) => ({ ...prev, [a.customerId]: e.target.value }))
++                      }
++                    >
++                      <option value="" disabled>
++                        Client workspace…
++                      </option>
++                      {workspaces.map((w) => (
++                        <option key={w.id} value={w.id}>
++                          {w.name}
++                        </option>
++                      ))}
++                    </select>
++                  </div>
++                ))}
++              </div>
++              {error ? <p className="text-xs text-negative">{error}</p> : null}
++              {success ? <p className="text-xs text-positive">{success}</p> : null}
++              <div className="flex gap-2">
++                <Button variant="outline" onClick={() => setAccounts(null)}>
++                  Back
++                </Button>
++                <Button className="flex-1" disabled={pending} onClick={connectSelected}>
++                  {pending ? "Connecting…" : "Connect selected"}
++                </Button>
++              </div>
++            </div>
++          )}
++        </div>
++      ) : null}
++    </div>
++  );
++}
++
++/**
++ * TikTok manual-token connect — mirrors ConnectMetaTokenForm exactly.
++ * Recommended over the OAuth "Connect" button for connecting more than one
++ * account at once, since TikTok's token-exchange response only ever
++ * returns however many accounts were granted on TikTok's own consent
++ * screen — this form's picker handles any number cleanly either way.
++ */
++export function ConnectTikTokTokenForm({
++  workspaces,
++}: {
++  workspaces: Array<{ id: string; name: string }>;
++}) {
++  const [open, setOpen] = useState(false);
++  const [token, setToken] = useState("");
++  const [accounts, setAccounts] = useState<TikTokAccountPreview[] | null>(null);
++  const [checked, setChecked] = useState<Record<string, boolean>>({});
++  const [workspaceFor, setWorkspaceFor] = useState<Record<string, string>>({});
++  const [error, setError] = useState<string | null>(null);
++  const [success, setSuccess] = useState<string | null>(null);
++  const [pending, startTransition] = useTransition();
++
++  function reset() {
++    setAccounts(null);
++    setChecked({});
++    setWorkspaceFor({});
++    setError(null);
++    setSuccess(null);
++    setToken("");
++  }
++
++  function fetchAccounts() {
++    setError(null);
++    setSuccess(null);
++    startTransition(async () => {
++      const result = await previewTikTokAccessToken(token);
++      if (result.error || !result.accounts) {
++        setError(result.error ?? "Something went wrong.");
++        return;
++      }
++      setAccounts(result.accounts);
++      const defaults: Record<string, string> = {};
++      for (const a of result.accounts) defaults[a.advertiserId] = workspaces[0]?.id ?? "";
++      setWorkspaceFor(defaults);
++    });
++  }
++
++  function connectSelected() {
++    setError(null);
++    const selectedIds = Object.entries(checked)
++      .filter(([, v]) => v)
++      .map(([id]) => id);
++    if (selectedIds.length === 0) {
++      setError("Pick at least one ad account.");
++      return;
++    }
++    startTransition(async () => {
++      const selections = (accounts ?? [])
++        .filter((a) => selectedIds.includes(a.advertiserId))
++        .map((a) => ({ ...a, workspaceId: workspaceFor[a.advertiserId] ?? "" }));
++      const result = await connectTikTokAccounts(token, selections);
++      if (result.error) {
++        setError(result.error);
++        return;
++      }
++      setSuccess(
++        `Connected ${selections.length} ad account${selections.length === 1 ? "" : "s"} — reports pull live immediately.`,
++      );
++      setAccounts(null);
++      setChecked({});
++    });
++  }
++
++  return (
++    <div className="relative">
++      <Button
++        variant="outline"
++        onClick={() => {
++          setOpen((v) => !v);
++          if (open) reset();
++        }}
++      >
++        {open ? <X size={13} /> : <Music2 size={13} />} Use a token instead
++      </Button>
++      {open ? (
++        <div className="absolute right-0 z-30 mt-2 w-[26rem] rounded-xl border border-border bg-surface p-4 shadow-xl">
++          {!accounts ? (
++            <div className="space-y-2.5">
++              <p className="text-xs leading-relaxed text-muted">
++                Paste a TikTok Business API access token (from the TikTok for Business developer
++                portal, scoped to Reporting access). If it can reach several ad accounts,
++                we&apos;ll list all of them so you can pick which to connect.
++              </p>
++              <textarea
++                value={token}
++                onChange={(e) => setToken(e.target.value)}
++                rows={3}
++                placeholder="act..."
++                className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring"
++              />
++              {error ? <p className="text-xs text-negative">{error}</p> : null}
++              <Button
++                className="w-full"
++                disabled={pending || token.trim().length < 10}
++                onClick={fetchAccounts}
++              >
++                {pending ? "Checking…" : "Fetch ad accounts"}
++              </Button>
++            </div>
++          ) : (
++            <div className="space-y-2.5">
++              <p className="text-xs text-muted">
++                Found {accounts.length} ad account{accounts.length === 1 ? "" : "s"}. Pick which to
++                connect and which client each belongs to.
++              </p>
++              <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
++                {accounts.map((a) => (
++                  <div key={a.advertiserId} className="rounded-lg border border-border px-3 py-2">
++                    <label className="flex items-center gap-2 text-[13px] font-medium">
++                      <input
++                        type="checkbox"
++                        checked={Boolean(checked[a.advertiserId])}
++                        onChange={(e) =>
++                          setChecked((prev) => ({ ...prev, [a.advertiserId]: e.target.checked }))
++                        }
++                      />
++                      {a.name}
++                      <span className="text-xs font-normal text-muted">({a.currency})</span>
++                    </label>
++                    <select
++                      className={`${inputCls} mt-1.5`}
++                      value={workspaceFor[a.advertiserId] ?? ""}
++                      onChange={(e) =>
++                        setWorkspaceFor((prev) => ({ ...prev, [a.advertiserId]: e.target.value }))
++                      }
++                    >
++                      <option value="" disabled>
++                        Client workspace…
++                      </option>
++                      {workspaces.map((w) => (
++                        <option key={w.id} value={w.id}>
++                          {w.name}
++                        </option>
++                      ))}
++                    </select>
++                  </div>
++                ))}
++              </div>
++              {error ? <p className="text-xs text-negative">{error}</p> : null}
++              {success ? <p className="text-xs text-positive">{success}</p> : null}
++              <div className="flex gap-2">
++                <Button variant="outline" onClick={() => setAccounts(null)}>
++                  Back
++                </Button>
++                <Button className="flex-1" disabled={pending} onClick={connectSelected}>
++                  {pending ? "Connecting…" : "Connect selected"}
++                </Button>
++              </div>
++            </div>
++          )}
++        </div>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/src/features/integrations/google-ads-live.ts b/src/features/integrations/google-ads-live.ts
+new file mode 100644
+index 0000000..1ef3057
+--- /dev/null
++++ b/src/features/integrations/google-ads-live.ts
+@@ -0,0 +1,351 @@
++import "server-only";
++import { getDb } from "@/lib/db";
++import { decryptSecret } from "@/lib/crypto";
++import { env, isDemoMode } from "@/lib/env";
++import { createGoogleAdsProvider, refreshAccessToken } from "./google-ads";
++import { ProviderAuthError, ProviderRateLimitError, type CampaignRecord, type ProviderCredentials } from "./types";
++import { sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
++import type { DateRange } from "@/features/metrics/queries";
++
++/**
++ * On-demand Google Ads reporting — same "pull-on-demand, not synced" shape
++ * as meta-live.ts. The one structural difference: Google Ads access tokens
++ * expire hourly, so every live pull first turns a stored REFRESH token into
++ * a short-lived access token (see getAccessToken's own 50-minute cache,
++ * separate from the 60s report cache below — otherwise every report
++ * refresh would also re-hit Google's token endpoint).
++ */
++
++interface CacheEntry<T> {
++  expires: number;
++  value: T;
++}
++const cache = new Map<string, CacheEntry<unknown>>();
++
++async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
++  const hit = cache.get(key);
++  const now = Date.now();
++  if (hit && hit.expires > now) return hit.value as T;
++  const value = await compute();
++  cache.set(key, { expires: now + ttlMs, value });
++  return value;
++}
++
++const INSIGHTS_TTL_MS = 60_000;
++const HEALTH_TTL_MS = 5 * 60_000;
++// Google access tokens last ~3600s; refresh 10 minutes early so a slow
++// request never straddles the actual expiry.
++const ACCESS_TOKEN_TTL_MS = 50 * 60_000;
++
++function reasonFor(e: unknown): string {
++  if (e instanceof ProviderAuthError) return e.message;
++  if (e instanceof ProviderRateLimitError) return "Google Ads rate-limited this request — try again in a minute.";
++  if (e instanceof Error) return e.message;
++  return "Unknown error reaching Google Ads.";
++}
++
++function logGoogleAdsFailure(connectionLabel: string, e: unknown): void {
++  console.error(`[google-ads-live] ${connectionLabel}: ${reasonFor(e)}`, e);
++}
++
++export interface LiveCampaign {
++  id: string;
++  name: string;
++  status: string;
++  qualityRanking: string | null;
++  engagementRateRanking: string | null;
++  conversionRateRanking: string | null;
++  dailyBudgetMinor: number | null;
++  facts: AdFacts;
++}
++
++export interface GoogleAdsFetchFailure {
++  displayName: string;
++  reason: string;
++}
++
++export interface LiveGoogleAdsReport {
++  totals: AdFacts;
++  trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
++  campaigns: LiveCampaign[];
++  partialFailure: boolean;
++  failures: GoogleAdsFetchFailure[];
++}
++
++async function getAccessToken(connectionId: string, refreshToken: string): Promise<string> {
++  const { accessToken } = await cached(`gads-token:${connectionId}`, ACCESS_TOKEN_TTL_MS, () =>
++    refreshAccessToken(refreshToken),
++  );
++  return accessToken;
++}
++
++interface ResolvedGoogleAdsCreds extends ProviderCredentials {
++  extra: Record<string, string>;
++}
++
++/**
++ * Resolves a connection to a ready-to-use access token + agency-wide
++ * developer token / login-customer-id. Falls back to
++ * GOOGLE_ADS_REFRESH_TOKEN when the connection has no secret of its own —
++ * this is what lets connectAgencyGoogleAdsAccounts save a connection with
++ * NO per-connection secret and still work, exactly mirroring Meta's
++ * META_USER_TOKEN fallback. Unlike Meta's resolveCreds (pure local
++ * decrypt), this can throw — refreshing the access token is a network
++ * call — so callers must try/catch around it, not just null-check.
++ */
++async function resolveCreds(connection: {
++  id: string;
++  currencyCode: string | null;
++}): Promise<ResolvedGoogleAdsCreds | null> {
++  const developerToken = env.GOOGLE_ADS_DEVELOPER_TOKEN;
++  if (!developerToken) {
++    throw new Error("Google Ads connector not configured — set GOOGLE_ADS_DEVELOPER_TOKEN.");
++  }
++
++  const db = getDb();
++  const secret = await db.query.integrationSecrets.findFirst({
++    where: (s, { eq }) => eq(s.connectionId, connection.id),
++  });
++
++  let refreshToken: string | undefined;
++  if (secret?.encryptedPayload) {
++    const parsed = JSON.parse(decryptSecret(secret.encryptedPayload)) as { refreshToken: string };
++    refreshToken = parsed.refreshToken;
++  } else if (env.GOOGLE_ADS_REFRESH_TOKEN) {
++    refreshToken = env.GOOGLE_ADS_REFRESH_TOKEN;
++  }
++  if (!refreshToken) return null;
++
++  const accessToken = await getAccessToken(connection.id, refreshToken);
++  const extra: Record<string, string> = {
++    developerToken,
++    currency: connection.currencyCode ?? "USD",
++  };
++  if (env.GOOGLE_ADS_LOGIN_CUSTOMER_ID) extra.loginCustomerId = env.GOOGLE_ADS_LOGIN_CUSTOMER_ID;
++  return { accessToken, extra };
++}
++
++interface ConnectionReport {
++  campaigns: LiveCampaign[];
++  trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
++}
++
++async function fetchConnectionReport(
++  creds: ProviderCredentials,
++  accountId: string,
++  range: DateRange,
++): Promise<ConnectionReport> {
++  const provider = createGoogleAdsProvider();
++
++  const campaignById = new Map<string, CampaignRecord>();
++  let campaignCursor: string | undefined;
++  do {
++    const page = await provider.listCampaigns(creds, accountId, campaignCursor);
++    for (const c of page.items) campaignById.set(c.externalId, c);
++    campaignCursor = page.nextCursor;
++  } while (campaignCursor);
++
++  const dailyByCampaign = new Map<string, AdFacts[]>();
++  const dailyTotals = new Map<string, { spendMinor: number; revenueMinor: number }>();
++  let insightCursor: string | undefined;
++  do {
++    const page = await provider.getDailyInsights(creds, accountId, range, insightCursor);
++    for (const row of page.items) {
++      const list = dailyByCampaign.get(row.campaignExternalId) ?? [];
++      list.push(row);
++      dailyByCampaign.set(row.campaignExternalId, list);
++
++      const t = dailyTotals.get(row.date) ?? { spendMinor: 0, revenueMinor: 0 };
++      t.spendMinor += row.spendMinor;
++      t.revenueMinor += row.revenueMinor;
++      dailyTotals.set(row.date, t);
++    }
++    insightCursor = page.nextCursor;
++  } while (insightCursor);
++
++  const campaigns: LiveCampaign[] = [...campaignById.values()].map((c) => ({
++    id: c.externalId,
++    name: c.name,
++    status: c.status,
++    qualityRanking: c.qualityRanking ?? null,
++    engagementRateRanking: c.engagementRateRanking ?? null,
++    conversionRateRanking: c.conversionRateRanking ?? null,
++    dailyBudgetMinor: c.dailyBudgetMinor ?? null,
++    facts: sumAdFacts(dailyByCampaign.get(c.externalId) ?? []),
++  }));
++
++  const trend = [...dailyTotals.entries()]
++    .map(([date, v]) => ({ date, ...v }))
++    .sort((a, b) => a.date.localeCompare(b.date));
++
++  return { campaigns, trend };
++}
++
++/**
++ * Live report for every active Google Ads connection under a workspace,
++ * merged into one totals/trend/campaigns set — mirrors getLiveMetaReport.
++ * Returns all-zero/empty when there's nothing to fetch (demo mode, or no
++ * active connection yet) rather than erroring.
++ */
++export async function getLiveGoogleAdsReport(
++  workspaceId: string,
++  range: DateRange,
++): Promise<LiveGoogleAdsReport> {
++  const empty: LiveGoogleAdsReport = {
++    totals: sumAdFacts([]),
++    trend: [],
++    campaigns: [],
++    partialFailure: false,
++    failures: [],
++  };
++  if (isDemoMode) return empty;
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "google_ads"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return empty;
++
++  const failures: GoogleAdsFetchFailure[] = [];
++
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      try {
++        const creds = await resolveCreds(connection);
++        if (!creds) {
++          const reason =
++            "No refresh token available for this account — connect it in Settings or set GOOGLE_ADS_REFRESH_TOKEN.";
++          failures.push({ displayName: connection.displayName, reason });
++          logGoogleAdsFailure(connection.displayName, new Error(reason));
++          return null;
++        }
++        const cacheKey = `google_ads:${connection.id}:${range.since}:${range.until}`;
++        return await cached(cacheKey, INSIGHTS_TTL_MS, () =>
++          fetchConnectionReport(creds, connection.externalAccountId, range),
++        );
++      } catch (e) {
++        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
++        logGoogleAdsFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++
++  const reports = perConnection.filter((r): r is ConnectionReport => r !== null);
++  const campaigns = reports.flatMap((r) => r.campaigns);
++
++  const trendMap = new Map<string, { spendMinor: number; revenueMinor: number }>();
++  for (const r of reports) {
++    for (const t of r.trend) {
++      const e = trendMap.get(t.date) ?? { spendMinor: 0, revenueMinor: 0 };
++      e.spendMinor += t.spendMinor;
++      e.revenueMinor += t.revenueMinor;
++      trendMap.set(t.date, e);
++    }
++  }
++  const trend = [...trendMap.entries()]
++    .map(([date, v]) => ({ date, ...v }))
++    .sort((a, b) => a.date.localeCompare(b.date));
++
++  const totals = sumAdFacts(campaigns.map((c) => c.facts));
++
++  return { totals, trend, campaigns, partialFailure: failures.length > 0, failures };
++}
++
++export interface PacingResult {
++  activeDailyBudgetMinor: number;
++  spendTodayMinor: number;
++  partialFailure: boolean;
++}
++
++/** "Pacing" for today — mirrors getMetaPacing exactly, same rationale. */
++export async function getGoogleAdsPacing(workspaceId: string): Promise<PacingResult> {
++  const empty: PacingResult = { activeDailyBudgetMinor: 0, spendTodayMinor: 0, partialFailure: false };
++  if (isDemoMode) return empty;
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "google_ads"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return empty;
++
++  const todayIso = new Date().toISOString().slice(0, 10);
++  const range: DateRange = { since: todayIso, until: todayIso };
++  let partialFailure = false;
++
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      try {
++        const creds = await resolveCreds(connection);
++        if (!creds) {
++          partialFailure = true;
++          logGoogleAdsFailure(connection.displayName, new Error("No refresh token available for pacing."));
++          return null;
++        }
++        const cacheKey = `google_ads-pacing:${connection.id}:${todayIso}`;
++        return await cached(cacheKey, INSIGHTS_TTL_MS, () =>
++          fetchConnectionReport(creds, connection.externalAccountId, range),
++        );
++      } catch (e) {
++        partialFailure = true;
++        logGoogleAdsFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++
++  const reports = perConnection.filter((r): r is ConnectionReport => r !== null);
++  const allCampaigns = reports.flatMap((r) => r.campaigns);
++  const activeDailyBudgetMinor = allCampaigns
++    .filter((c) => c.status === "active")
++    .reduce((sum, c) => sum + (c.dailyBudgetMinor ?? 0), 0);
++  const spendTodayMinor = allCampaigns.reduce((sum, c) => sum + c.facts.spendMinor, 0);
++
++  return { activeDailyBudgetMinor, spendTodayMinor, partialFailure };
++}
++
++export type AccountHealth = "live" | "idle" | "no_access";
++
++export interface AccountHealthResult {
++  connectionId: string;
++  displayName: string;
++  health: AccountHealth;
++}
++
++/** Cheap per-account health probe — mirrors checkMetaAccountsHealth. */
++export async function checkGoogleAdsAccountsHealth(workspaceId: string): Promise<AccountHealthResult[]> {
++  if (isDemoMode) return [];
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "google_ads")),
++  });
++  if (connections.length === 0) return [];
++
++  const provider = createGoogleAdsProvider();
++  const since = new Date();
++  since.setDate(since.getDate() - 6);
++  const range: DateRange = { since: since.toISOString().slice(0, 10), until: new Date().toISOString().slice(0, 10) };
++
++  return Promise.all(
++    connections.map(async (connection) => {
++      const cacheKey = `google_ads-health:${connection.id}`;
++      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++        try {
++          const creds = await resolveCreds(connection);
++          if (!creds) return "no_access";
++          const page = await provider.getDailyInsights(creds, connection.externalAccountId, range);
++          const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
++          return spend > 0 ? "live" : "idle";
++        } catch (e) {
++          logGoogleAdsFailure(connection.displayName, e);
++          return "no_access";
++        }
++      });
++      return { connectionId: connection.id, displayName: connection.displayName, health };
++    }),
++  );
++}
+diff --git a/src/features/integrations/google-ads.ts b/src/features/integrations/google-ads.ts
+new file mode 100644
+index 0000000..ad3111e
+--- /dev/null
++++ b/src/features/integrations/google-ads.ts
+@@ -0,0 +1,419 @@
++import type {
++  AdsProvider,
++  CampaignRecord,
++  DailyInsightRecord,
++  PageResult,
++  ProviderCredentials,
++} from "./types";
++import { ProviderAuthError, ProviderRateLimitError } from "./types";
++import { env } from "@/lib/env";
++
++/**
++ * Live Google Ads API client (REST interface, v17, queries written in
++ * GAQL and sent to `googleAds:search`). Called only by live-pull code
++ * (google-ads-live.ts) and the OAuth callback with decrypted/refreshed
++ * credentials — never from client-facing code.
++ *
++ * Built against Google's documented v17 REST + GAQL contract. Unlike
++ * Meta's Graph API (tested against this repo's actual dev account),
++ * nobody has run this against a real Google Ads developer token yet —
++ * there's no test account available while that approval is pending (see
++ * the Settings page credential instructions). The request/response shapes
++ * below match Google's published docs closely; if a real account surfaces
++ * a field-naming or error-shape mismatch, checkGoogleAdsAccountsHealth's
++ * `reasonFor()` in google-ads-live.ts is the first place to look — it logs
++ * the raw error server-side on every failure.
++ *
++ * Access tokens expire after ~1 hour — every credential bundle here
++ * carries a REFRESH token (from the one-time OAuth consent), and
++ * refreshAccessToken() exchanges it for a short-lived access token before
++ * each live pull (google-ads-live.ts caches the resulting access token for
++ * ~50min so this doesn't hit Google's token endpoint every request).
++ */
++
++// v24 confirmed current as of July 2026 (v24 shipped April 2026, latest
++// minor v24.2 in June 2026) — checked against Google's own release notes
++// rather than assumed, since Ads API versions sunset roughly yearly.
++const API_VERSION = "v24";
++const API_BASE = `https://googleads.googleapis.com/${API_VERSION}`;
++const TOKEN_URL = "https://oauth2.googleapis.com/token";
++
++interface GoogleTokenErrorBody {
++  error?: string;
++  error_description?: string;
++}
++
++export interface RefreshedToken {
++  accessToken: string;
++  expiresInSeconds: number;
++}
++
++/**
++ * Exchanges a long-lived OAuth refresh token for a short-lived (~1hr)
++ * access token. Requires GOOGLE_ADS_CLIENT_ID/SECRET — the same OAuth
++ * client the consent flow used to mint the refresh token (Google ties
++ * refresh tokens to the client that requested them; they can't be
++ * redeemed against a different client id/secret).
++ */
++export async function refreshAccessToken(refreshToken: string): Promise<RefreshedToken> {
++  const clientId = env.GOOGLE_ADS_CLIENT_ID;
++  const clientSecret = env.GOOGLE_ADS_CLIENT_SECRET;
++  if (!clientId || !clientSecret) {
++    throw new ProviderAuthError(
++      "Google Ads connector not configured (missing GOOGLE_ADS_CLIENT_ID/GOOGLE_ADS_CLIENT_SECRET)",
++    );
++  }
++  const res = await fetch(TOKEN_URL, {
++    method: "POST",
++    headers: { "Content-Type": "application/x-www-form-urlencoded" },
++    body: new URLSearchParams({
++      client_id: clientId,
++      client_secret: clientSecret,
++      refresh_token: refreshToken,
++      grant_type: "refresh_token",
++    }),
++  });
++  if (res.status === 400 || res.status === 401) {
++    throw new ProviderAuthError(
++      "Google rejected the refresh token — it's likely been revoked. Reconnect in Settings.",
++    );
++  }
++  if (!res.ok) {
++    const body = (await res.json().catch(() => ({}))) as GoogleTokenErrorBody;
++    throw new Error(`Google token refresh failed: ${body.error_description ?? body.error ?? res.status}`);
++  }
++  const body = (await res.json()) as { access_token: string; expires_in: number };
++  return { accessToken: body.access_token, expiresInSeconds: body.expires_in };
++}
++
++/** developer-token and login-customer-id are agency-wide (env), not
++ *  per-connection — carried on ProviderCredentials.extra so provider
++ *  methods don't need extra parameters threaded through every call. */
++interface GoogleAdsCreds extends ProviderCredentials {
++  extra?: Record<string, string>;
++}
++
++function authHeaders(creds: GoogleAdsCreds): Record<string, string> {
++  const headers: Record<string, string> = {
++    Authorization: `Bearer ${creds.accessToken}`,
++    "Content-Type": "application/json",
++  };
++  if (creds.extra?.developerToken) headers["developer-token"] = creds.extra.developerToken;
++  if (creds.extra?.loginCustomerId) headers["login-customer-id"] = creds.extra.loginCustomerId;
++  return headers;
++}
++
++interface GoogleAdsErrorBody {
++  error?: { code?: number; message?: string; status?: string };
++}
++
++/** Defense in depth: `range.since`/`range.until` ultimately trace back to a
++ *  URL query param (the date-range picker) that isn't format-validated
++ *  upstream. GAQL has no parameterized-query support over REST — the query
++ *  is always a plain string — so anything embedded in a WHERE clause here
++ *  MUST be checked first. Google-scoped blast radius is limited (the
++ *  customer id in the URL path already bounds which account's data is
++ *  reachable), but a malformed date could still corrupt the query. */
++function assertIsoDate(value: string): string {
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
++    throw new Error(`Invalid date range for Google Ads query: "${value}"`);
++  }
++  return value;
++}
++
++async function gaqlSearch<T>(
++  customerId: string,
++  query: string,
++  creds: GoogleAdsCreds,
++  pageToken?: string,
++): Promise<{ results: T[]; nextPageToken?: string }> {
++  const res = await fetch(`${API_BASE}/customers/${customerId}/googleAds:search`, {
++    method: "POST",
++    headers: authHeaders(creds),
++    body: JSON.stringify({ query, pageToken, pageSize: 10_000 }),
++  });
++  if (res.status === 401) throw new ProviderAuthError("Google Ads rejected the access token");
++  if (res.status === 429) throw new ProviderRateLimitError(60);
++  const body = (await res.json().catch(() => ({}))) as { results?: T[]; nextPageToken?: string } &
++    GoogleAdsErrorBody;
++  if (!res.ok) {
++    if (res.status === 403) {
++      throw new ProviderAuthError(body.error?.message ?? "Google Ads permission denied for this account");
++    }
++    if (res.status === 503) throw new ProviderRateLimitError(30);
++    throw new Error(`Google Ads API error: ${body.error?.message ?? res.statusText}`);
++  }
++  return { results: body.results ?? [], nextPageToken: body.nextPageToken };
++}
++
++export interface AccessibleCustomer {
++  customerId: string;
++  descriptiveName: string;
++  currencyCode: string;
++  timeZone: string;
++  isManager: boolean;
++}
++
++/**
++ * Discovers Google Ads customer ids the just-authenticated Google user has
++ * been granted DIRECT access to. Confirmed against Google's own docs:
++ * this does NOT walk an MCC's client hierarchy — a manager account's own
++ * login only sees accounts it (or its user) was explicitly added to, not
++ * every client linked beneath it. That makes this the right call for "a
++ * client grants our app direct access to their own account" (the OAuth
++ * button in Settings), and the WRONG call for "list every client under
++ * our agency's MCC" — use listLinkedClientAccounts for that instead.
++ */
++export async function listAccessibleCustomers(
++  accessToken: string,
++  developerToken: string,
++): Promise<AccessibleCustomer[]> {
++  const res = await fetch(`${API_BASE}/customers:listAccessibleCustomers`, {
++    headers: { Authorization: `Bearer ${accessToken}`, "developer-token": developerToken },
++  });
++  if (res.status === 401) throw new ProviderAuthError("Google Ads rejected the access token");
++  if (!res.ok) {
++    const body = (await res.json().catch(() => ({}))) as GoogleAdsErrorBody;
++    throw new Error(`Google Ads API error: ${body.error?.message ?? res.statusText}`);
++  }
++  const body = (await res.json()) as { resourceNames?: string[] };
++  const ids = (body.resourceNames ?? []).map((rn) => rn.replace("customers/", ""));
++
++  const creds: GoogleAdsCreds = { accessToken, extra: { developerToken } };
++  const infos = await Promise.all(
++    ids.map(async (id) => {
++      try {
++        return await fetchCustomerInfo(id, creds);
++      } catch {
++        return null; // an id we can list but can't read details for — skip it
++      }
++    }),
++  );
++  return infos.filter((c): c is AccessibleCustomer => c !== null);
++}
++
++interface GoogleAdsCustomerRow {
++  customer: {
++    id: string;
++    descriptiveName?: string;
++    currencyCode?: string;
++    timeZone?: string;
++    manager?: boolean;
++  };
++}
++
++async function fetchCustomerInfo(customerId: string, creds: GoogleAdsCreds): Promise<AccessibleCustomer> {
++  const query = "SELECT customer.id, customer.descriptive_name, customer.currency_code, customer.time_zone, customer.manager FROM customer LIMIT 1";
++  const { results } = await gaqlSearch<GoogleAdsCustomerRow>(customerId, query, creds);
++  const c = results[0]?.customer;
++  return {
++    customerId,
++    descriptiveName: c?.descriptiveName ?? customerId,
++    currencyCode: c?.currencyCode ?? "USD",
++    timeZone: c?.timeZone ?? "UTC",
++    isManager: c?.manager ?? false,
++  };
++}
++
++export interface LinkedClientAccount {
++  customerId: string;
++  descriptiveName: string;
++  currencyCode: string;
++  timeZone: string;
++}
++
++interface CustomerClientRow {
++  customerClient: {
++    id: string;
++    descriptiveName?: string;
++    currencyCode?: string;
++    timeZone?: string;
++    manager?: boolean;
++    level?: string;
++  };
++}
++
++/**
++ * Lists client accounts linked one level directly under an agency's own
++ * manager (MCC) account — the correct way for an agency to enumerate "which
++ * of my clients can I report on" from its own login, without asking every
++ * client to run their own OAuth consent (mirrors how Meta's agency-wide
++ * token flow lists every ad account META_USER_TOKEN can see). Requires the
++ * caller's access token to belong to a user with access to managerCustomerId
++ * itself; login-customer-id is set to that manager for the query.
++ *
++ * Deliberately one level deep only — an agency nesting a sub-manager
++ * between the top MCC and a client account won't see that client here.
++ * Reasonable for a first pass; a recursive walk is a future enhancement if
++ * an agency's hierarchy actually needs it.
++ */
++export async function listLinkedClientAccounts(
++  accessToken: string,
++  developerToken: string,
++  managerCustomerId: string,
++): Promise<LinkedClientAccount[]> {
++  const creds: GoogleAdsCreds = {
++    accessToken,
++    extra: { developerToken, loginCustomerId: managerCustomerId },
++  };
++  const query =
++    "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, " +
++    "customer_client.time_zone, customer_client.manager, customer_client.level " +
++    "FROM customer_client WHERE customer_client.level <= 1";
++  const { results } = await gaqlSearch<CustomerClientRow>(managerCustomerId, query, creds);
++  return results
++    .filter((r) => r.customerClient.level !== "0" && !r.customerClient.manager)
++    .map((r) => ({
++      customerId: r.customerClient.id,
++      descriptiveName: r.customerClient.descriptiveName ?? r.customerClient.id,
++      currencyCode: r.customerClient.currencyCode ?? "USD",
++      timeZone: r.customerClient.timeZone ?? "UTC",
++    }));
++}
++
++/** 1,000,000 micros = 1 major currency unit = 100 minor units, so
++ *  micros / 10,000 = minor units. */
++function microsToMinor(micros: string | undefined): number {
++  return Math.round((parseInt(micros ?? "0", 10) || 0) / 10_000);
++}
++
++/** conversions_value is a decimal in major currency units (not micros). */
++function decimalToMinor(value: number | string | undefined): number {
++  const n = typeof value === "string" ? parseFloat(value) : (value ?? 0);
++  return Math.round((n || 0) * 100);
++}
++
++function mapCampaignStatus(s: string): CampaignRecord["status"] {
++  if (s === "ENABLED") return "active";
++  if (s === "PAUSED") return "paused";
++  if (s === "REMOVED") return "deleted";
++  return "archived";
++}
++
++interface GoogleAdsCampaignRow {
++  campaign: { id: string; name: string; status: string; advertisingChannelType?: string };
++  campaignBudget?: { amountMicros?: string };
++}
++
++interface GoogleAdsMetricsRow {
++  campaign: { id: string };
++  segments: { date: string };
++  metrics: {
++    costMicros?: string;
++    impressions?: string;
++    clicks?: string;
++    conversions?: number | string;
++    conversionsValue?: number | string;
++    videoViews?: string;
++  };
++}
++
++/**
++ * Maps a metrics row to the shared AdFacts shape. Only the metrics Google
++ * Ads reports at plain campaign×date grain are populated (spend, revenue,
++ * impressions, clicks, conversions, video views); the funnel-stage
++ * breakdown fields Meta gets for free from its `actions` array
++ * (addToCart, initiateCheckout, leads, etc.) require a second query
++ * segmented by conversion-action category — a reasonable follow-up, not
++ * implemented here. `reach` is also 0: campaign-grain unique-reach isn't
++ * exposed by a simple GAQL metric the way Meta's `reach` field is.
++ */
++function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRecord {
++  const videoViews = parseInt(r.metrics.videoViews ?? "0", 10) || 0;
++  return {
++    campaignExternalId: r.campaign.id,
++    date: r.segments.date,
++    currencyCode: currency,
++    spendMinor: microsToMinor(r.metrics.costMicros),
++    revenueMinor: decimalToMinor(r.metrics.conversionsValue),
++    impressions: parseInt(r.metrics.impressions ?? "0", 10) || 0,
++    clicks: parseInt(r.metrics.clicks ?? "0", 10) || 0,
++    purchases: Math.round(Number(r.metrics.conversions ?? 0)) || 0,
++    reach: 0,
++    // Google's `video_views` is the closest available analogue to Meta's
++    // 3-second-view metric, not an exact equivalent — treat as approximate.
++    videoViews3s: videoViews,
++    videoPlays: videoViews,
++    inlineLinkClicks: 0,
++    outboundClicks: 0,
++    uniqueClicks: 0,
++    landingPageViews: 0,
++    pageEngagements: 0,
++    videoThruplays: 0,
++    videoP50: 0,
++    videoP75: 0,
++    videoP100: 0,
++    viewContent: 0,
++    addToCart: 0,
++    initiateCheckout: 0,
++    addPaymentInfo: 0,
++    leads: 0,
++  };
++}
++
++export function createGoogleAdsProvider(): AdsProvider {
++  return {
++    key: "google_ads",
++
++    async listCampaigns(
++      creds: ProviderCredentials,
++      accountId: string,
++      cursor?: string,
++    ): Promise<PageResult<CampaignRecord>> {
++      const query =
++        "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.amount_micros " +
++        "FROM campaign ORDER BY campaign.id";
++      const { results, nextPageToken } = await gaqlSearch<GoogleAdsCampaignRow>(
++        accountId,
++        query,
++        creds as GoogleAdsCreds,
++        cursor,
++      );
++      return {
++        items: results.map((r) => ({
++          externalId: r.campaign.id,
++          name: r.campaign.name,
++          status: mapCampaignStatus(r.campaign.status),
++          // Google Ads has no single "objective" field like Meta's — the ad
++          // channel type (SEARCH, DISPLAY, PERFORMANCE_MAX, ...) is the
++          // closest one-line description of what a campaign does.
++          objective: r.campaign.advertisingChannelType,
++          dailyBudgetMinor: r.campaignBudget?.amountMicros
++            ? microsToMinor(r.campaignBudget.amountMicros)
++            : undefined,
++          currencyCode: creds.extra?.currency ?? "USD",
++        })),
++        nextCursor: nextPageToken,
++      };
++    },
++
++    async getDailyInsights(
++      creds: ProviderCredentials,
++      accountId: string,
++      range: { since: string; until: string },
++      cursor?: string,
++    ): Promise<PageResult<DailyInsightRecord>> {
++      const since = assertIsoDate(range.since);
++      const until = assertIsoDate(range.until);
++      const query =
++        "SELECT campaign.id, segments.date, metrics.cost_micros, metrics.impressions, metrics.clicks, " +
++        "metrics.conversions, metrics.conversions_value, metrics.video_views FROM campaign " +
++        `WHERE segments.date BETWEEN '${since}' AND '${until}'`;
++      const { results, nextPageToken } = await gaqlSearch<GoogleAdsMetricsRow>(
++        accountId,
++        query,
++        creds as GoogleAdsCreds,
++        cursor,
++      );
++      const currency = creds.extra?.currency ?? "USD";
++      return {
++        items: results.map((r) => mapMetricsRow(r, currency)),
++        nextCursor: nextPageToken,
++      };
++    },
++
++    // No getRankings: Google Ads' closest concept (Quality Score) lives at
++    // the keyword level, not the campaign level, so it doesn't map onto
++    // CampaignRecord's per-campaign ranking fields the way Meta's do.
++  };
++}
+diff --git a/src/features/integrations/live-ads.ts b/src/features/integrations/live-ads.ts
+new file mode 100644
+index 0000000..d674bdc
+--- /dev/null
++++ b/src/features/integrations/live-ads.ts
+@@ -0,0 +1,136 @@
++import "server-only";
++import { isDemoMode } from "@/lib/env";
++import { getLiveMetaReport } from "./meta-live";
++import { getLiveGoogleAdsReport } from "./google-ads-live";
++import { getLiveTikTokReport } from "./tiktok-live";
++import { sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
++import type { DateRange, DailyAdPoint } from "@/features/metrics/queries";
++
++/**
++ * Blends live ad data across all three "pull-on-demand" providers (Meta,
++ * Google Ads, TikTok) into one report — the shared piece OverviewReport
++ * and AiInsights both need (a whole-account view, not one channel at a
++ * time). features/ads/channel-page.tsx does NOT use this: it shows one
++ * provider at a time and calls that provider's own getLiveXReport
++ * directly, so it isn't paying for the other two providers' API calls on
++ * every single-channel page view.
++ *
++ * Each underlying getLiveXReport already no-ops (one cheap DB query, no
++ * external API call) when a workspace has zero connections for that
++ * provider, so calling all three unconditionally here is safe and cheap
++ * even for a client connected to just one channel.
++ */
++
++export type AdProviderKey = "meta" | "google_ads" | "tiktok";
++
++export const AD_PROVIDER_KEYS = ["meta", "google_ads", "tiktok"] as const;
++
++export const AD_PROVIDER_LABELS: Record<AdProviderKey, string> = {
++  meta: "Meta",
++  google_ads: "Google Ads",
++  tiktok: "TikTok",
++};
++
++export interface AdFetchFailure {
++  provider: AdProviderKey;
++  displayName: string;
++  reason: string;
++}
++
++export interface ProviderReport {
++  totals: AdFacts;
++  trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
++}
++
++export interface LiveAdsReport {
++  totals: AdFacts;
++  trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
++  byProvider: Record<AdProviderKey, ProviderReport>;
++  partialFailure: boolean;
++  failures: AdFetchFailure[];
++}
++
++function mergeTrend(
++  trends: Array<Array<{ date: string; spendMinor: number; revenueMinor: number }>>,
++): Array<{ date: string; spendMinor: number; revenueMinor: number }> {
++  const byDate = new Map<string, { date: string; spendMinor: number; revenueMinor: number }>();
++  for (const trend of trends) {
++    for (const row of trend) {
++      const entry = byDate.get(row.date) ?? { date: row.date, spendMinor: 0, revenueMinor: 0 };
++      entry.spendMinor += row.spendMinor;
++      entry.revenueMinor += row.revenueMinor;
++      byDate.set(row.date, entry);
++    }
++  }
++  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
++}
++
++export async function getLiveAdsReport(workspaceId: string, range: DateRange): Promise<LiveAdsReport> {
++  const empty: ProviderReport = { totals: sumAdFacts([]), trend: [] };
++  if (isDemoMode) {
++    return {
++      totals: empty.totals,
++      trend: [],
++      byProvider: { meta: empty, google_ads: empty, tiktok: empty },
++      partialFailure: false,
++      failures: [],
++    };
++  }
++
++  const [meta, googleAds, tiktok] = await Promise.all([
++    getLiveMetaReport(workspaceId, range),
++    getLiveGoogleAdsReport(workspaceId, range),
++    getLiveTikTokReport(workspaceId, range),
++  ]);
++
++  const failures: AdFetchFailure[] = [
++    ...meta.failures.map((f) => ({ provider: "meta" as const, ...f })),
++    ...googleAds.failures.map((f) => ({ provider: "google_ads" as const, ...f })),
++    ...tiktok.failures.map((f) => ({ provider: "tiktok" as const, ...f })),
++  ];
++
++  const byProvider: Record<AdProviderKey, ProviderReport> = {
++    meta: { totals: meta.totals, trend: meta.trend },
++    google_ads: { totals: googleAds.totals, trend: googleAds.trend },
++    tiktok: { totals: tiktok.totals, trend: tiktok.trend },
++  };
++
++  return {
++    totals: sumAdFacts([meta.totals, googleAds.totals, tiktok.totals]),
++    trend: mergeTrend([meta.trend, googleAds.trend, tiktok.trend]),
++    byProvider,
++    partialFailure: meta.partialFailure || googleAds.partialFailure || tiktok.partialFailure,
++    failures,
++  };
++}
++
++/**
++ * Shapes demo-mode DB rows (flat, one row per provider+date) into the same
++ * {totals, trend, byProvider} shape getLiveAdsReport returns above, so
++ * callers (OverviewReport, AiInsights) read one shape regardless of
++ * whether the data came from a live pull or the demo-mode generator.
++ */
++export function adsReportFromRows(rows: DailyAdPoint[]): LiveAdsReport {
++  const byProvider = {} as LiveAdsReport["byProvider"];
++  for (const key of AD_PROVIDER_KEYS) {
++    const providerRows = rows.filter((r) => r.provider === key);
++    byProvider[key] = {
++      totals: sumAdFacts(providerRows),
++      trend: providerRows.map((r) => ({ date: r.date, spendMinor: r.spendMinor, revenueMinor: r.revenueMinor })),
++    };
++  }
++  const trendMap = new Map<string, { date: string; spendMinor: number; revenueMinor: number }>();
++  for (const r of rows) {
++    const entry = trendMap.get(r.date) ?? { date: r.date, spendMinor: 0, revenueMinor: 0 };
++    entry.spendMinor += r.spendMinor;
++    entry.revenueMinor += r.revenueMinor;
++    trendMap.set(r.date, entry);
++  }
++  return {
++    totals: sumAdFacts(rows),
++    trend: [...trendMap.values()].sort((a, b) => a.date.localeCompare(b.date)),
++    byProvider,
++    partialFailure: false,
++    failures: [],
++  };
++}
+diff --git a/src/features/integrations/shopify-live.ts b/src/features/integrations/shopify-live.ts
+new file mode 100644
+index 0000000..e169bdb
+--- /dev/null
++++ b/src/features/integrations/shopify-live.ts
+@@ -0,0 +1,199 @@
++import "server-only";
++import { getDb } from "@/lib/db";
++import { decryptSecret } from "@/lib/crypto";
++import { isDemoMode } from "@/lib/env";
++import { fetchShopifyDailyFacts } from "./shopify";
++import { ProviderAuthError, ProviderRateLimitError } from "./types";
++import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
++import type { DateRange } from "@/features/metrics/queries";
++
++/**
++ * On-demand Shopify reporting — same "pull-on-demand, not synced" shape as
++ * meta-live.ts, adapted for store sales instead of ad spend. Nothing runs
++ * in the background; when someone opens the Shopify page (or a workspace's
++ * Overview/AI Copilot, which also blend in store numbers), this hits the
++ * Shopify Admin API live for exactly that store + date range, cached 60s
++ * per connection+range on the same warm server instance.
++ */
++
++interface CacheEntry<T> {
++  expires: number;
++  value: T;
++}
++const cache = new Map<string, CacheEntry<unknown>>();
++
++async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
++  const hit = cache.get(key);
++  const now = Date.now();
++  if (hit && hit.expires > now) return hit.value as T;
++  const value = await compute();
++  cache.set(key, { expires: now + ttlMs, value });
++  return value;
++}
++
++const FACTS_TTL_MS = 60_000;
++const HEALTH_TTL_MS = 5 * 60_000;
++
++function reasonFor(e: unknown): string {
++  if (e instanceof ProviderAuthError) return "Shopify rejected the access token — it's likely been revoked. Reconnect in Settings.";
++  if (e instanceof ProviderRateLimitError) return "Shopify rate-limited this request — try again in a minute.";
++  if (e instanceof Error) return e.message;
++  return "Unknown error reaching Shopify.";
++}
++
++function logShopifyFailure(connectionLabel: string, e: unknown): void {
++  console.error(`[shopify-live] ${connectionLabel}: ${reasonFor(e)}`, e);
++}
++
++export interface ShopifyFetchFailure {
++  displayName: string;
++  reason: string;
++}
++
++export interface DailyShopPoint extends ShopFacts {
++  date: string;
++}
++
++export interface LiveShopifyReport {
++  totals: ShopFacts;
++  rows: DailyShopPoint[];
++  partialFailure: boolean;
++  failures: ShopifyFetchFailure[];
++}
++
++interface ResolvedShopifyCreds {
++  shopDomain: string;
++  accessToken: string;
++}
++
++async function resolveCreds(connection: {
++  id: string;
++  externalAccountId: string;
++}): Promise<ResolvedShopifyCreds | null> {
++  const db = getDb();
++  const secret = await db.query.integrationSecrets.findFirst({
++    where: (s, { eq }) => eq(s.connectionId, connection.id),
++  });
++  if (!secret?.encryptedPayload) return null;
++  const parsed = JSON.parse(decryptSecret(secret.encryptedPayload)) as { accessToken: string };
++  return { shopDomain: connection.externalAccountId, accessToken: parsed.accessToken };
++}
++
++/**
++ * Live store-sales report for every active Shopify connection under a
++ * workspace, merged into one totals/rows set. Returns all-zero when
++ * there's nothing to fetch (demo mode, or no active connection yet)
++ * rather than erroring, so a brand-new client workspace just shows zeros.
++ */
++export async function getLiveShopifyReport(
++  workspaceId: string,
++  range: DateRange,
++): Promise<LiveShopifyReport> {
++  const empty: LiveShopifyReport = {
++    totals: sumShopFacts([]),
++    rows: [],
++    partialFailure: false,
++    failures: [],
++  };
++  if (isDemoMode) return empty;
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "shopify"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return empty;
++
++  const failures: ShopifyFetchFailure[] = [];
++
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      const creds = await resolveCreds(connection);
++      if (!creds) {
++        const reason = "No access token available for this store — connect it in Settings.";
++        failures.push({ displayName: connection.displayName, reason });
++        logShopifyFailure(connection.displayName, new Error(reason));
++        return null;
++      }
++      const cacheKey = `shopify:${connection.id}:${range.since}:${range.until}`;
++      try {
++        return await cached(cacheKey, FACTS_TTL_MS, () =>
++          fetchShopifyDailyFacts(creds.shopDomain, creds.accessToken, range),
++        );
++      } catch (e) {
++        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
++        logShopifyFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++
++  const maps = perConnection.filter((m): m is Map<string, ShopFacts> => m !== null);
++
++  const merged = new Map<string, ShopFacts>();
++  for (const map of maps) {
++    for (const [date, facts] of map) {
++      const existing = merged.get(date);
++      merged.set(date, existing ? sumShopFacts([existing, facts]) : facts);
++    }
++  }
++
++  const rows: DailyShopPoint[] = [...merged.entries()]
++    .map(([date, facts]) => ({ date, ...facts }))
++    .sort((a, b) => a.date.localeCompare(b.date));
++
++  return {
++    totals: sumShopFacts(rows),
++    rows,
++    partialFailure: failures.length > 0,
++    failures,
++  };
++}
++
++export type ShopifyAccountHealth = "live" | "idle" | "no_access";
++
++export interface ShopifyAccountHealthResult {
++  connectionId: string;
++  displayName: string;
++  health: ShopifyAccountHealth;
++}
++
++/**
++ * Cheap per-connection health probe — mirrors checkMetaAccountsHealth.
++ * "live" = reachable with orders in the last week, "idle" = reachable but
++ * no recent orders, "no_access" = token rejected.
++ */
++export async function checkShopifyAccountsHealth(workspaceId: string): Promise<ShopifyAccountHealthResult[]> {
++  if (isDemoMode) return [];
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "shopify")),
++  });
++  if (connections.length === 0) return [];
++
++  const until = new Date();
++  const since = new Date();
++  since.setDate(until.getDate() - 6);
++  const range: DateRange = { since: since.toISOString().slice(0, 10), until: until.toISOString().slice(0, 10) };
++
++  return Promise.all(
++    connections.map(async (connection) => {
++      const cacheKey = `shopify-health:${connection.id}`;
++      const health = await cached<ShopifyAccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++        const creds = await resolveCreds(connection);
++        if (!creds) return "no_access";
++        try {
++          const facts = await fetchShopifyDailyFacts(creds.shopDomain, creds.accessToken, range);
++          const orders = [...facts.values()].reduce((sum, f) => sum + f.orders, 0);
++          return orders > 0 ? "live" : "idle";
++        } catch (e) {
++          logShopifyFailure(connection.displayName, e);
++          return "no_access";
++        }
++      });
++      return { connectionId: connection.id, displayName: connection.displayName, health };
++    }),
++  );
++}
+diff --git a/src/features/integrations/shopify.ts b/src/features/integrations/shopify.ts
+new file mode 100644
+index 0000000..98f04ec
+--- /dev/null
++++ b/src/features/integrations/shopify.ts
+@@ -0,0 +1,190 @@
++import { ProviderAuthError, ProviderRateLimitError } from "./types";
++import type { ShopFacts } from "@/lib/metrics/definitions";
++
++/**
++ * Live Shopify Admin REST API client. Unlike Meta/Google Ads/TikTok,
++ * Shopify has no campaigns/ad-spend — it reports STORE sales, so this
++ * deliberately does NOT implement the `AdsProvider` interface (see
++ * types.ts's note on why). Called only with a decrypted access token —
++ * never from client-facing code.
++ *
++ * Connection model: a Shopify "custom app" (created per-store, directly in
++ * that store's own admin — Settings → Apps and sales channels → Develop
++ * apps), not a public OAuth app. This is the standard, Shopify-recommended
++ * approach for an agency integrating a known, bounded list of client
++ * stores: no App Store review, an Admin API access token is available the
++ * moment the app is installed, and it never expires on its own (only if
++ * revoked). Mirrors the same "paste a long-lived token" shape as Meta's
++ * manual-connect path.
++ */
++
++const API_VERSION = "2024-10";
++
++interface ShopifyErrorBody {
++  errors?: string | Record<string, string[]>;
++}
++
++function shopUrl(shopDomain: string, path: string): string {
++  return `https://${shopDomain}/admin/api/${API_VERSION}${path}`;
++}
++
++async function shopifyFetch<T>(shopDomain: string, path: string, accessToken: string): Promise<{ body: T; linkHeader: string | null }> {
++  const res = await fetch(shopUrl(shopDomain, path), {
++    headers: { "X-Shopify-Access-Token": accessToken, Accept: "application/json" },
++  });
++  if (res.status === 401 || res.status === 403) {
++    throw new ProviderAuthError("Shopify rejected the access token");
++  }
++  if (res.status === 429) {
++    const retryAfter = Number(res.headers.get("retry-after") ?? "2");
++    throw new ProviderRateLimitError(Math.max(1, Math.round(retryAfter)));
++  }
++  if (!res.ok) {
++    const body = (await res.json().catch(() => ({}))) as ShopifyErrorBody;
++    const message = typeof body.errors === "string" ? body.errors : JSON.stringify(body.errors ?? res.statusText);
++    throw new Error(`Shopify API error: ${message}`);
++  }
++  const body = (await res.json()) as T;
++  return { body, linkHeader: res.headers.get("link") };
++}
++
++/** Shopify's Link header: `<url>; rel="next", <url>; rel="previous"`. */
++function nextPageInfo(linkHeader: string | null): string | null {
++  if (!linkHeader) return null;
++  const match = linkHeader.split(",").find((part) => part.includes('rel="next"'));
++  if (!match) return null;
++  const urlMatch = match.match(/<([^>]+)>/);
++  if (!urlMatch) return null;
++  try {
++    return new URL(urlMatch[1]).searchParams.get("page_info");
++  } catch {
++    return null;
++  }
++}
++
++export interface ShopifyShopInfo {
++  name: string;
++  currency: string;
++  timezone: string;
++  domain: string;
++}
++
++/**
++ * Verifies a {shop domain, access token} pair works, and returns basic shop
++ * info to prefill the connection's display name/currency/timezone — the
++ * same role `previewMetaAccessToken` plays before a connection is saved.
++ */
++export async function verifyShopifyCredentials(
++  shopDomain: string,
++  accessToken: string,
++): Promise<ShopifyShopInfo> {
++  const { body } = await shopifyFetch<{
++    shop: { name: string; currency: string; iana_timezone: string; myshopify_domain: string };
++  }>(shopDomain, "/shop.json", accessToken);
++  return {
++    name: body.shop.name,
++    currency: body.shop.currency,
++    timezone: body.shop.iana_timezone,
++    domain: body.shop.myshopify_domain,
++  };
++}
++
++interface ShopifyOrder {
++  id: number;
++  created_at: string;
++  cancelled_at: string | null;
++  total_price: string;
++  customer?: { orders_count?: number } | null;
++  refunds?: Array<{
++    created_at: string;
++    transactions?: Array<{ kind: string; status: string; amount: string }>;
++  }>;
++}
++
++function toMinor(value: string | undefined): number {
++  return Math.round(parseFloat(value ?? "0") * 100) || 0;
++}
++
++/**
++ * Fetches every order in the date range (paginated fully via Shopify's
++ * cursor-based `page_info` Link header) and aggregates into one ShopFacts
++ * bucket per day. Cancelled orders are excluded from every total — they
++ * were never a real sale. Refunds are attributed to the day the refund
++ * itself happened, not the original order date, so a refund issued today
++ * for an order placed last week shows up in today's numbers (matching how
++ * Shopify's own Analytics reports refunds).
++ *
++ * Known limitation: Shopify's Admin REST API has no store-traffic/session
++ * endpoint on any non-Plus plan (that needs the ShopifyQL Analytics API) —
++ * `sessions` is always 0 here. Conversion rate on the Shopify report page
++ * will read 0% as a result until a GA4/Search Console-style analytics
++ * connector is added.
++ */
++export async function fetchShopifyDailyFacts(
++  shopDomain: string,
++  accessToken: string,
++  range: { since: string; until: string },
++): Promise<Map<string, ShopFacts>> {
++  const byDate = new Map<string, ShopFacts>();
++  const emptyFacts = (): ShopFacts => ({
++    grossSalesMinor: 0,
++    netSalesMinor: 0,
++    refundsMinor: 0,
++    orders: 0,
++    sessions: 0,
++    newCustomers: 0,
++    returningCustomers: 0,
++  });
++
++  const createdMin = `${range.since}T00:00:00Z`;
++  const createdMax = `${range.until}T23:59:59Z`;
++  let pageInfo: string | null = null;
++  let first = true;
++
++  do {
++    const query = first
++      ? `status=any&created_at_min=${encodeURIComponent(createdMin)}&created_at_max=${encodeURIComponent(createdMax)}&limit=250&fields=id,created_at,cancelled_at,total_price,customer,refunds`
++      : `limit=250&page_info=${encodeURIComponent(pageInfo!)}`;
++    first = false;
++
++    const { body, linkHeader } = await shopifyFetch<{ orders: ShopifyOrder[] }>(
++      shopDomain,
++      `/orders.json?${query}`,
++      accessToken,
++    );
++
++    for (const order of body.orders) {
++      if (order.cancelled_at) continue;
++      const date = order.created_at.slice(0, 10);
++      const entry = byDate.get(date) ?? emptyFacts();
++
++      const total = toMinor(order.total_price);
++      entry.grossSalesMinor += total;
++      entry.netSalesMinor += total;
++      entry.orders += 1;
++
++      const lifetimeOrders = order.customer?.orders_count ?? 1;
++      if (lifetimeOrders <= 1) entry.newCustomers += 1;
++      else entry.returningCustomers += 1;
++
++      byDate.set(date, entry);
++
++      for (const refund of order.refunds ?? []) {
++        const refundDate = refund.created_at.slice(0, 10);
++        if (refundDate < range.since || refundDate > range.until) continue;
++        const refundAmount = (refund.transactions ?? [])
++          .filter((t) => t.kind === "refund" && t.status === "success")
++          .reduce((sum, t) => sum + toMinor(t.amount), 0);
++        if (refundAmount === 0) continue;
++        const refundEntry = byDate.get(refundDate) ?? emptyFacts();
++        refundEntry.refundsMinor += refundAmount;
++        refundEntry.netSalesMinor -= refundAmount;
++        byDate.set(refundDate, refundEntry);
++      }
++    }
++
++    pageInfo = nextPageInfo(linkHeader);
++  } while (pageInfo);
++
++  return byDate;
++}
+diff --git a/src/features/integrations/tiktok-live.ts b/src/features/integrations/tiktok-live.ts
+new file mode 100644
+index 0000000..e9a4b86
+--- /dev/null
++++ b/src/features/integrations/tiktok-live.ts
+@@ -0,0 +1,343 @@
++import "server-only";
++import { eq } from "drizzle-orm";
++import { getDb } from "@/lib/db";
++import { integrationSecrets } from "@/db/schema";
++import { decryptSecret, encryptSecret } from "@/lib/crypto";
++import { env, isDemoMode } from "@/lib/env";
++import { createTikTokProvider, refreshTikTokToken } from "./tiktok";
++import { ProviderAuthError, ProviderRateLimitError, type CampaignRecord, type ProviderCredentials } from "./types";
++import { sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
++import type { DateRange } from "@/features/metrics/queries";
++
++/**
++ * On-demand TikTok reporting — same "pull-on-demand, not synced" shape as
++ * meta-live.ts / google-ads-live.ts. Token handling is reactive rather
++ * than proactive (see tiktok.ts's file-level comment on why TikTok's
++ * token-lifetime model is genuinely uncertain from available docs): every
++ * call tries the stored access token first, and only exchanges the
++ * refresh token — then persists the result — if that first attempt comes
++ * back as an auth failure. Accounts with no refresh token on file (or no
++ * TIKTOK_APP_ID/SECRET configured to redeem one) just surface the auth
++ * error normally, same as every other provider's expired-credential path.
++ */
++
++interface CacheEntry<T> {
++  expires: number;
++  value: T;
++}
++const cache = new Map<string, CacheEntry<unknown>>();
++
++async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
++  const hit = cache.get(key);
++  const now = Date.now();
++  if (hit && hit.expires > now) return hit.value as T;
++  const value = await compute();
++  cache.set(key, { expires: now + ttlMs, value });
++  return value;
++}
++
++const INSIGHTS_TTL_MS = 60_000;
++const HEALTH_TTL_MS = 5 * 60_000;
++
++function reasonFor(e: unknown): string {
++  if (e instanceof ProviderAuthError) return e.message;
++  if (e instanceof ProviderRateLimitError) return "TikTok rate-limited this request — try again in a minute.";
++  if (e instanceof Error) return e.message;
++  return "Unknown error reaching TikTok.";
++}
++
++function logTikTokFailure(connectionLabel: string, e: unknown): void {
++  console.error(`[tiktok-live] ${connectionLabel}: ${reasonFor(e)}`, e);
++}
++
++export interface LiveCampaign {
++  id: string;
++  name: string;
++  status: string;
++  qualityRanking: string | null;
++  engagementRateRanking: string | null;
++  conversionRateRanking: string | null;
++  dailyBudgetMinor: number | null;
++  facts: AdFacts;
++}
++
++export interface TikTokFetchFailure {
++  displayName: string;
++  reason: string;
++}
++
++export interface LiveTikTokReport {
++  totals: AdFacts;
++  trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
++  campaigns: LiveCampaign[];
++  partialFailure: boolean;
++  failures: TikTokFetchFailure[];
++}
++
++interface StoredTikTokSecret {
++  accessToken: string;
++  refreshToken?: string;
++}
++
++async function resolveStoredSecret(connectionId: string): Promise<StoredTikTokSecret | null> {
++  const db = getDb();
++  const secret = await db.query.integrationSecrets.findFirst({
++    where: (s, { eq: eqOp }) => eqOp(s.connectionId, connectionId),
++  });
++  if (!secret?.encryptedPayload) return null;
++  return JSON.parse(decryptSecret(secret.encryptedPayload)) as StoredTikTokSecret;
++}
++
++async function refreshAndPersist(connectionId: string, refreshToken: string): Promise<string> {
++  const appId = env.TIKTOK_APP_ID;
++  const appSecret = env.TIKTOK_APP_SECRET;
++  if (!appId || !appSecret) {
++    throw new ProviderAuthError(
++      "TikTok token needs refreshing but TIKTOK_APP_ID/TIKTOK_APP_SECRET aren't configured — reconnect in Settings.",
++    );
++  }
++  const result = await refreshTikTokToken(appId, appSecret, refreshToken);
++  const db = getDb();
++  await db
++    .update(integrationSecrets)
++    .set({
++      encryptedPayload: encryptSecret(
++        JSON.stringify({ accessToken: result.accessToken, refreshToken: result.refreshToken }),
++      ),
++      rotatedAt: new Date(),
++    })
++    .where(eq(integrationSecrets.connectionId, connectionId));
++  return result.accessToken;
++}
++
++/**
++ * Resolves credentials and runs `fn`, retrying exactly once with a
++ * refreshed access token if the first attempt fails with an auth error and
++ * a refresh token is on file. Successful refreshes are persisted so the
++ * NEXT call doesn't need to refresh again.
++ */
++async function withCreds<T>(
++  connection: { id: string; displayName: string; currencyCode: string | null },
++  fn: (creds: ProviderCredentials) => Promise<T>,
++): Promise<T> {
++  const stored = await resolveStoredSecret(connection.id);
++  if (!stored) {
++    throw new Error("No access token available for this account — connect it in Settings.");
++  }
++  const extra = { currency: connection.currencyCode ?? "USD" };
++  try {
++    return await fn({ accessToken: stored.accessToken, extra });
++  } catch (e) {
++    if (e instanceof ProviderAuthError && stored.refreshToken) {
++      const freshAccessToken = await refreshAndPersist(connection.id, stored.refreshToken);
++      return await fn({ accessToken: freshAccessToken, extra });
++    }
++    throw e;
++  }
++}
++
++interface ConnectionReport {
++  campaigns: LiveCampaign[];
++  trend: Array<{ date: string; spendMinor: number; revenueMinor: number }>;
++}
++
++async function fetchConnectionReport(
++  creds: ProviderCredentials,
++  accountId: string,
++  range: DateRange,
++): Promise<ConnectionReport> {
++  const provider = createTikTokProvider();
++
++  const campaignById = new Map<string, CampaignRecord>();
++  let campaignCursor: string | undefined;
++  do {
++    const page = await provider.listCampaigns(creds, accountId, campaignCursor);
++    for (const c of page.items) campaignById.set(c.externalId, c);
++    campaignCursor = page.nextCursor;
++  } while (campaignCursor);
++
++  const dailyByCampaign = new Map<string, AdFacts[]>();
++  const dailyTotals = new Map<string, { spendMinor: number; revenueMinor: number }>();
++  let insightCursor: string | undefined;
++  do {
++    const page = await provider.getDailyInsights(creds, accountId, range, insightCursor);
++    for (const row of page.items) {
++      const list = dailyByCampaign.get(row.campaignExternalId) ?? [];
++      list.push(row);
++      dailyByCampaign.set(row.campaignExternalId, list);
++
++      const t = dailyTotals.get(row.date) ?? { spendMinor: 0, revenueMinor: 0 };
++      t.spendMinor += row.spendMinor;
++      t.revenueMinor += row.revenueMinor;
++      dailyTotals.set(row.date, t);
++    }
++    insightCursor = page.nextCursor;
++  } while (insightCursor);
++
++  const campaigns: LiveCampaign[] = [...campaignById.values()].map((c) => ({
++    id: c.externalId,
++    name: c.name,
++    status: c.status,
++    qualityRanking: null,
++    engagementRateRanking: null,
++    conversionRateRanking: null,
++    dailyBudgetMinor: c.dailyBudgetMinor ?? null,
++    facts: sumAdFacts(dailyByCampaign.get(c.externalId) ?? []),
++  }));
++
++  const trend = [...dailyTotals.entries()]
++    .map(([date, v]) => ({ date, ...v }))
++    .sort((a, b) => a.date.localeCompare(b.date));
++
++  return { campaigns, trend };
++}
++
++/** Live report for every active TikTok connection under a workspace —
++ *  mirrors getLiveMetaReport / getLiveGoogleAdsReport. */
++export async function getLiveTikTokReport(workspaceId: string, range: DateRange): Promise<LiveTikTokReport> {
++  const empty: LiveTikTokReport = {
++    totals: sumAdFacts([]),
++    trend: [],
++    campaigns: [],
++    partialFailure: false,
++    failures: [],
++  };
++  if (isDemoMode) return empty;
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "tiktok"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return empty;
++
++  const failures: TikTokFetchFailure[] = [];
++
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      try {
++        const cacheKey = `tiktok:${connection.id}:${range.since}:${range.until}`;
++        return await cached(cacheKey, INSIGHTS_TTL_MS, () =>
++          withCreds(connection, (creds) => fetchConnectionReport(creds, connection.externalAccountId, range)),
++        );
++      } catch (e) {
++        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
++        logTikTokFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++
++  const reports = perConnection.filter((r): r is ConnectionReport => r !== null);
++  const campaigns = reports.flatMap((r) => r.campaigns);
++
++  const trendMap = new Map<string, { spendMinor: number; revenueMinor: number }>();
++  for (const r of reports) {
++    for (const t of r.trend) {
++      const e = trendMap.get(t.date) ?? { spendMinor: 0, revenueMinor: 0 };
++      e.spendMinor += t.spendMinor;
++      e.revenueMinor += t.revenueMinor;
++      trendMap.set(t.date, e);
++    }
++  }
++  const trend = [...trendMap.entries()]
++    .map(([date, v]) => ({ date, ...v }))
++    .sort((a, b) => a.date.localeCompare(b.date));
++
++  const totals = sumAdFacts(campaigns.map((c) => c.facts));
++
++  return { totals, trend, campaigns, partialFailure: failures.length > 0, failures };
++}
++
++export interface PacingResult {
++  activeDailyBudgetMinor: number;
++  spendTodayMinor: number;
++  partialFailure: boolean;
++}
++
++/** "Pacing" for today — mirrors getMetaPacing/getGoogleAdsPacing. Note
++ *  many TikTok campaigns manage budget at the ad-group level (see
++ *  tiktok.ts's dailyBudgetMinor mapping), so activeDailyBudgetMinor can
++ *  legitimately read 0 even with active, spending campaigns. */
++export async function getTikTokPacing(workspaceId: string): Promise<PacingResult> {
++  const empty: PacingResult = { activeDailyBudgetMinor: 0, spendTodayMinor: 0, partialFailure: false };
++  if (isDemoMode) return empty;
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "tiktok"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return empty;
++
++  const todayIso = new Date().toISOString().slice(0, 10);
++  const range: DateRange = { since: todayIso, until: todayIso };
++  let partialFailure = false;
++
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      try {
++        const cacheKey = `tiktok-pacing:${connection.id}:${todayIso}`;
++        return await cached(cacheKey, INSIGHTS_TTL_MS, () =>
++          withCreds(connection, (creds) => fetchConnectionReport(creds, connection.externalAccountId, range)),
++        );
++      } catch (e) {
++        partialFailure = true;
++        logTikTokFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++
++  const reports = perConnection.filter((r): r is ConnectionReport => r !== null);
++  const allCampaigns = reports.flatMap((r) => r.campaigns);
++  const activeDailyBudgetMinor = allCampaigns
++    .filter((c) => c.status === "active")
++    .reduce((sum, c) => sum + (c.dailyBudgetMinor ?? 0), 0);
++  const spendTodayMinor = allCampaigns.reduce((sum, c) => sum + c.facts.spendMinor, 0);
++
++  return { activeDailyBudgetMinor, spendTodayMinor, partialFailure };
++}
++
++export type AccountHealth = "live" | "idle" | "no_access";
++
++export interface AccountHealthResult {
++  connectionId: string;
++  displayName: string;
++  health: AccountHealth;
++}
++
++/** Cheap per-account health probe — mirrors checkMetaAccountsHealth. */
++export async function checkTikTokAccountsHealth(workspaceId: string): Promise<AccountHealthResult[]> {
++  if (isDemoMode) return [];
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) => andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "tiktok")),
++  });
++  if (connections.length === 0) return [];
++
++  const provider = createTikTokProvider();
++  const since = new Date();
++  since.setDate(since.getDate() - 6);
++  const range: DateRange = { since: since.toISOString().slice(0, 10), until: new Date().toISOString().slice(0, 10) };
++
++  return Promise.all(
++    connections.map(async (connection) => {
++      const cacheKey = `tiktok-health:${connection.id}`;
++      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
++        try {
++          const page = await withCreds(connection, (creds) =>
++            provider.getDailyInsights(creds, connection.externalAccountId, range),
++          );
++          const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
++          return spend > 0 ? "live" : "idle";
++        } catch (e) {
++          logTikTokFailure(connection.displayName, e);
++          return "no_access";
++        }
++      });
++      return { connectionId: connection.id, displayName: connection.displayName, health };
++    }),
++  );
++}
+diff --git a/src/features/integrations/tiktok.ts b/src/features/integrations/tiktok.ts
+new file mode 100644
+index 0000000..0bb381a
+--- /dev/null
++++ b/src/features/integrations/tiktok.ts
+@@ -0,0 +1,381 @@
++import type {
++  AdsProvider,
++  CampaignRecord,
++  DailyInsightRecord,
++  PageResult,
++  ProviderCredentials,
++} from "./types";
++import { ProviderAuthError, ProviderRateLimitError } from "./types";
++
++/**
++ * Live TikTok Marketing API client (Business API v1.3). Called only by
++ * live-pull code (tiktok-live.ts) and the OAuth callback with decrypted
++ * credentials — never from client-facing code.
++ *
++ * Built from TikTok's published v1.3 docs and consistent patterns across
++ * third-party integration guides, NOT tested against a live account —
++ * nobody has a TikTok for Business developer app approved yet (app review
++ * is pending, same as Google Ads' developer token). Two things worth
++ * flagging if a real account surfaces a mismatch:
++ *
++ * 1. Response envelope: every TikTok Business API response is HTTP 200
++ *    with `{code, message, data, request_id}` — code 0 means success,
++ *    anything else is an API-level error REGARDLESS of HTTP status. This
++ *    client checks both the transport status and the envelope code, since
++ *    sources disagree on which failures surface at which layer.
++ * 2. Token lifetime: some TikTok docs describe a 24h access token + 1yr
++ *    refresh token (mirroring the consumer Login Kit OAuth at
++ *    open.tiktokapis.com); others describe the Business API's own token as
++ *    longer-lived with no mandatory refresh. This client stores whatever
++ *    the token exchange actually returns (access + refresh, if present)
++ *    and only attempts a refresh reactively — when a call comes back with
++ *    an auth error AND a refresh token is on file — rather than assuming
++ *    either model up front.
++ */
++
++const API_BASE = "https://business-api.tiktok.com/open_api/v1.3";
++const TOKEN_URL = `${API_BASE}/oauth2/access_token/`;
++
++interface TikTokEnvelope<T> {
++  code: number;
++  message: string;
++  data: T;
++  request_id?: string;
++}
++
++/** code 0 = success. Everything else is an API-level error even though
++ *  TikTok answers with HTTP 200 — never trust res.ok alone here. No
++ *  specific numeric code is confirmed as "auth failure" from available
++ *  docs (one confirmed example: message "The access token is invalid or
++ *  not found in the request."), so this classifies by message text rather
++ *  than citing exact codes that might be wrong. */
++function isAuthError(_code: number, message: string): boolean {
++  const m = message.toLowerCase();
++  return (
++    m.includes("access token") ||
++    m.includes("access_token") ||
++    (m.includes("auth") && (m.includes("invalid") || m.includes("expired") || m.includes("not found")))
++  );
++}
++
++/** No specific rate-limit code is confirmed for this API from available
++ *  docs, so this intentionally goes by message text only rather than a
++ *  guessed numeric code that might be wrong. */
++function isRateLimitError(_code: number, message: string): boolean {
++  const m = message.toLowerCase();
++  return m.includes("rate limit") || m.includes("too many requests") || m.includes("qps");
++}
++
++async function tiktokFetch<T>(
++  path: string,
++  accessToken: string,
++  init?: { method?: "GET" | "POST"; query?: Record<string, string>; body?: unknown },
++): Promise<T> {
++  let url = `${API_BASE}${path}`;
++  if (init?.query) {
++    const qs = new URLSearchParams(init.query).toString();
++    url += `?${qs}`;
++  }
++  const res = await fetch(url, {
++    method: init?.method ?? "GET",
++    headers: {
++      "Access-Token": accessToken,
++      "Content-Type": "application/json",
++    },
++    body: init?.body ? JSON.stringify(init.body) : undefined,
++  });
++
++  if (res.status === 401 || res.status === 403) {
++    throw new ProviderAuthError("TikTok rejected the access token");
++  }
++  if (res.status === 429) throw new ProviderRateLimitError(60);
++
++  const envelope = (await res.json().catch(() => null)) as TikTokEnvelope<T> | null;
++  if (!envelope || typeof envelope.code !== "number") {
++    if (!res.ok) throw new Error(`TikTok API error: HTTP ${res.status}`);
++    throw new Error("TikTok API returned an unexpected response shape");
++  }
++  if (envelope.code !== 0) {
++    if (isAuthError(envelope.code, envelope.message)) {
++      throw new ProviderAuthError(`TikTok rejected the request: ${envelope.message}`);
++    }
++    if (isRateLimitError(envelope.code, envelope.message)) {
++      throw new ProviderRateLimitError(60);
++    }
++    throw new Error(`TikTok API error (${envelope.code}): ${envelope.message}`);
++  }
++  return envelope.data;
++}
++
++export interface TikTokTokenResult {
++  accessToken: string;
++  refreshToken?: string;
++  advertiserIds: string[];
++}
++
++/**
++ * Exchanges an authorization code (from the /portal/auth redirect) for an
++ * access token. Uses app_id/secret/auth_code field names per TikTok's
++ * Business API convention — deliberately NOT the generic OAuth2
++ * client_id/client_secret/code naming Google/Meta use.
++ */
++export async function exchangeAuthCode(
++  appId: string,
++  appSecret: string,
++  authCode: string,
++): Promise<TikTokTokenResult> {
++  const res = await fetch(TOKEN_URL, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ app_id: appId, secret: appSecret, auth_code: authCode }),
++  });
++  const envelope = (await res.json().catch(() => null)) as TikTokEnvelope<{
++    access_token?: string;
++    refresh_token?: string;
++    advertiser_ids?: string[];
++  }> | null;
++  if (!envelope || envelope.code !== 0 || !envelope.data.access_token) {
++    throw new ProviderAuthError(
++      envelope?.message ?? "TikTok rejected the authorization code — try connecting again.",
++    );
++  }
++  return {
++    accessToken: envelope.data.access_token,
++    refreshToken: envelope.data.refresh_token,
++    advertiserIds: envelope.data.advertiser_ids ?? [],
++  };
++}
++
++/**
++ * Best-effort refresh — attempted reactively (see the file-level doc
++ * comment on token-lifetime uncertainty), never assumed to be required.
++ * Mirrors exchangeAuthCode's request shape with grant_type added, the
++ * closest documented pattern for this endpoint's refresh behavior.
++ */
++export async function refreshTikTokToken(
++  appId: string,
++  appSecret: string,
++  refreshToken: string,
++): Promise<TikTokTokenResult> {
++  const res = await fetch(TOKEN_URL, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({
++      app_id: appId,
++      secret: appSecret,
++      refresh_token: refreshToken,
++      grant_type: "refresh_token",
++    }),
++  });
++  const envelope = (await res.json().catch(() => null)) as TikTokEnvelope<{
++    access_token?: string;
++    refresh_token?: string;
++    advertiser_ids?: string[];
++  }> | null;
++  if (!envelope || envelope.code !== 0 || !envelope.data.access_token) {
++    throw new ProviderAuthError(
++      envelope?.message ?? "TikTok rejected the refresh token — reconnect in Settings.",
++    );
++  }
++  return {
++    accessToken: envelope.data.access_token,
++    refreshToken: envelope.data.refresh_token ?? refreshToken,
++    advertiserIds: envelope.data.advertiser_ids ?? [],
++  };
++}
++
++/**
++ * Lists advertiser accounts a PASTED access token can reach — lets an
++ * admin connect TikTok the same low-friction way as Meta's "paste a
++ * token" flow and Shopify's custom-app token, without running the OAuth
++ * redirect dance at all. app_id/secret identify which app issued the
++ * token; TikTok requires both alongside the token itself for this lookup.
++ */
++export async function fetchAuthorizedAdvertiserIds(
++  accessToken: string,
++  appId: string,
++  appSecret: string,
++): Promise<string[]> {
++  // Docs for this specific endpoint show app_id/secret/Access_Token as
++  // query params (unlike every other endpoint, which reads the token from
++  // the Access-Token header) — sent both ways here since third-party
++  // sources aren't fully consistent on which one this endpoint actually
++  // reads, and sending both costs nothing.
++  const data = await tiktokFetch<{ list?: Array<{ advertiser_id: string }> }>(
++    "/oauth2/advertiser/get/",
++    accessToken,
++    { query: { app_id: appId, secret: appSecret, Access_Token: accessToken } },
++  );
++  return (data.list ?? []).map((a) => a.advertiser_id);
++}
++
++export interface AdvertiserInfo {
++  advertiserId: string;
++  name: string;
++  currency: string;
++  timezone: string;
++}
++
++/** Token exchange only returns advertiser IDs — this fills in the
++ *  name/currency/timezone needed to create a connection. */
++export async function fetchAdvertiserInfo(
++  accessToken: string,
++  advertiserIds: string[],
++): Promise<AdvertiserInfo[]> {
++  if (advertiserIds.length === 0) return [];
++  const data = await tiktokFetch<{
++    list?: Array<{ advertiser_id: string; name: string; currency: string; timezone: string }>;
++  }>("/advertiser/info/", accessToken, {
++    query: { advertiser_ids: JSON.stringify(advertiserIds) },
++  });
++  return (data.list ?? []).map((a) => ({
++    advertiserId: a.advertiser_id,
++    name: a.name,
++    currency: a.currency,
++    timezone: a.timezone,
++  }));
++}
++
++function mapCampaignStatus(s: string | undefined): CampaignRecord["status"] {
++  if (s === "ENABLE") return "active";
++  if (s === "DISABLE") return "paused";
++  if (s === "DELETE" || s === "REMOVE") return "deleted";
++  return "archived";
++}
++
++interface TikTokCampaignRow {
++  campaign_id: string;
++  campaign_name: string;
++  operation_status?: string;
++  objective_type?: string;
++  budget?: number;
++  budget_mode?: string;
++}
++
++interface TikTokPageInfo {
++  page: number;
++  page_size: number;
++  total_number: number;
++  total_page: number;
++}
++
++export function createTikTokProvider(): AdsProvider {
++  return {
++    key: "tiktok",
++
++    async listCampaigns(
++      creds: ProviderCredentials,
++      accountId: string,
++      cursor?: string,
++    ): Promise<PageResult<CampaignRecord>> {
++      const page = cursor ? parseInt(cursor, 10) || 1 : 1;
++      const data = await tiktokFetch<{ list?: TikTokCampaignRow[]; page_info?: TikTokPageInfo }>(
++        "/campaign/get/",
++        creds.accessToken,
++        { query: { advertiser_id: accountId, page: String(page), page_size: "200" } },
++      );
++      const items: CampaignRecord[] = (data.list ?? []).map((c) => ({
++        externalId: c.campaign_id,
++        name: c.campaign_name,
++        status: mapCampaignStatus(c.operation_status),
++        objective: c.objective_type,
++        // Many TikTok campaigns manage budget at the ad-group level, not
++        // the campaign level — only BUDGET_MODE_DAY has a meaningful daily
++        // figure here; BUDGET_MODE_TOTAL is a lifetime number (would be
++        // misleading shown as "daily"), BUDGET_MODE_INFINITE has none.
++        dailyBudgetMinor:
++          c.budget_mode === "BUDGET_MODE_DAY" && typeof c.budget === "number"
++            ? Math.round(c.budget * 100)
++            : undefined,
++        currencyCode: creds.extra?.currency ?? "USD",
++      }));
++      const info = data.page_info;
++      const nextCursor = info && info.page < info.total_page ? String(info.page + 1) : undefined;
++      return { items, nextCursor };
++    },
++
++    async getDailyInsights(
++      creds: ProviderCredentials,
++      accountId: string,
++      range: { since: string; until: string },
++      cursor?: string,
++    ): Promise<PageResult<DailyInsightRecord>> {
++      if (!/^\d{4}-\d{2}-\d{2}$/.test(range.since) || !/^\d{4}-\d{2}-\d{2}$/.test(range.until)) {
++        throw new Error(`Invalid date range for TikTok report: "${range.since}" .. "${range.until}"`);
++      }
++      const page = cursor ? parseInt(cursor, 10) || 1 : 1;
++      const metrics = [
++        "spend",
++        "impressions",
++        "clicks",
++        "reach",
++        "conversion",
++        "video_play_actions",
++        "video_watched_2s",
++      ];
++      const data = await tiktokFetch<{
++        list?: Array<{
++          dimensions: { campaign_id: string; stat_time_day: string };
++          metrics: Record<string, string>;
++        }>;
++        page_info?: TikTokPageInfo;
++      }>("/report/integrated/get/", creds.accessToken, {
++        query: {
++          advertiser_id: accountId,
++          report_type: "BASIC",
++          data_level: "AUCTION_CAMPAIGN",
++          dimensions: JSON.stringify(["campaign_id", "stat_time_day"]),
++          metrics: JSON.stringify(metrics),
++          start_date: range.since,
++          end_date: range.until,
++          page: String(page),
++          page_size: "200",
++        },
++      });
++
++      const currency = creds.extra?.currency ?? "USD";
++      const items: DailyInsightRecord[] = (data.list ?? []).map((row) => {
++        const m = row.metrics;
++        const num = (key: string) => parseFloat(m[key] ?? "0") || 0;
++        const videoViews = num("video_play_actions");
++        return {
++          campaignExternalId: row.dimensions.campaign_id,
++          date: row.dimensions.stat_time_day.slice(0, 10),
++          currencyCode: currency,
++          spendMinor: Math.round(num("spend") * 100),
++          // TikTok's BASIC report has no direct "attributed revenue"
++          // metric without a connected pixel/catalog reporting "value" —
++          // left at 0 pending that setup, same documented-gap treatment as
++          // Google Ads' funnel-breakdown fields below.
++          revenueMinor: 0,
++          impressions: Math.round(num("impressions")),
++          clicks: Math.round(num("clicks")),
++          purchases: Math.round(num("conversion")),
++          reach: Math.round(num("reach")),
++          videoViews3s: Math.round(num("video_watched_2s")), // closest available bucket to a 3s view
++          videoPlays: Math.round(videoViews),
++          inlineLinkClicks: 0,
++          outboundClicks: 0,
++          uniqueClicks: 0,
++          landingPageViews: 0,
++          pageEngagements: 0,
++          videoThruplays: 0,
++          videoP50: 0,
++          videoP75: 0,
++          videoP100: 0,
++          viewContent: 0,
++          addToCart: 0,
++          initiateCheckout: 0,
++          addPaymentInfo: 0,
++          leads: 0,
++        };
++      });
++      const info = data.page_info;
++      const nextCursor = info && info.page < info.total_page ? String(info.page + 1) : undefined;
++      return { items, nextCursor };
++    },
++
++    // No getRankings — TikTok has no per-campaign quality/engagement/
++    // conversion ranking concept analogous to Meta's.
++  };
++}
+diff --git a/src/features/overview/report.tsx b/src/features/overview/report.tsx
+index db2873c..41a09c2 100644
+--- a/src/features/overview/report.tsx
++++ b/src/features/overview/report.tsx
+@@ -9,13 +9,20 @@ import {
+   type DateRange,
+   type RangePreset,
+ } from "@/features/metrics/queries";
+-import { getLiveMetaReport } from "@/features/integrations/meta-live";
++import {
++  getLiveAdsReport,
++  adsReportFromRows,
++  AD_PROVIDER_KEYS,
++  AD_PROVIDER_LABELS,
++  type LiveAdsReport,
++} from "@/features/integrations/live-ads";
++import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
+ import {
+   adMetrics,
+   blendedMetrics,
+   shopMetrics,
+-  sumAdFacts,
+   sumShopFacts,
++  type ShopFacts,
+ } from "@/lib/metrics/definitions";
+ import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
+ import { isDemoMode } from "@/lib/env";
+@@ -51,31 +58,52 @@ export async function OverviewReport({
+   const rangeLabel = formatRangeLabel(range, preset);
+   const prevRange = previousPeriod(range);
+ 
+-  // Meta is pulled live (see features/integrations/meta-live.ts) — nothing
+-  // syncs it to the database anymore, so the database query here only
+-  // covers Google/TikTok in live mode. Demo mode keeps its old all-three
+-  // behaviour since there's no live Meta connection to speak of.
+-  const dbAdProviders = isDemoMode
+-    ? (["meta", "google_ads", "tiktok"] as const)
+-    : (["google_ads", "tiktok"] as const);
++  // Meta/Google Ads/TikTok/Shopify are all pulled live now (see
++  // features/integrations/*-live.ts) — nothing syncs to the database
++  // anymore. Demo mode keeps reading the deterministic generator for both,
++  // reshaped into the same {totals, trend, byProvider} structure via
++  // adsReportFromRows so everything below reads one shape either way.
++  let ads: LiveAdsReport;
++  let adsPrev: LiveAdsReport;
++  let shop: Array<ShopFacts & { date: string }>;
++  let prevShop: Array<ShopFacts & { date: string }>;
++  let shopFailures: Array<{ displayName: string; reason: string }> = [];
+ 
+-  const [dbAds, shop, prevDbAds, prevShop, metaCurrent, metaPrevious] = await Promise.all([
+-    getAdDaily(workspaceId, range, [...dbAdProviders]),
+-    getShopDaily(workspaceId, range),
+-    getAdDaily(workspaceId, prevRange, [...dbAdProviders]),
+-    getShopDaily(workspaceId, prevRange),
+-    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, range),
+-    isDemoMode ? Promise.resolve(null) : getLiveMetaReport(workspaceId, prevRange),
+-  ]);
++  if (!isDemoMode) {
++    const [adsCurrent, adsPrevious, shopCurrent, shopPrevious] = await Promise.all([
++      getLiveAdsReport(workspaceId, range),
++      getLiveAdsReport(workspaceId, prevRange),
++      getLiveShopifyReport(workspaceId, range),
++      getLiveShopifyReport(workspaceId, prevRange),
++    ]);
++    ads = adsCurrent;
++    adsPrev = adsPrevious;
++    shop = shopCurrent.rows;
++    prevShop = shopPrevious.rows;
++    shopFailures = shopCurrent.failures;
++  } else {
++    const [dbAds, prevDbAds, shopRows, prevShopRows] = await Promise.all([
++      getAdDaily(workspaceId, range, [...AD_PROVIDER_KEYS]),
++      getAdDaily(workspaceId, prevRange, [...AD_PROVIDER_KEYS]),
++      getShopDaily(workspaceId, range),
++      getShopDaily(workspaceId, prevRange),
++    ]);
++    ads = adsReportFromRows(dbAds);
++    adsPrev = adsReportFromRows(prevDbAds);
++    shop = shopRows;
++    prevShop = prevShopRows;
++  }
+ 
+-  // dbAds keeps its per-row shape (date + provider) for the trend chart and
+-  // the per-channel breakdown below; metaCurrent/metaPrevious carry Meta's
+-  // live totals separately since they don't have that per-row shape.
+-  const metaFailures = metaCurrent?.failures ?? [];
++  // ads.failures already carry a `provider` tag (see live-ads.ts) — merged
++  // with Shopify's own failures for one combined banner below.
++  const allFailures = [
++    ...ads.failures.map((f) => ({ channel: AD_PROVIDER_LABELS[f.provider], displayName: f.displayName, reason: f.reason })),
++    ...shopFailures.map((f) => ({ channel: "Shopify", displayName: f.displayName, reason: f.reason })),
++  ];
+ 
+-  const a = sumAdFacts(metaCurrent ? [sumAdFacts(dbAds), metaCurrent.totals] : dbAds);
++  const a = ads.totals;
+   const s = sumShopFacts(shop);
+-  const pa = sumAdFacts(metaPrevious ? [sumAdFacts(prevDbAds), metaPrevious.totals] : prevDbAds);
++  const pa = adsPrev.totals;
+   const ps = sumShopFacts(prevShop);
+ 
+   const deltaOf = (curr: number, prev: number) =>
+@@ -114,25 +142,18 @@ export async function OverviewReport({
+     { label: "Returning share", value: formatPercent(shopMetrics.returningShare(s)), delta: deltaOf(shopMetrics.returningShare(s), shopMetrics.returningShare(ps)), info: "What percentage of your customers this period had bought from you before — a sign of loyalty." },
+   ];
+ 
+-  // Merge ads spend + shop revenue into one daily trend. Google/TikTok come
+-  // from dbAds (per-row, has a date); Meta's live trend is a separate array
+-  // with the same {date, spendMinor} shape, merged in alongside it.
++  // Merge ads spend + shop revenue into one daily trend. ads.trend is
++  // already merged across all three ad channels (see live-ads.ts /
++  // adsReportFromRows above).
+   const byDate = new Map<string, { date: string; revenue: number; spend: number }>();
+   for (const row of shop) {
+     byDate.set(row.date, { date: row.date, revenue: row.netSalesMinor, spend: 0 });
+   }
+-  for (const row of dbAds) {
++  for (const row of ads.trend) {
+     const entry = byDate.get(row.date) ?? { date: row.date, revenue: 0, spend: 0 };
+     entry.spend += row.spendMinor;
+     byDate.set(row.date, entry);
+   }
+-  if (metaCurrent) {
+-    for (const row of metaCurrent.trend) {
+-      const entry = byDate.get(row.date) ?? { date: row.date, revenue: 0, spend: 0 };
+-      entry.spend += row.spendMinor;
+-      byDate.set(row.date, entry);
+-    }
+-  }
+   const trend = [...byDate.values()].sort((x, y) => x.date.localeCompare(y.date));
+   const ordersTrend = shop.map((r) => ({ date: r.date, orders: r.orders }));
+ 
+@@ -140,13 +161,20 @@ export async function OverviewReport({
+ 
+   return (
+     <>
+-      {metaFailures.length > 0 ? (
++      {allFailures.length > 0 ? (
+         <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
+           <p>
+-            Meta numbers below may be incomplete — couldn&apos;t reach{" "}
+-            {metaFailures.length === 1 ? "1 connected Meta account" : `${metaFailures.length} connected Meta accounts`}{" "}
+-            just now. Check Settings or the Meta Ads page for details.
++            Numbers below may be incomplete — couldn&apos;t reach{" "}
++            {allFailures.length === 1 ? "1 connected account" : `${allFailures.length} connected accounts`} just
++            now. This report is pulled live on every page view, so refreshing may resolve it.
+           </p>
++          <ul className="mt-1 list-inside list-disc space-y-0.5">
++            {allFailures.map((f, i) => (
++              <li key={`${f.channel}-${f.displayName}-${i}`}>
++                <span className="font-medium">{f.channel} · {f.displayName}:</span> {f.reason}
++              </li>
++            ))}
++          </ul>
+         </div>
+       ) : null}
+ 
+@@ -232,13 +260,8 @@ export async function OverviewReport({
+         <Card>
+           <CardHeader title="Channel efficiency" subtitle={rangeLabel} />
+           <div className="space-y-3 px-5 pb-5 pt-2">
+-            {(["meta", "google_ads", "tiktok"] as const).map((provider) => {
+-              // Meta no longer has rows in dbAds (it's pulled live) — use
+-              // its live totals directly instead of filtering for it.
+-              const totals =
+-                provider === "meta"
+-                  ? (metaCurrent?.totals ?? sumAdFacts([]))
+-                  : sumAdFacts(dbAds.filter((r) => r.provider === provider));
++            {AD_PROVIDER_KEYS.map((provider) => {
++              const totals = ads.byProvider[provider].totals;
+               const roas = adMetrics.roas(totals);
+               return (
+                 <div
+diff --git a/src/features/shopify/report.tsx b/src/features/shopify/report.tsx
+index a14cea6..8070a5c 100644
+--- a/src/features/shopify/report.tsx
++++ b/src/features/shopify/report.tsx
+@@ -8,8 +8,10 @@ import {
+   type DateRange,
+   type RangePreset,
+ } from "@/features/metrics/queries";
++import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
+ import { shopMetrics, sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
+ import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
++import { isDemoMode } from "@/lib/env";
+ 
+ /**
+  * The read-only Shopify report body — KPI grid + sales/customer charts —
+@@ -27,10 +29,37 @@ export async function ShopifyReport({
+   preset: RangePreset;
+ }) {
+   const rangeLabel = formatRangeLabel(range, preset);
+-  const [rows, prevRows] = await Promise.all([
+-    getShopDaily(workspaceId, range),
+-    getShopDaily(workspaceId, previousPeriod(range)),
+-  ]);
++  const prevRange = previousPeriod(range);
++
++  // Shopify is pulled live now (see features/integrations/shopify-live.ts)
++  // — nothing syncs orders to the database anymore, same "pull-on-demand"
++  // shape as Meta/Google Ads/TikTok. Demo mode keeps reading the
++  // deterministic generator via getShopDaily since there's no real store
++  // connected to pull from.
++  let rows: Array<ShopFacts & { date: string }>;
++  let prevRows: Array<ShopFacts & { date: string }>;
++  let partialFailure = false;
++  let failures: Array<{ displayName: string; reason: string }> = [];
++
++  if (!isDemoMode) {
++    const [current, previous] = await Promise.all([
++      getLiveShopifyReport(workspaceId, range),
++      getLiveShopifyReport(workspaceId, prevRange),
++    ]);
++    rows = current.rows;
++    prevRows = previous.rows;
++    partialFailure = current.partialFailure || previous.partialFailure;
++    // Current-range failures are the most relevant to show — the previous-
++    // period pull uses the same connections/credentials, so its failures
++    // would just be duplicates for the same underlying reason.
++    failures = current.failures;
++  } else {
++    [rows, prevRows] = await Promise.all([
++      getShopDaily(workspaceId, range),
++      getShopDaily(workspaceId, prevRange),
++    ]);
++  }
++
+   const totals = sumShopFacts(rows);
+   const prev = sumShopFacts(prevRows);
+   const deltaOf = (c: number, p: number) => (p > 0 ? (c - p) / p : 0);
+@@ -68,6 +97,25 @@ export async function ShopifyReport({
+ 
+   return (
+     <>
++      {partialFailure ? (
++        <div className="rounded-lg border border-negative/30 bg-negative/10 px-4 py-2.5 text-xs text-negative">
++          <p>
++            Couldn&apos;t reach {failures.length === 1 ? "one connected store" : `${failures.length || "one or more"} connected store(s)`} just
++            now — numbers below may be incomplete. This report is pulled live on every page view,
++            so refreshing may resolve it.
++          </p>
++          {failures.length > 0 ? (
++            <ul className="mt-1 list-inside list-disc space-y-0.5">
++              {failures.map((f, i) => (
++                <li key={`${f.displayName}-${i}`}>
++                  <span className="font-medium">{f.displayName}:</span> {f.reason}
++                </li>
++              ))}
++            </ul>
++          ) : null}
++        </div>
++      ) : null}
++
+       <div>
+         <p className="mb-2 text-xs font-medium uppercase tracking-widest text-muted">
+           {rangeLabel} · vs previous period · hover the ⓘ on any card for a plain-English explanation
+diff --git a/src/lib/env.ts b/src/lib/env.ts
+index 6bb669c..10f21b0 100644
+--- a/src/lib/env.ts
++++ b/src/lib/env.ts
+@@ -18,6 +18,38 @@ const serverSchema = z.object({
+   META_USER_TOKEN: z.string().min(20).optional(),
+   META_APP_ID: z.string().min(1).optional(),
+   META_APP_SECRET: z.string().min(1).optional(),
++  /** HMAC secret Shopify signs webhook payloads with — set per the app's
++   *  webhook config in the Shopify Partner dashboard (or a custom app's
++   *  webhook settings). Read directly by the webhook route too; declared
++   *  here as well so it's validated/discoverable alongside every other key. */
++  SHOPIFY_WEBHOOK_SECRET: z.string().min(1).optional(),
++  /** Google Ads OAuth client (Google Cloud Console → APIs & Services →
++   *  Credentials → OAuth client ID, type "Web application"). Required for
++   *  the /api/integrations/google_ads/start|callback OAuth flow. */
++  GOOGLE_ADS_CLIENT_ID: z.string().min(1).optional(),
++  GOOGLE_ADS_CLIENT_SECRET: z.string().min(1).optional(),
++  /** Agency-wide developer token from a Google Ads Manager (MCC) account's
++   *  API Center — gates every Google Ads API call regardless of which
++   *  client's refresh token is used, same role META_USER_TOKEN plays for
++   *  Meta's agency-wide path. */
++  GOOGLE_ADS_DEVELOPER_TOKEN: z.string().min(1).optional(),
++  /** The MCC manager account's customer id (digits only, no dashes) — sent
++   *  as the login-customer-id header so the API knows which manager account
++   *  is acting on behalf of a linked client account. */
++  GOOGLE_ADS_LOGIN_CUSTOMER_ID: z.string().min(1).optional(),
++  /** One agency-wide OAuth refresh token, minted once (e.g. via Google's
++   *  OAuth 2.0 Playground authorizing the adwords scope, or by running this
++   *  app's own /api/integrations/google_ads/start flow once and copying the
++   *  refresh_token it receives). Lets the agency list and connect every
++   *  client account linked under GOOGLE_ADS_LOGIN_CUSTOMER_ID's MCC without
++   *  a separate OAuth consent per client — same role META_USER_TOKEN plays
++   *  for Meta's agency-wide path. */
++  GOOGLE_ADS_REFRESH_TOKEN: z.string().min(1).optional(),
++  /** TikTok for Business developer app, from the TikTok for Business
++   *  Marketing API app registration. Required for the
++   *  /api/integrations/tiktok/start|callback OAuth flow. */
++  TIKTOK_APP_ID: z.string().min(1).optional(),
++  TIKTOK_APP_SECRET: z.string().min(1).optional(),
+ });
+ 
+ const clientSchema = z.object({
+@@ -34,6 +66,14 @@ export const env = {
+     META_USER_TOKEN: process.env.META_USER_TOKEN,
+     META_APP_ID: process.env.META_APP_ID,
+     META_APP_SECRET: process.env.META_APP_SECRET,
++    SHOPIFY_WEBHOOK_SECRET: process.env.SHOPIFY_WEBHOOK_SECRET,
++    GOOGLE_ADS_CLIENT_ID: process.env.GOOGLE_ADS_CLIENT_ID,
++    GOOGLE_ADS_CLIENT_SECRET: process.env.GOOGLE_ADS_CLIENT_SECRET,
++    GOOGLE_ADS_DEVELOPER_TOKEN: process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
++    GOOGLE_ADS_LOGIN_CUSTOMER_ID: process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID,
++    GOOGLE_ADS_REFRESH_TOKEN: process.env.GOOGLE_ADS_REFRESH_TOKEN,
++    TIKTOK_APP_ID: process.env.TIKTOK_APP_ID,
++    TIKTOK_APP_SECRET: process.env.TIKTOK_APP_SECRET,
+   }),
+   ...clientSchema.parse({
+     NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
+-- 
+2.43.0
+

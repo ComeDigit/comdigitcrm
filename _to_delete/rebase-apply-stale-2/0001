@@ -1,0 +1,388 @@
+From 88edc529781bd6f83483466e1370869431fc13cb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 26 Jul 2026 18:36:14 +0000
+Subject: [PATCH] Add a real Shopify OAuth connect flow, alongside the
+ paste-a-token path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Shopify retired creating custom apps directly in a store's admin — new
+apps now go through the Partner/Dev Dashboard and a real OAuth token
+exchange rather than a static token you copy off a page. Rather than
+leave the existing paste-a-token flow as the only (now partly stale)
+option, this adds a proper "Connect via OAuth" button that mirrors the
+Meta/Google Ads/TikTok pattern:
+
+- /api/integrations/shopify/start takes a shop domain (its consent
+  dialog lives on the store's own domain, unlike the other three
+  providers' single fixed authorize URL) plus the usual signed-state
+  CSRF nonce.
+- /api/integrations/shopify/callback verifies both our own state AND
+  Shopify's own hmac signature on the callback params, exchanges the
+  code for a non-expiring offline access token, then hands off to the
+  EXISTING connectShopifyStore() — the same function the paste-a-token
+  form already calls — so both connect paths always produce an
+  identical connection and can never drift apart.
+- New SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET env vars gate it; the
+  paste-a-token form's copy is updated to stop pointing at the
+  discontinued in-admin flow and point at the new button instead.
+
+tsc, lint, tests (11/11), and production build all pass clean.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ .../integrations/shopify/callback/route.ts    | 107 ++++++++++++++++++
+ .../api/integrations/shopify/start/route.ts   |  81 +++++++++++++
+ src/app/dashboard/settings/page.tsx           |   5 +
+ .../integrations/components/forms.tsx         |  64 ++++++++++-
+ src/lib/env.ts                                |  11 ++
+ 5 files changed, 262 insertions(+), 6 deletions(-)
+ create mode 100644 src/app/api/integrations/shopify/callback/route.ts
+ create mode 100644 src/app/api/integrations/shopify/start/route.ts
+
+diff --git a/src/app/api/integrations/shopify/callback/route.ts b/src/app/api/integrations/shopify/callback/route.ts
+new file mode 100644
+index 0000000..800cc1b
+--- /dev/null
++++ b/src/app/api/integrations/shopify/callback/route.ts
+@@ -0,0 +1,107 @@
++import { createHmac, timingSafeEqual } from "node:crypto";
++import { NextResponse, type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import { authorize } from "@/lib/auth/authorize";
++import { connectShopifyStore } from "@/features/integrations/actions";
++
++/**
++ * Shopify OAuth — step 2. Two independent signature checks before anything
++ * else happens:
++ *  1. OUR signed state (workspaceId:nonce:sig + nonce cookie) — standard
++ *     CSRF protection, same pattern as the Meta/Google Ads/TikTok callbacks.
++ *  2. SHOPIFY's own hmac param on the callback query string — proves this
++ *     redirect genuinely came from Shopify and wasn't forged or modified
++ *     in transit. Computed by sorting every param except hmac/signature
++ *     alphabetically, joining as key=value&key=value, and HMAC-SHA256'ing
++ *     with the app's client secret (per Shopify's documented
++ *     authorization-code-grant spec).
++ *
++ * The token exchange asks for an offline token (no `expiring` flag), which
++ * Shopify returns as non-expiring — matching what shopify-live.ts already
++ * assumes (a static bearer token, no refresh logic). Persistence is
++ * handed off to connectShopifyStore, the SAME function the paste-a-token
++ * form calls, so both connect paths always produce an identical
++ * connection and can never quietly drift apart.
++ */
++export async function GET(request: NextRequest) {
++  const clientId = process.env.SHOPIFY_CLIENT_ID;
++  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
++  if (!clientId || !clientSecret) {
++    return NextResponse.json({ error: "Shopify OAuth connector not configured" }, { status: 501 });
++  }
++
++  const principal = await getPrincipal();
++  if (!principal) {
++    return NextResponse.redirect(new URL("/dashboard/settings", request.url));
++  }
++
++  const { searchParams, origin } = new URL(request.url);
++  const code = searchParams.get("code");
++  const shop = (searchParams.get("shop") ?? "").toLowerCase();
++  const state = searchParams.get("state") ?? "";
++  const hmac = searchParams.get("hmac");
++  const nonceCookie = request.cookies.get("shopify_oauth_nonce")?.value;
++
++  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop)) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=invalid_shop`);
++  }
++
++  // 1. Our own CSRF state: workspaceId:nonce:sig, nonce must match cookie.
++  const [workspaceId, nonce, sig] = state.split(":");
++  if (!code || !workspaceId || !nonce || !sig || nonce !== nonceCookie) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=invalid_state`);
++  }
++  const expectedSig = createHmac("sha256", clientSecret)
++    .update(`${workspaceId}:${nonce}`)
++    .digest("hex");
++  const sigBuf = Buffer.from(sig, "hex");
++  const expSigBuf = Buffer.from(expectedSig, "hex");
++  if (sigBuf.length !== expSigBuf.length || !timingSafeEqual(sigBuf, expSigBuf)) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=invalid_state`);
++  }
++
++  // 2. Shopify's own hmac over the callback params — proves authenticity.
++  if (!hmac) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=invalid_hmac`);
++  }
++  const message = [...searchParams.entries()]
++    .filter(([key]) => key !== "hmac" && key !== "signature")
++    .sort(([a], [b]) => a.localeCompare(b))
++    .map(([key, value]) => `${key}=${value}`)
++    .join("&");
++  const expectedHmac = createHmac("sha256", clientSecret).update(message).digest("hex");
++  const hmacBuf = Buffer.from(hmac, "hex");
++  const expHmacBuf = Buffer.from(expectedHmac, "hex");
++  if (hmacBuf.length !== expHmacBuf.length || !timingSafeEqual(hmacBuf, expHmacBuf)) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=invalid_hmac`);
++  }
++
++  try {
++    authorize(principal, "connections.manage", workspaceId);
++  } catch {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=forbidden`);
++  }
++
++  const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json", Accept: "application/json" },
++    body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, code }),
++  });
++  if (!tokenRes.ok) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=token_error`);
++  }
++  const tokenBody = (await tokenRes.json().catch(() => ({}))) as { access_token?: string };
++  if (!tokenBody.access_token) {
++    return NextResponse.redirect(`${origin}/dashboard/settings?shopify=token_error`);
++  }
++
++  const result = await connectShopifyStore(workspaceId, shop, tokenBody.access_token);
++
++  const response = NextResponse.redirect(
++    result.error
++      ? `${origin}/dashboard/settings?shopify=connect_error`
++      : `${origin}/dashboard/settings?shopify=connected`,
++  );
++  response.cookies.delete("shopify_oauth_nonce");
++  return response;
++}
+diff --git a/src/app/api/integrations/shopify/start/route.ts b/src/app/api/integrations/shopify/start/route.ts
+new file mode 100644
+index 0000000..ad2c697
+--- /dev/null
++++ b/src/app/api/integrations/shopify/start/route.ts
+@@ -0,0 +1,81 @@
++import { createHmac, randomBytes } from "node:crypto";
++import { NextResponse, type NextRequest } from "next/server";
++import { getPrincipal } from "@/lib/auth/principal";
++import { can } from "@/lib/auth/authorize";
++
++/**
++ * Shopify OAuth — step 1. Unlike Meta/Google Ads/TikTok, there's no single
++ * global authorize URL to redirect to — Shopify's consent dialog lives on
++ * the STORE's own domain (https://{shop}/admin/oauth/authorize), so this
++ * route needs a `shop` query param up front alongside `workspace` (the
++ * admin types the store domain before hitting Connect — same format the
++ * paste-a-token flow already asks for). Env-gated: returns a clear message
++ * until SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET exist (an app created in
++ * the Shopify Partner/Dev Dashboard, "custom distribution" so it installs
++ * on a client's store without App Store review — see Settings page copy).
++ *
++ * Scopes match connectShopifyStore's grantedScopes exactly, so a
++ * connection made through this OAuth path and one made by pasting a token
++ * are indistinguishable to the rest of the app.
++ */
++export async function GET(request: NextRequest) {
++  const clientId = process.env.SHOPIFY_CLIENT_ID;
++  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
++  if (!clientId || !clientSecret) {
++    return NextResponse.json(
++      {
++        error:
++          "Shopify OAuth connector not configured. Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET (create a custom-distribution app in the Shopify Partner/Dev Dashboard), or paste an Admin API access token instead.",
++      },
++      { status: 501 },
++    );
++  }
++
++  const principal = await getPrincipal();
++  if (!principal || !can(principal, "connections.manage")) {
++    return NextResponse.json({ error: "Not allowed" }, { status: 403 });
++  }
++
++  const workspaceId = request.nextUrl.searchParams.get("workspace");
++  if (!workspaceId) {
++    return NextResponse.json({ error: "workspace is required" }, { status: 400 });
++  }
++
++  let shop = (request.nextUrl.searchParams.get("shop") ?? "")
++    .trim()
++    .toLowerCase()
++    .replace(/^https?:\/\//, "")
++    .replace(/\/.*$/, "");
++  if (shop && !shop.includes(".")) shop = `${shop}.myshopify.com`;
++  if (!/^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop)) {
++    return NextResponse.json(
++      { error: "Enter a valid shop domain, e.g. yourstore.myshopify.com" },
++      { status: 400 },
++    );
++  }
++
++  const { origin } = new URL(request.url);
++  const nonce = randomBytes(16).toString("hex");
++  const payload = `${workspaceId}:${nonce}`;
++  const sig = createHmac("sha256", clientSecret).update(payload).digest("hex");
++  const state = `${payload}:${sig}`;
++
++  const redirectUri = `${origin}/api/integrations/shopify/callback`;
++  const dialog = new URL(`https://${shop}/admin/oauth/authorize`);
++  dialog.searchParams.set("client_id", clientId);
++  // Offline access (no grant_options[]=per-user) — a non-expiring token
++  // tied to the store, not to whichever staff member approves the install.
++  dialog.searchParams.set("scope", "read_orders,read_customers");
++  dialog.searchParams.set("redirect_uri", redirectUri);
++  dialog.searchParams.set("state", state);
++
++  const response = NextResponse.redirect(dialog);
++  response.cookies.set("shopify_oauth_nonce", nonce, {
++    httpOnly: true,
++    secure: true,
++    sameSite: "lax",
++    maxAge: 600,
++    path: "/api/integrations/shopify",
++  });
++  return response;
++}
+diff --git a/src/app/dashboard/settings/page.tsx b/src/app/dashboard/settings/page.tsx
+index d7b94a9..7770039 100644
+--- a/src/app/dashboard/settings/page.tsx
++++ b/src/app/dashboard/settings/page.tsx
+@@ -9,6 +9,7 @@ import {
+   ConnectMetaAgencyForm,
+   AutoProvisionMetaAccountsButton,
+   ConnectShopifyForm,
++  ConnectShopifyOAuthForm,
+   ConnectGoogleAdsAgencyForm,
+   ConnectTikTokTokenForm,
+ } from "@/features/integrations/components/forms";
+@@ -50,6 +51,7 @@ export default async function SettingsPage() {
+   const connections = await getConnections(principal.orgId);
+   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
+   const metaConfigured = Boolean(process.env.META_APP_ID);
++  const shopifyOAuthConfigured = Boolean(process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET);
+   const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
+   const googleAdsConfigured = Boolean(process.env.GOOGLE_ADS_CLIENT_ID);
+   const googleAdsAgencyConfigured = Boolean(env.GOOGLE_ADS_REFRESH_TOKEN);
+@@ -267,6 +269,9 @@ export default async function SettingsPage() {
+                     {p.key === "meta" && !isDemoMode && agencyTokenConfigured ? (
+                       <AutoProvisionMetaAccountsButton />
+                     ) : null}
++                    {p.key === "shopify" && !isDemoMode && shopifyOAuthConfigured ? (
++                      <ConnectShopifyOAuthForm workspaceId={workspaceId} />
++                    ) : null}
+                     {p.key === "shopify" && !isDemoMode ? (
+                       <ConnectShopifyForm workspaces={workspaces} />
+                     ) : null}
+diff --git a/src/features/integrations/components/forms.tsx b/src/features/integrations/components/forms.tsx
+index e641da4..6d294b2 100644
+--- a/src/features/integrations/components/forms.tsx
++++ b/src/features/integrations/components/forms.tsx
+@@ -486,12 +486,12 @@ export function ConnectShopifyForm({
+           {!shopInfo ? (
+             <div className="space-y-2.5">
+               <p className="text-xs leading-relaxed text-muted">
+-                In the store&apos;s Shopify admin: Settings → Apps and sales channels →
+-                Develop apps → Create an app → enable{" "}
+-                <code className="rounded bg-surface-2 px-1">read_orders</code> and{" "}
+-                <code className="rounded bg-surface-2 px-1">read_customers</code> under Admin
+-                API scopes → Install app. Paste the access token it shows you (starts with{" "}
+-                <code className="rounded bg-surface-2 px-1">shpat_</code>) below.
++                Already have an Admin API access token for this store (from an existing
++                custom app, or one minted another way)? Paste it below — it starts with{" "}
++                <code className="rounded bg-surface-2 px-1">shpat_</code>. Setting up a brand
++                new store? The &quot;Connect via OAuth&quot; button is the easier path now —
++                Shopify moved custom-app creation to the Dev Dashboard, so there&apos;s no
++                longer a one-click way to get a token straight from a store&apos;s own admin.
+               </p>
+               <div>
+                 <label className="mb-1 block text-xs text-muted">Shop domain</label>
+@@ -551,6 +551,58 @@ export function ConnectShopifyForm({
+   );
+ }
+ 
++/**
++ * OAuth "Connect" for Shopify — the recommended path now that Shopify has
++ * retired in-admin custom-app creation (see the paste-a-token form's
++ * copy). Unlike Meta/Google Ads/TikTok, Shopify's consent dialog lives on
++ * the STORE's own domain rather than one fixed URL, so this needs a shop
++ * domain up front. A plain GET form straight to the start route is enough
++ * — no client-side preview step, Shopify's own consent screen (and the
++ * callback's HMAC verification) is what proves the connection is real.
++ * Connects to whichever workspace is currently active in the top nav —
++ * same convention as the plain OAuth anchor Meta/Google Ads/TikTok use.
++ */
++export function ConnectShopifyOAuthForm({ workspaceId }: { workspaceId: string }) {
++  const [open, setOpen] = useState(false);
++  const [shop, setShop] = useState("");
++
++  return (
++    <div className="relative">
++      <Button
++        variant="outline"
++        onClick={() => setOpen((v) => !v)}
++      >
++        {open ? <X size={13} /> : <ShoppingBag size={13} />} Connect via OAuth
++      </Button>
++      {open ? (
++        <div className="absolute right-0 z-30 mt-2 w-80 rounded-xl border border-border bg-surface p-4 shadow-xl">
++          <form action="/api/integrations/shopify/start" method="GET" className="space-y-2.5">
++            <p className="text-xs leading-relaxed text-muted">
++              Enter the client&apos;s store domain. You&apos;ll be sent to Shopify to approve
++              access for the currently-active workspace, then back here, connected.
++            </p>
++            <input type="hidden" name="workspace" value={workspaceId} />
++            <div>
++              <label className="mb-1 block text-xs text-muted">Shop domain</label>
++              <input
++                className={inputCls}
++                name="shop"
++                value={shop}
++                onChange={(e) => setShop(e.target.value)}
++                placeholder="yourstore.myshopify.com"
++                required
++              />
++            </div>
++            <Button className="w-full" type="submit" disabled={!shop.trim()}>
++              Continue to Shopify
++            </Button>
++          </form>
++        </div>
++      ) : null}
++    </div>
++  );
++}
++
+ /**
+  * Google Ads agency-token connect — mirrors ConnectMetaAgencyForm, sourced
+  * from GOOGLE_ADS_REFRESH_TOKEN + GOOGLE_ADS_LOGIN_CUSTOMER_ID (the
+diff --git a/src/lib/env.ts b/src/lib/env.ts
+index 10f21b0..a6452b7 100644
+--- a/src/lib/env.ts
++++ b/src/lib/env.ts
+@@ -23,6 +23,15 @@ const serverSchema = z.object({
+    *  webhook settings). Read directly by the webhook route too; declared
+    *  here as well so it's validated/discoverable alongside every other key. */
+   SHOPIFY_WEBHOOK_SECRET: z.string().min(1).optional(),
++  /** Shopify OAuth app credentials (Partner/Dev Dashboard → your app →
++   *  Client ID/Client secret — "custom distribution" so it installs on a
++   *  client's store without App Store review). Powers the
++   *  /api/integrations/shopify/start|callback "Connect" button — the
++   *  alternative to pasting an Admin API access token by hand. Shopify
++   *  retired in-admin custom apps for new setups, so this is now the
++   *  simpler path for connecting a brand-new client store. */
++  SHOPIFY_CLIENT_ID: z.string().min(1).optional(),
++  SHOPIFY_CLIENT_SECRET: z.string().min(1).optional(),
+   /** Google Ads OAuth client (Google Cloud Console → APIs & Services →
+    *  Credentials → OAuth client ID, type "Web application"). Required for
+    *  the /api/integrations/google_ads/start|callback OAuth flow. */
+@@ -67,6 +76,8 @@ export const env = {
+     META_APP_ID: process.env.META_APP_ID,
+     META_APP_SECRET: process.env.META_APP_SECRET,
+     SHOPIFY_WEBHOOK_SECRET: process.env.SHOPIFY_WEBHOOK_SECRET,
++    SHOPIFY_CLIENT_ID: process.env.SHOPIFY_CLIENT_ID,
++    SHOPIFY_CLIENT_SECRET: process.env.SHOPIFY_CLIENT_SECRET,
+     GOOGLE_ADS_CLIENT_ID: process.env.GOOGLE_ADS_CLIENT_ID,
+     GOOGLE_ADS_CLIENT_SECRET: process.env.GOOGLE_ADS_CLIENT_SECRET,
+     GOOGLE_ADS_DEVELOPER_TOKEN: process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+-- 
+2.43.0
+

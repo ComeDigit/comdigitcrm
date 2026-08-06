@@ -1,0 +1,996 @@
+---
+ src/features/ads/channel-page.tsx             | 297 +++++++++++++++++-
+ .../google-ads-breakdowns-live.ts             | 176 +++++++++++
+ .../integrations/google-ads-breakdowns.ts     | 244 ++++++++++++++
+ src/features/integrations/google-ads-live.ts  |  18 +-
+ src/features/integrations/google-ads.ts       |  80 +++--
+ 5 files changed, 776 insertions(+), 39 deletions(-)
+ create mode 100644 src/features/integrations/google-ads-breakdowns-live.ts
+ create mode 100644 src/features/integrations/google-ads-breakdowns.ts
+
+diff --git a/src/features/ads/channel-page.tsx b/src/features/ads/channel-page.tsx
+index 3033cbe..b609ae3 100644
+--- a/src/features/ads/channel-page.tsx
++++ b/src/features/ads/channel-page.tsx
+@@ -22,6 +22,17 @@ import type {
+   MetaCountryInsight,
+ } from "@/features/integrations/meta-breakdowns";
+ import { getLiveGoogleAdsReport, getGoogleAdsPacing } from "@/features/integrations/google-ads-live";
++import {
++  getLiveGoogleAdsKeywords,
++  getLiveGoogleAdsSearchTerms,
++  getLiveGoogleAdsAudience,
++} from "@/features/integrations/google-ads-breakdowns-live";
++import type {
++  GoogleAdsKeywordInsight,
++  GoogleAdsSearchTermInsight,
++  GoogleAdsDeviceInsight,
++  GoogleAdsLocationInsight,
++} from "@/features/integrations/google-ads-breakdowns";
+ import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
+ import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
+ import type { DemoProvider } from "@/features/demo-data/generator";
+@@ -70,6 +81,12 @@ export async function AdsReport({
+   let ads: MetaAdInsight[] = [];
+   let byAgeGender: MetaAgeGenderInsight[] = [];
+   let byCountry: MetaCountryInsight[] = [];
++  // Google-Ads-only deeper breakdowns (AUDIT_REPORT.md High: keyword/
++  // search-term/device/location reporting) — same story, empty elsewhere.
++  let googleKeywords: GoogleAdsKeywordInsight[] = [];
++  let googleSearchTerms: GoogleAdsSearchTermInsight[] = [];
++  let googleByDevice: GoogleAdsDeviceInsight[] = [];
++  let googleByLocation: GoogleAdsLocationInsight[] = [];
+ 
+   // All three ad channels are on-demand/live per client instruction — no
+   // local historical storage for any of them. Two live pulls (current +
+@@ -118,17 +135,41 @@ export async function AdsReport({
+     }
+     pacing = pacingResult;
+   } else if (provider === "google_ads" && !isDemoMode) {
+-    const [current, previous, pacingResult] = await Promise.all([
++    const [current, previous, pacingResult, keywordsResult, searchTermsResult, audienceResult] = await Promise.all([
+       getLiveGoogleAdsReport(workspaceId, range),
+       getLiveGoogleAdsReport(workspaceId, previousPeriod(range)),
+       getGoogleAdsPacing(workspaceId),
++      getLiveGoogleAdsKeywords(workspaceId, range),
++      getLiveGoogleAdsSearchTerms(workspaceId, range),
++      getLiveGoogleAdsAudience(workspaceId, range),
+     ]);
+     totals = current.totals;
+     prev = previous.totals;
+     trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
+     campaigns = current.campaigns;
+-    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
+-    failures = current.failures;
++    googleKeywords = keywordsResult.keywords;
++    googleSearchTerms = searchTermsResult.searchTerms;
++    googleByDevice = audienceResult.byDevice;
++    googleByLocation = audienceResult.byLocation;
++    partialFailure =
++      current.partialFailure ||
++      previous.partialFailure ||
++      pacingResult.partialFailure ||
++      keywordsResult.partialFailure ||
++      searchTermsResult.partialFailure ||
++      audienceResult.partialFailure;
++    // Same story as the Meta branch above — every one of these shares the
++    // same connections/credentials, so de-dupe by display name.
++    const seenGoogleFailures = new Set<string>();
++    failures = [];
++    for (const list of [current.failures, keywordsResult.failures, searchTermsResult.failures, audienceResult.failures]) {
++      for (const f of list) {
++        if (!seenGoogleFailures.has(f.displayName)) {
++          seenGoogleFailures.add(f.displayName);
++          failures.push(f);
++        }
++      }
++    }
+     pacing = pacingResult;
+   } else if (provider === "tiktok" && !isDemoMode) {
+     const [current, previous, pacingResult] = await Promise.all([
+@@ -180,6 +221,16 @@ export async function AdsReport({
+   const adSetsShown = adSets.slice(0, AD_ENTITY_DISPLAY_CAP);
+   const adsShown = ads.slice(0, AD_ENTITY_DISPLAY_CAP);
+ 
++  // Google keywords/search terms are already capped to 50 per connection
++  // by the GAQL query itself (see google-ads-breakdowns.ts) — but a
++  // workspace with more than one connected Google Ads account can still
++  // exceed 50 once flat-concatenated, so re-sort + re-cap the combined list
++  // the same way as adSets/ads above.
++  googleKeywords.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++  googleSearchTerms.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++  const googleKeywordsShown = googleKeywords.slice(0, AD_ENTITY_DISPLAY_CAP);
++  const googleSearchTermsShown = googleSearchTerms.slice(0, AD_ENTITY_DISPLAY_CAP);
++
+   /**
+    * Trimmed to the 4 most-used cards per group (was ~35 cards across 4
+    * groups) — per client request, less scrolling for the numbers people
+@@ -252,6 +303,18 @@ export async function AdsReport({
+   };
+   const rankLabel = (rank?: string | null) => (rank ? rank.replace(/_/g, " ") : "—");
+ 
++  /** Google's segments.device enum values, in the friendly form Google's
++   *  own UI uses — CONNECTED_TV in particular reads badly as raw text. */
++  const deviceLabels: Record<string, string> = {
++    MOBILE: "Mobile",
++    DESKTOP: "Desktop",
++    TABLET: "Tablet",
++    CONNECTED_TV: "Connected TV",
++    OTHER: "Other",
++  };
++  const deviceLabel = (d: string) => deviceLabels[d] ?? d.replace(/_/g, " ");
++  const matchTypeLabel = (m: string) => (m ? m.charAt(0) + m.slice(1).toLowerCase() : "—");
++
+   return (
+     <main className="space-y-6 px-6 py-6">
+         <DateRangePicker preset={preset} range={range} />
+@@ -630,6 +693,234 @@ export async function AdsReport({
+             </Card>
+           </>
+         ) : null}
++
++        {provider === "google_ads" && !isDemoMode ? (
++          <>
++            <Card>
++              <CardHeader
++                title="Keywords"
++                subtitle={`${rangeLabel} · top ${AD_ENTITY_DISPLAY_CAP} by spend`}
++              />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Keyword</th>
++                      <th className="px-3 py-2 font-medium">Match type</th>
++                      <th className="px-3 py-2 font-medium">Ad group</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>CPC</th>
++                      <th className={th}>CPM</th>
++                      <th className={th}>CTR</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {googleKeywordsShown.length === 0 ? (
++                      <tr>
++                        <td colSpan={13} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No keywords found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {googleKeywordsShown.map((k) => {
++                      const f = k.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr key={k.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
++                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{k.text}</td>
++                          <td className="px-3 py-2.5 text-muted">{matchTypeLabel(k.matchType)}</td>
++                          <td className="max-w-[180px] truncate px-3 py-2.5 text-muted">{k.adGroupName}</td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++
++            <Card>
++              <CardHeader
++                title="Search terms"
++                subtitle={`${rangeLabel} · top ${AD_ENTITY_DISPLAY_CAP} by spend · what people actually typed`}
++              />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Search term</th>
++                      <th className="px-3 py-2 font-medium">Ad group</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>CPC</th>
++                      <th className={th}>CPM</th>
++                      <th className={th}>CTR</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {googleSearchTermsShown.length === 0 ? (
++                      <tr>
++                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No search terms found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {googleSearchTermsShown.map((s) => {
++                      const f = s.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr key={s.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
++                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{s.searchTerm}</td>
++                          <td className="max-w-[180px] truncate px-3 py-2.5 text-muted">{s.adGroupName}</td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++
++            <Card>
++              <CardHeader title="Device" subtitle={`${rangeLabel} · sorted by spend`} />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Device</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                      <th className={th}>CTR</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {googleByDevice.length === 0 ? (
++                      <tr>
++                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No device data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {googleByDevice.map((row) => {
++                      const f = row.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr key={row.device} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
++                          <td className="px-3 py-2.5 font-medium">{deviceLabel(row.device)}</td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++
++            <Card>
++              <CardHeader
++                title="Location — country"
++                subtitle={`${rangeLabel} · sorted by spend${googleByLocation.length >= 25 ? " · top 25 shown" : ""}`}
++              />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Country</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                      <th className={th}>CTR</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {googleByLocation.length === 0 ? (
++                      <tr>
++                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No location data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {googleByLocation.map((row) => {
++                      const f = row.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr
++                          key={row.countryCriterionId}
++                          className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
++                        >
++                          <td className="px-3 py-2.5 font-medium" title={`Google location ID ${row.countryCriterionId}`}>
++                            {row.countryCode ?? `#${row.countryCriterionId}`}
++                          </td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++          </>
++        ) : null}
+     </main>
+   );
+ }
+diff --git a/src/features/integrations/google-ads-breakdowns-live.ts b/src/features/integrations/google-ads-breakdowns-live.ts
+new file mode 100644
+index 0000000..d60f037
+--- /dev/null
++++ b/src/features/integrations/google-ads-breakdowns-live.ts
+@@ -0,0 +1,176 @@
++import "server-only";
++import { getDb } from "@/lib/db";
++import { isDemoMode } from "@/lib/env";
++import { resolveCreds, cached, reasonFor, logGoogleAdsFailure, INSIGHTS_TTL_MS } from "./google-ads-live";
++import {
++  fetchGoogleAdsKeywords,
++  fetchGoogleAdsSearchTerms,
++  fetchGoogleAdsDeviceBreakdown,
++  fetchGoogleAdsLocationBreakdown,
++  type GoogleAdsKeywordInsight,
++  type GoogleAdsSearchTermInsight,
++  type GoogleAdsDeviceInsight,
++  type GoogleAdsLocationInsight,
++} from "./google-ads-breakdowns";
++import { sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
++import type { DateRange } from "@/features/metrics/queries";
++import type { ResolvedGoogleAdsCreds } from "./google-ads-live";
++import type { GoogleAdsFetchFailure } from "./google-ads-live";
++
++/**
++ * On-demand orchestration for the deeper Google Ads reports
++ * (google-ads-breakdowns.ts) — same shape as getLiveGoogleAdsReport in
++ * google-ads-live.ts: resolve every active Google Ads connection under the
++ * workspace, pull each live (cached 60s per connection+range), merge, and
++ * surface partial failures. Mirrors meta-breakdowns-live.ts's structure.
++ *
++ * Keywords/search terms are flat-concatenated across connections (already
++ * unique to their own ad account, same precedent as campaigns). Device and
++ * location rows are SUMMED across connections by their segment key, same
++ * precedent as meta-live.ts's daily trend and meta-breakdowns-live.ts's
++ * audience merge.
++ */
++
++interface Failing {
++  failures: GoogleAdsFetchFailure[];
++}
++
++async function forEachConnection<T>(
++  workspaceId: string,
++  fetchOne: (creds: ResolvedGoogleAdsCreds, accountId: string) => Promise<T>,
++): Promise<{ results: T[] } & Failing> {
++  if (isDemoMode) return { results: [], failures: [] };
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "google_ads"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return { results: [], failures: [] };
++
++  const failures: GoogleAdsFetchFailure[] = [];
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      // resolveCreds itself can throw here (it refreshes the access token
++      // over the network) — unlike Meta's version, it can't be null-checked
++      // outside a try/catch. Mirrors getLiveGoogleAdsReport's own structure
++      // in google-ads-live.ts.
++      try {
++        const creds = await resolveCreds(connection);
++        if (!creds) {
++          const reason =
++            "No refresh token available for this account — connect it in Settings or set GOOGLE_ADS_REFRESH_TOKEN.";
++          failures.push({ displayName: connection.displayName, reason });
++          logGoogleAdsFailure(connection.displayName, new Error(reason));
++          return null;
++        }
++        return await fetchOne(creds, connection.externalAccountId);
++      } catch (e) {
++        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
++        logGoogleAdsFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++  // Cast (not a type-predicate filter): for a fully generic, unconstrained
++  // T, TS can't prove Awaited<T> is identical to T — same issue as
++  // meta-breakdowns-live.ts's forEachConnection.
++  return { results: perConnection.filter((r) => r !== null) as T[], failures };
++}
++
++export interface LiveGoogleAdsKeywords extends Failing {
++  keywords: GoogleAdsKeywordInsight[];
++  partialFailure: boolean;
++}
++
++export async function getLiveGoogleAdsKeywords(workspaceId: string, range: DateRange): Promise<LiveGoogleAdsKeywords> {
++  const { results, failures } = await forEachConnection(workspaceId, (creds, accountId) =>
++    cached(`gads-keywords:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++      fetchGoogleAdsKeywords(creds, accountId, range),
++    ),
++  );
++  return { keywords: results.flat(), partialFailure: failures.length > 0, failures };
++}
++
++export interface LiveGoogleAdsSearchTerms extends Failing {
++  searchTerms: GoogleAdsSearchTermInsight[];
++  partialFailure: boolean;
++}
++
++export async function getLiveGoogleAdsSearchTerms(
++  workspaceId: string,
++  range: DateRange,
++): Promise<LiveGoogleAdsSearchTerms> {
++  const { results, failures } = await forEachConnection(workspaceId, (creds, accountId) =>
++    cached(`gads-searchterms:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++      fetchGoogleAdsSearchTerms(creds, accountId, range),
++    ),
++  );
++  return { searchTerms: results.flat(), partialFailure: failures.length > 0, failures };
++}
++
++export interface LiveGoogleAdsAudience extends Failing {
++  byDevice: GoogleAdsDeviceInsight[];
++  byLocation: GoogleAdsLocationInsight[];
++  partialFailure: boolean;
++}
++
++/** "Audience" here mirrors getLiveMetaAudience's grouping — device and
++ *  location are both "who/where" dimensions, fetched and merged together
++ *  in one call since they're always shown together on the report page. */
++export async function getLiveGoogleAdsAudience(workspaceId: string, range: DateRange): Promise<LiveGoogleAdsAudience> {
++  const [deviceResult, locationResult] = await Promise.all([
++    forEachConnection(workspaceId, (creds, accountId) =>
++      cached(`gads-device:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++        fetchGoogleAdsDeviceBreakdown(creds, accountId, range),
++      ),
++    ),
++    forEachConnection(workspaceId, (creds, accountId) =>
++      cached(`gads-location:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++        fetchGoogleAdsLocationBreakdown(creds, accountId, range),
++      ),
++    ),
++  ]);
++
++  const byDeviceMap = new Map<string, AdFacts[]>();
++  for (const rows of deviceResult.results) {
++    for (const row of rows) {
++      const list = byDeviceMap.get(row.device) ?? [];
++      list.push(row.facts);
++      byDeviceMap.set(row.device, list);
++    }
++  }
++  const byDevice = [...byDeviceMap.entries()]
++    .map(([device, facts]) => ({ device, facts: sumAdFacts(facts) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++
++  const byLocationMap = new Map<
++    string,
++    { countryCriterionId: string; countryCode: string | null; facts: AdFacts[] }
++  >();
++  for (const rows of locationResult.results) {
++    for (const row of rows) {
++      const entry = byLocationMap.get(row.countryCriterionId) ?? {
++        countryCriterionId: row.countryCriterionId,
++        countryCode: row.countryCode,
++        facts: [],
++      };
++      entry.facts.push(row.facts);
++      byLocationMap.set(row.countryCriterionId, entry);
++    }
++  }
++  const byLocation = [...byLocationMap.values()]
++    .map((e) => ({ countryCriterionId: e.countryCriterionId, countryCode: e.countryCode, facts: sumAdFacts(e.facts) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor)
++    .slice(0, 25);
++
++  // Same connections/credentials power both fetches, so a bad token fails
++  // both at once — de-duped by display name so the banner doesn't list the
++  // same account twice.
++  const failures = [...deviceResult.failures];
++  for (const f of locationResult.failures) {
++    if (!failures.some((existing) => existing.displayName === f.displayName)) failures.push(f);
++  }
++
++  return { byDevice, byLocation, partialFailure: failures.length > 0, failures };
++}
+diff --git a/src/features/integrations/google-ads-breakdowns.ts b/src/features/integrations/google-ads-breakdowns.ts
+new file mode 100644
+index 0000000..c5fecd1
+--- /dev/null
++++ b/src/features/integrations/google-ads-breakdowns.ts
+@@ -0,0 +1,244 @@
++import "server-only";
++import {
++  gaqlSearch,
++  assertIsoDate,
++  mapGoogleAdsFacts,
++  type GoogleAdsCreds,
++  type GoogleAdsMetricsFields,
++} from "./google-ads";
++import type { AdFacts } from "@/lib/metrics/definitions";
++
++/**
++ * Deeper Google Ads reporting than the campaign-grain report in
++ * google-ads-live.ts (AUDIT_REPORT.md — High: "Google Ads keyword/search-
++ * term/device/location reporting missing"). Same on-demand-pull shape as
++ * everything else in this app — nothing here is stored, it hits the Google
++ * Ads API the moment the page is opened. Mirrors meta-breakdowns.ts's
++ * structure (raw fetchers here, orchestration in
++ * google-ads-breakdowns-live.ts) even though the underlying query language
++ * (GAQL) is completely different from Meta's Graph API.
++ *
++ * Keywords and search terms are both ordered by spend and capped to the
++ * top 50 directly in the GAQL query (`ORDER BY ... LIMIT 50`) rather than
++ * paginating everything and slicing client-side — a busy Search campaign
++ * can have thousands of either, and this Google Ads client has never been
++ * exercised against a real large account (see google-ads.ts's own doc
++ * comment), so an unbounded paginate-everything loop here is a real risk,
++ * not just a hypothetical one.
++ */
++
++async function fetchAllPages<T>(accountId: string, query: string, creds: GoogleAdsCreds): Promise<T[]> {
++  const out: T[] = [];
++  let pageToken: string | undefined;
++  do {
++    const { results, nextPageToken } = await gaqlSearch<T>(accountId, query, creds, pageToken);
++    out.push(...results);
++    pageToken = nextPageToken;
++  } while (pageToken);
++  return out;
++}
++
++/** Rows already capped via LIMIT in the query itself — a single page,
++ *  never worth looping for. */
++async function fetchOnePage<T>(accountId: string, query: string, creds: GoogleAdsCreds): Promise<T[]> {
++  const { results } = await gaqlSearch<T>(accountId, query, creds);
++  return results;
++}
++
++export interface GoogleAdsKeywordInsight {
++  id: string;
++  text: string;
++  matchType: string;
++  adGroupId: string;
++  adGroupName: string;
++  campaignId: string;
++  facts: AdFacts;
++}
++
++interface GoogleAdsKeywordRow {
++  adGroupCriterion: { criterionId: string; keyword?: { text?: string; matchType?: string } };
++  adGroup: { id: string; name?: string };
++  campaign: { id: string };
++  metrics: GoogleAdsMetricsFields;
++}
++
++export async function fetchGoogleAdsKeywords(
++  creds: GoogleAdsCreds,
++  accountId: string,
++  range: { since: string; until: string },
++): Promise<GoogleAdsKeywordInsight[]> {
++  const since = assertIsoDate(range.since);
++  const until = assertIsoDate(range.until);
++  const query =
++    "SELECT ad_group_criterion.criterion_id, ad_group_criterion.keyword.text, " +
++    "ad_group_criterion.keyword.match_type, ad_group.id, ad_group.name, campaign.id, metrics.cost_micros, " +
++    "metrics.impressions, metrics.clicks, metrics.conversions, metrics.conversions_value FROM keyword_view " +
++    `WHERE segments.date BETWEEN '${since}' AND '${until}' ORDER BY metrics.cost_micros DESC LIMIT 50`;
++  const currency = creds.extra?.currency ?? "USD";
++  const rows = await fetchOnePage<GoogleAdsKeywordRow>(accountId, query, creds);
++  return rows.map((r) => ({
++    id: `${r.adGroup.id}:${r.adGroupCriterion.criterionId}`,
++    text: r.adGroupCriterion.keyword?.text ?? "(unknown)",
++    matchType: r.adGroupCriterion.keyword?.matchType ?? "UNKNOWN",
++    adGroupId: r.adGroup.id,
++    adGroupName: r.adGroup.name ?? r.adGroup.id,
++    campaignId: r.campaign.id,
++    facts: mapGoogleAdsFacts(r.metrics, currency),
++  }));
++}
++
++export interface GoogleAdsSearchTermInsight {
++  id: string;
++  searchTerm: string;
++  adGroupId: string;
++  adGroupName: string;
++  campaignId: string;
++  facts: AdFacts;
++}
++
++interface GoogleAdsSearchTermRow {
++  searchTermView: { searchTerm: string };
++  adGroup: { id: string; name?: string };
++  campaign: { id: string };
++  metrics: GoogleAdsMetricsFields;
++}
++
++/**
++ * Search terms are the actual queries people typed that triggered an ad —
++ * distinct from keywords (what the advertiser bid on). The same term can
++ * appear once per ad group it matched under, so rows are kept ad-group-
++ * scoped rather than collapsed into one row per term, matching how Google
++ * Ads' own UI reports this by default.
++ */
++export async function fetchGoogleAdsSearchTerms(
++  creds: GoogleAdsCreds,
++  accountId: string,
++  range: { since: string; until: string },
++): Promise<GoogleAdsSearchTermInsight[]> {
++  const since = assertIsoDate(range.since);
++  const until = assertIsoDate(range.until);
++  const query =
++    "SELECT search_term_view.search_term, ad_group.id, ad_group.name, campaign.id, metrics.cost_micros, " +
++    "metrics.impressions, metrics.clicks, metrics.conversions, metrics.conversions_value FROM search_term_view " +
++    `WHERE segments.date BETWEEN '${since}' AND '${until}' ORDER BY metrics.cost_micros DESC LIMIT 50`;
++  const currency = creds.extra?.currency ?? "USD";
++  const rows = await fetchOnePage<GoogleAdsSearchTermRow>(accountId, query, creds);
++  return rows.map((r, i) => ({
++    id: `${r.adGroup.id}:${i}`,
++    searchTerm: r.searchTermView.searchTerm,
++    adGroupId: r.adGroup.id,
++    adGroupName: r.adGroup.name ?? r.adGroup.id,
++    campaignId: r.campaign.id,
++    facts: mapGoogleAdsFacts(r.metrics, currency),
++  }));
++}
++
++export interface GoogleAdsDeviceInsight {
++  device: string;
++  facts: AdFacts;
++}
++
++interface GoogleAdsDeviceRow {
++  segments: { device: string };
++  metrics: GoogleAdsMetricsFields;
++}
++
++/**
++ * One row per device type (MOBILE/DESKTOP/TABLET/CONNECTED_TV/OTHER),
++ * aggregated across every campaign for the whole range — selecting only
++ * segments.device (no campaign/date fields) makes GAQL aggregate
++ * everything else away, the same way Meta's account-level breakdowns do.
++ * Small, fixed cardinality (~5 values) — no LIMIT needed.
++ */
++export async function fetchGoogleAdsDeviceBreakdown(
++  creds: GoogleAdsCreds,
++  accountId: string,
++  range: { since: string; until: string },
++): Promise<GoogleAdsDeviceInsight[]> {
++  const since = assertIsoDate(range.since);
++  const until = assertIsoDate(range.until);
++  const query =
++    "SELECT segments.device, metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions, " +
++    `metrics.conversions_value FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}'`;
++  const currency = creds.extra?.currency ?? "USD";
++  const rows = await fetchAllPages<GoogleAdsDeviceRow>(accountId, query, creds);
++  return rows
++    .map((r) => ({ device: r.segments.device, facts: mapGoogleAdsFacts(r.metrics, currency) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++}
++
++/**
++ * Country-level Google Ads geo target criterion IDs → ISO 3166-1 alpha-2
++ * codes. Google publishes the full mapping (thousands of rows, city/region
++ * granularity included) as a downloadable reference from the Google Ads
++ * API geo targets docs (developers.google.com/google-ads/api/data/
++ * geotargets); fetching and parsing that full file is a reasonable future
++ * enhancement, not done here.
++ *
++ * This is deliberately a SMALL, hand-verified subset — cross-checked
++ * against Google's own published geo targets reference rather than
++ * guessed — covering the markets most agency clients actually run ads in.
++ * A wrong numeric-ID-to-country mapping would silently mislabel a
++ * client's location data with nothing to catch it (unlike a code bug,
++ * there's no typecheck/test that can verify a hardcoded ID is correct),
++ * so this table only includes IDs actually confirmed against Google's
++ * documentation — it does NOT attempt to cover every country. Anything
++ * not in this table still shows up in the report labeled by its raw
++ * criterion ID rather than a guessed country (see
++ * fetchGoogleAdsLocationBreakdown below) — nothing is silently dropped,
++ * nothing is silently mislabeled.
++ */
++export const GOOGLE_COUNTRY_CRITERIA: Record<string, string> = {
++  "2840": "US",
++  "2826": "GB",
++  "2124": "CA",
++  "2036": "AU",
++  "2356": "IN",
++  "2276": "DE",
++  "2250": "FR",
++  "2392": "JP",
++  "2076": "BR",
++  "2484": "MX",
++};
++
++export interface GoogleAdsLocationInsight {
++  countryCriterionId: string;
++  /** ISO 3166-1 alpha-2 code when the criterion ID is in our verified
++   *  table above; null otherwise (UI falls back to the raw ID). */
++  countryCode: string | null;
++  facts: AdFacts;
++}
++
++interface GoogleAdsGeoRow {
++  geographicView: { countryCriterionId: string };
++  metrics: GoogleAdsMetricsFields;
++}
++
++/**
++ * Performance by the searcher's physical country (geographic_view is
++ * always country-grain — city/region-level performance lives in the
++ * separate user_location_view resource, not fetched here). Capped to the
++ * top 25 by spend, same as Meta's country breakdown.
++ */
++export async function fetchGoogleAdsLocationBreakdown(
++  creds: GoogleAdsCreds,
++  accountId: string,
++  range: { since: string; until: string },
++): Promise<GoogleAdsLocationInsight[]> {
++  const since = assertIsoDate(range.since);
++  const until = assertIsoDate(range.until);
++  const query =
++    "SELECT geographic_view.country_criterion_id, metrics.cost_micros, metrics.impressions, metrics.clicks, " +
++    "metrics.conversions, metrics.conversions_value FROM geographic_view " +
++    `WHERE segments.date BETWEEN '${since}' AND '${until}'`;
++  const currency = creds.extra?.currency ?? "USD";
++  const rows = await fetchAllPages<GoogleAdsGeoRow>(accountId, query, creds);
++  return rows
++    .map((r) => ({
++      countryCriterionId: r.geographicView.countryCriterionId,
++      countryCode: GOOGLE_COUNTRY_CRITERIA[r.geographicView.countryCriterionId] ?? null,
++      facts: mapGoogleAdsFacts(r.metrics, currency),
++    }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor)
++    .slice(0, 25);
++}
+diff --git a/src/features/integrations/google-ads-live.ts b/src/features/integrations/google-ads-live.ts
+index 1ef3057..08325e1 100644
+--- a/src/features/integrations/google-ads-live.ts
++++ b/src/features/integrations/google-ads-live.ts
+@@ -22,7 +22,11 @@ interface CacheEntry<T> {
+ }
+ const cache = new Map<string, CacheEntry<unknown>>();
+ 
+-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
++/** Exported so google-ads-breakdowns-live.ts shares this exact cache
++ *  instance (namespaced by key prefix) instead of running a second
++ *  independent cache for what's conceptually the same live-pull
++ *  mechanism — same reasoning as meta-live.ts's `cached`. */
++export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+   const hit = cache.get(key);
+   const now = Date.now();
+   if (hit && hit.expires > now) return hit.value as T;
+@@ -31,20 +35,20 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
+   return value;
+ }
+ 
+-const INSIGHTS_TTL_MS = 60_000;
++export const INSIGHTS_TTL_MS = 60_000;
+ const HEALTH_TTL_MS = 5 * 60_000;
+ // Google access tokens last ~3600s; refresh 10 minutes early so a slow
+ // request never straddles the actual expiry.
+ const ACCESS_TOKEN_TTL_MS = 50 * 60_000;
+ 
+-function reasonFor(e: unknown): string {
++export function reasonFor(e: unknown): string {
+   if (e instanceof ProviderAuthError) return e.message;
+   if (e instanceof ProviderRateLimitError) return "Google Ads rate-limited this request — try again in a minute.";
+   if (e instanceof Error) return e.message;
+   return "Unknown error reaching Google Ads.";
+ }
+ 
+-function logGoogleAdsFailure(connectionLabel: string, e: unknown): void {
++export function logGoogleAdsFailure(connectionLabel: string, e: unknown): void {
+   console.error(`[google-ads-live] ${connectionLabel}: ${reasonFor(e)}`, e);
+ }
+ 
+@@ -79,7 +83,7 @@ async function getAccessToken(connectionId: string, refreshToken: string): Promi
+   return accessToken;
+ }
+ 
+-interface ResolvedGoogleAdsCreds extends ProviderCredentials {
++export interface ResolvedGoogleAdsCreds extends ProviderCredentials {
+   extra: Record<string, string>;
+ }
+ 
+@@ -92,8 +96,10 @@ interface ResolvedGoogleAdsCreds extends ProviderCredentials {
+  * META_USER_TOKEN fallback. Unlike Meta's resolveCreds (pure local
+  * decrypt), this can throw — refreshing the access token is a network
+  * call — so callers must try/catch around it, not just null-check.
++ * Exported so google-ads-breakdowns-live.ts resolves credentials the
++ * exact same way rather than duplicating the token-refresh dance.
+  */
+-async function resolveCreds(connection: {
++export async function resolveCreds(connection: {
+   id: string;
+   currencyCode: string | null;
+ }): Promise<ResolvedGoogleAdsCreds | null> {
+diff --git a/src/features/integrations/google-ads.ts b/src/features/integrations/google-ads.ts
+index ad3111e..881ef3e 100644
+--- a/src/features/integrations/google-ads.ts
++++ b/src/features/integrations/google-ads.ts
+@@ -89,7 +89,7 @@ export async function refreshAccessToken(refreshToken: string): Promise<Refreshe
+ /** developer-token and login-customer-id are agency-wide (env), not
+  *  per-connection — carried on ProviderCredentials.extra so provider
+  *  methods don't need extra parameters threaded through every call. */
+-interface GoogleAdsCreds extends ProviderCredentials {
++export interface GoogleAdsCreds extends ProviderCredentials {
+   extra?: Record<string, string>;
+ }
+ 
+@@ -114,14 +114,14 @@ interface GoogleAdsErrorBody {
+  *  MUST be checked first. Google-scoped blast radius is limited (the
+  *  customer id in the URL path already bounds which account's data is
+  *  reachable), but a malformed date could still corrupt the query. */
+-function assertIsoDate(value: string): string {
++export function assertIsoDate(value: string): string {
+   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+     throw new Error(`Invalid date range for Google Ads query: "${value}"`);
+   }
+   return value;
+ }
+ 
+-async function gaqlSearch<T>(
++export async function gaqlSearch<T>(
+   customerId: string,
+   query: string,
+   creds: GoogleAdsCreds,
+@@ -273,12 +273,12 @@ export async function listLinkedClientAccounts(
+ 
+ /** 1,000,000 micros = 1 major currency unit = 100 minor units, so
+  *  micros / 10,000 = minor units. */
+-function microsToMinor(micros: string | undefined): number {
++export function microsToMinor(micros: string | undefined): number {
+   return Math.round((parseInt(micros ?? "0", 10) || 0) / 10_000);
+ }
+ 
+ /** conversions_value is a decimal in major currency units (not micros). */
+-function decimalToMinor(value: number | string | undefined): number {
++export function decimalToMinor(value: number | string | undefined): number {
+   const n = typeof value === "string" ? parseFloat(value) : (value ?? 0);
+   return Math.round((n || 0) * 100);
+ }
+@@ -295,40 +295,52 @@ interface GoogleAdsCampaignRow {
+   campaignBudget?: { amountMicros?: string };
+ }
+ 
++/** The metrics fields every insights-style GAQL query below selects —
++ *  shared by the campaign-grain query here and google-ads-breakdowns.ts's
++ *  keyword / search term / device / location queries, so they all map
++ *  through the exact same mapGoogleAdsFacts logic instead of re-deriving
++ *  it per breakdown. */
++export interface GoogleAdsMetricsFields {
++  costMicros?: string;
++  impressions?: string;
++  clicks?: string;
++  conversions?: number | string;
++  conversionsValue?: number | string;
++  videoViews?: string;
++}
++
+ interface GoogleAdsMetricsRow {
+   campaign: { id: string };
+   segments: { date: string };
+-  metrics: {
+-    costMicros?: string;
+-    impressions?: string;
+-    clicks?: string;
+-    conversions?: number | string;
+-    conversionsValue?: number | string;
+-    videoViews?: string;
+-  };
++  metrics: GoogleAdsMetricsFields;
+ }
+ 
+ /**
+- * Maps a metrics row to the shared AdFacts shape. Only the metrics Google
+- * Ads reports at plain campaign×date grain are populated (spend, revenue,
+- * impressions, clicks, conversions, video views); the funnel-stage
+- * breakdown fields Meta gets for free from its `actions` array
+- * (addToCart, initiateCheckout, leads, etc.) require a second query
+- * segmented by conversion-action category — a reasonable follow-up, not
+- * implemented here. `reach` is also 0: campaign-grain unique-reach isn't
+- * exposed by a simple GAQL metric the way Meta's `reach` field is.
++ * The AdFacts-shaped subset of a metrics row — factored out of
++ * mapMetricsRow so google-ads-breakdowns.ts (keyword / search term /
++ * device / location insights, which share this exact metrics shape but
++ * aren't keyed by campaign+date the way DailyInsightRecord is) can reuse
++ * the same parsing instead of re-deriving it. Only the metrics Google Ads
++ * reports at this level are populated (spend, revenue, impressions,
++ * clicks, conversions, video views); the funnel-stage breakdown fields
++ * Meta gets for free from its `actions` array (addToCart,
++ * initiateCheckout, leads, etc.) require a second query segmented by
++ * conversion-action category — a reasonable follow-up, not implemented
++ * here. `reach` is also 0: unique-reach isn't exposed by a simple GAQL
++ * metric the way Meta's `reach` field is.
+  */
+-function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRecord {
+-  const videoViews = parseInt(r.metrics.videoViews ?? "0", 10) || 0;
++export function mapGoogleAdsFacts(
++  m: GoogleAdsMetricsFields,
++  currency: string,
++): Omit<DailyInsightRecord, "campaignExternalId" | "date"> {
++  const videoViews = parseInt(m.videoViews ?? "0", 10) || 0;
+   return {
+-    campaignExternalId: r.campaign.id,
+-    date: r.segments.date,
+     currencyCode: currency,
+-    spendMinor: microsToMinor(r.metrics.costMicros),
+-    revenueMinor: decimalToMinor(r.metrics.conversionsValue),
+-    impressions: parseInt(r.metrics.impressions ?? "0", 10) || 0,
+-    clicks: parseInt(r.metrics.clicks ?? "0", 10) || 0,
+-    purchases: Math.round(Number(r.metrics.conversions ?? 0)) || 0,
++    spendMinor: microsToMinor(m.costMicros),
++    revenueMinor: decimalToMinor(m.conversionsValue),
++    impressions: parseInt(m.impressions ?? "0", 10) || 0,
++    clicks: parseInt(m.clicks ?? "0", 10) || 0,
++    purchases: Math.round(Number(m.conversions ?? 0)) || 0,
+     reach: 0,
+     // Google's `video_views` is the closest available analogue to Meta's
+     // 3-second-view metric, not an exact equivalent — treat as approximate.
+@@ -351,6 +363,14 @@ function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRe
+   };
+ }
+ 
++function mapMetricsRow(r: GoogleAdsMetricsRow, currency: string): DailyInsightRecord {
++  return {
++    campaignExternalId: r.campaign.id,
++    date: r.segments.date,
++    ...mapGoogleAdsFacts(r.metrics, currency),
++  };
++}
++
+ export function createGoogleAdsProvider(): AdsProvider {
+   return {
+     key: "google_ads",
+-- 
+2.43.0
+

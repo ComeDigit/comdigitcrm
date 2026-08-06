@@ -1,0 +1,758 @@
+From ffc06d2d3f660ff4de2a4ecef45bb1fcc9d3a947 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 26 Jul 2026 20:26:47 +0000
+Subject: [PATCH] Add a full audit trail: auth events, connection lifecycle,
+ and a viewer page
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends AUDIT_REPORT.md's "no audit trail for auth/connection events"
+finding (High) end to end:
+
+- Every connect action (Meta, Shopify, Google Ads, TikTok — paste-token,
+  agency-token, OAuth, and auto-provision paths) now logs a
+  connection.connect event with the account and client it touched.
+- New disconnectConnection() action + a "Disconnect" control per connected
+  account in Settings — there was previously no way to cut a client's ad
+  account/store connection off short of editing the database by hand.
+  Disconnecting flips status to "disconnected", which every live-report
+  and health-check function already treats as inactive.
+- Client portal auth events are now logged: login success, failed
+  password, lockout triggered, and logout, plus the admin-side login
+  management actions (create/update/enable/disable/unlock/delete).
+- New /dashboard/activity page (audit log had no display UI before this —
+  it was write-only) shows the most recent 200 events with the client name,
+  action, and a compact detail summary. Linked from the sidebar.
+- Connected-accounts list in Settings now labels each connection by client
+  name, not just its raw ad-account/store name — previously indistinguishable
+  which client a given connection belonged to when an agency has several.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ src/app/dashboard/activity/page.tsx           | 104 +++++++++++++
+ src/app/dashboard/settings/page.tsx           |  20 ++-
+ src/components/shell/sidebar.tsx              |   2 +
+ src/features/audit/queries.ts                 |  48 ++++++
+ src/features/client-portal/actions.ts         | 121 ++++++++++++++-
+ src/features/integrations/actions.ts          | 142 ++++++++++++++++++
+ .../integrations/components/forms.tsx         |  45 ++++++
+ 7 files changed, 471 insertions(+), 11 deletions(-)
+ create mode 100644 src/app/dashboard/activity/page.tsx
+ create mode 100644 src/features/audit/queries.ts
+
+diff --git a/src/app/dashboard/activity/page.tsx b/src/app/dashboard/activity/page.tsx
+new file mode 100644
+index 0000000..19631ca
+--- /dev/null
++++ b/src/app/dashboard/activity/page.tsx
+@@ -0,0 +1,104 @@
++import { Topbar } from "@/components/shell/topbar";
++import { Card, CardHeader, Badge, EmptyState } from "@/components/ui/primitives";
++import { getPrincipal } from "@/lib/auth/principal";
++import { getRecentAuditEvents, RECENT_EVENTS_LIMIT, type AuditEventRow } from "@/features/audit/queries";
++import { getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
++import { isDemoMode } from "@/lib/env";
++
++export const metadata = { title: "Activity" };
++
++function humanizeAction(action: string): string {
++  return action.replace(/[._]/g, " ");
++}
++
++/** Only genuinely security-relevant events get flagged red — routine admin
++ *  actions (suspend, disable, disconnect, delete/archive) are intentional
++ *  decisions, not problems, so they stay neutral. */
++function actionTone(action: string): "negative" | "outline" {
++  return /login_failed|lockout/.test(action) ? "negative" : "outline";
++}
++
++function summarizeDetail(value: unknown): string | null {
++  if (!value || typeof value !== "object") return null;
++  const parts = Object.entries(value as Record<string, unknown>)
++    .filter(([, v]) => v !== null && v !== undefined && v !== "")
++    .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`);
++  if (parts.length === 0) return null;
++  const joined = parts.join(", ");
++  return joined.length > 140 ? `${joined.slice(0, 140)}…` : joined;
++}
++
++export default async function ActivityPage() {
++  const principal = await getPrincipal();
++
++  const [events, workspaces, archivedWorkspaces] = await Promise.all([
++    getRecentAuditEvents(principal.orgId),
++    isDemoMode ? Promise.resolve([]) : getWorkspaces(principal.orgId),
++    isDemoMode ? Promise.resolve([]) : getArchivedWorkspaces(principal.orgId),
++  ]);
++
++  const workspaceName = new Map<string, string>();
++  for (const w of [...workspaces, ...archivedWorkspaces]) workspaceName.set(w.id, w.name);
++
++  const rowLabel = (e: AuditEventRow): string =>
++    e.workspaceId ? (workspaceName.get(e.workspaceId) ?? "Deleted client") : "—";
++
++  return (
++    <>
++      <Topbar title="Activity" />
++      <main className="space-y-6 px-6 py-6">
++        <Card>
++          <CardHeader
++            title="Audit log"
++            subtitle={
++              isDemoMode
++                ? "Demo mode — connect Supabase to see real activity."
++                : `Client logins, connection changes, and roster edits — most recent ${RECENT_EVENTS_LIMIT} events`
++            }
++          />
++          <div className="px-5 pb-5 pt-2">
++            {isDemoMode ? (
++              <p className="text-xs text-muted">
++                Demo mode has no audit trail to show — this becomes live the moment Supabase is connected.
++              </p>
++            ) : events.length === 0 ? (
++              <EmptyState
++                title="No activity yet"
++                hint="Connect an integration, add a client login, or edit a client and it'll show up here."
++              />
++            ) : (
++              <div className="overflow-x-auto">
++                <table className="w-full text-left text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-[11px] uppercase tracking-widest text-muted">
++                      <th className="py-2 pr-4 font-medium">When</th>
++                      <th className="py-2 pr-4 font-medium">Event</th>
++                      <th className="py-2 pr-4 font-medium">Client</th>
++                      <th className="py-2 font-medium">Detail</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {events.map((e) => (
++                      <tr key={e.id} className="border-b border-border/60 align-top">
++                        <td className="whitespace-nowrap py-2 pr-4 text-xs text-muted">
++                          {new Date(e.createdAt).toLocaleString("en-IN")}
++                        </td>
++                        <td className="py-2 pr-4">
++                          <Badge tone={actionTone(e.action)}>{humanizeAction(e.action)}</Badge>
++                        </td>
++                        <td className="whitespace-nowrap py-2 pr-4 text-xs">{rowLabel(e)}</td>
++                        <td className="py-2 text-xs text-muted">
++                          {summarizeDetail(e.after) ?? summarizeDetail(e.before) ?? "—"}
++                        </td>
++                      </tr>
++                    ))}
++                  </tbody>
++                </table>
++              </div>
++            )}
++          </div>
++        </Card>
++      </main>
++    </>
++  );
++}
+diff --git a/src/app/dashboard/settings/page.tsx b/src/app/dashboard/settings/page.tsx
+index 7770039..2ce8875 100644
+--- a/src/app/dashboard/settings/page.tsx
++++ b/src/app/dashboard/settings/page.tsx
+@@ -3,7 +3,7 @@ import { Card, CardHeader, Badge, Button } from "@/components/ui/primitives";
+ import { env, isDemoMode } from "@/lib/env";
+ import { getPrincipal } from "@/lib/auth/principal";
+ import { getActiveWorkspaceId } from "@/lib/workspace";
+-import { getWorkspaces } from "@/features/crm/queries";
++import { getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
+ import {
+   ConnectMetaTokenForm,
+   ConnectMetaAgencyForm,
+@@ -12,6 +12,7 @@ import {
+   ConnectShopifyOAuthForm,
+   ConnectGoogleAdsAgencyForm,
+   ConnectTikTokTokenForm,
++  DisconnectConnectionButton,
+ } from "@/features/integrations/components/forms";
+ import { checkAgencyMetaTokenHealth } from "@/features/integrations/actions";
+ import { checkMetaAccountsHealth, type AccountHealth } from "@/features/integrations/meta-live";
+@@ -50,6 +51,13 @@ export default async function SettingsPage() {
+   const workspaceId = await getActiveWorkspaceId();
+   const connections = await getConnections(principal.orgId);
+   const workspaces = isDemoMode ? [] : await getWorkspaces(principal.orgId);
++  const archivedWorkspaces = isDemoMode ? [] : await getArchivedWorkspaces(principal.orgId);
++  // Connections span every client — without this label, a Meta/Shopify/
++  // Google Ads/TikTok connection only ever shows its own ad-account/store
++  // name, with no indication of WHICH client it belongs to (AUDIT_REPORT.md
++  // — Partial: "global connected-accounts view doesn't label by client").
++  const workspaceNameById = new Map<string, string>();
++  for (const w of [...workspaces, ...archivedWorkspaces]) workspaceNameById.set(w.id, w.name);
+   const metaConfigured = Boolean(process.env.META_APP_ID);
+   const shopifyOAuthConfigured = Boolean(process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET);
+   const agencyTokenConfigured = Boolean(env.META_USER_TOKEN);
+@@ -228,9 +236,12 @@ export default async function SettingsPage() {
+                   <div>
+                     <span className="font-medium">{p.label}</span>
+                     {existing.map((c) => (
+-                      <p key={c.id} className="flex items-center gap-1.5 text-xs text-muted">
++                      <p key={c.id} className="flex flex-wrap items-center gap-1.5 text-xs text-muted">
++                        <span className="font-medium text-foreground">
++                          {workspaceNameById.get(c.workspaceId) ?? "Deleted client"}
++                        </span>
+                         <span>
+-                          {c.displayName} ·{" "}
++                          — {c.displayName} ·{" "}
+                           <span className={c.status === "active" ? "text-positive" : "text-muted"}>
+                             {c.status}
+                           </span>
+@@ -242,6 +253,9 @@ export default async function SettingsPage() {
+                         ) : c.lastSyncAt ? (
+                           `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
+                         ) : null}
++                        {c.status === "active" ? (
++                          <DisconnectConnectionButton connectionId={c.id} workspaceId={c.workspaceId} />
++                        ) : null}
+                       </p>
+                     ))}
+                   </div>
+diff --git a/src/components/shell/sidebar.tsx b/src/components/shell/sidebar.tsx
+index 09d8528..939ccb7 100644
+--- a/src/components/shell/sidebar.tsx
++++ b/src/components/shell/sidebar.tsx
+@@ -12,6 +12,7 @@ import {
+   CheckSquare,
+   Settings,
+   Sparkles,
++  History,
+   type LucideIcon,
+ } from "lucide-react";
+ import { cn } from "@/lib/utils";
+@@ -45,6 +46,7 @@ const NAV: Array<{ section: string; items: NavItem[] }> = [
+     section: "Workspace",
+     items: [
+       { href: "/dashboard/ai", label: "AI Copilot", icon: Sparkles },
++      { href: "/dashboard/activity", label: "Activity log", icon: History },
+       { href: "/dashboard/settings", label: "Settings", icon: Settings },
+     ],
+   },
+diff --git a/src/features/audit/queries.ts b/src/features/audit/queries.ts
+new file mode 100644
+index 0000000..00f248d
+--- /dev/null
++++ b/src/features/audit/queries.ts
+@@ -0,0 +1,48 @@
++import "server-only";
++import { isDemoMode } from "@/lib/env";
++import { getDb } from "@/lib/db";
++
++/**
++ * Read side of the audit trail (AUDIT_REPORT.md — Partial: "audit logs
++ * write-only with no display UI"). auditLog itself has been written to by
++ * mutation helpers for a while; this is the first query that reads it back.
++ * No demo-mode data — the demo generator has never produced audit rows, so
++ * demo mode just shows an empty/explanatory state on the page instead.
++ */
++
++export interface AuditEventRow {
++  id: string;
++  workspaceId: string | null;
++  actorId: string | null;
++  action: string;
++  resourceType: string;
++  resourceId: string | null;
++  before: unknown;
++  after: unknown;
++  createdAt: string;
++}
++
++const RECENT_EVENTS_LIMIT = 200;
++
++export async function getRecentAuditEvents(orgId: string): Promise<AuditEventRow[]> {
++  if (isDemoMode) return [];
++  const db = getDb();
++  const rows = await db.query.auditLog.findMany({
++    where: (a, { eq }) => eq(a.orgId, orgId),
++    orderBy: (a, { desc }) => desc(a.createdAt),
++    limit: RECENT_EVENTS_LIMIT,
++  });
++  return rows.map((r) => ({
++    id: r.id,
++    workspaceId: r.workspaceId,
++    actorId: r.actorId,
++    action: r.action,
++    resourceType: r.resourceType,
++    resourceId: r.resourceId,
++    before: r.before,
++    after: r.after,
++    createdAt: r.createdAt.toISOString(),
++  }));
++}
++
++export { RECENT_EVENTS_LIMIT };
+diff --git a/src/features/client-portal/actions.ts b/src/features/client-portal/actions.ts
+index 262fc0a..644f899 100644
+--- a/src/features/client-portal/actions.ts
++++ b/src/features/client-portal/actions.ts
+@@ -5,16 +5,44 @@ import { redirect } from "next/navigation";
+ import { revalidatePath } from "next/cache";
+ import { isDemoMode } from "@/lib/env";
+ import { getDb } from "@/lib/db";
+-import { clientUsers } from "@/db/schema";
++import { clientUsers, auditLog } from "@/db/schema";
+ import { authorize, AuthorizationError } from "@/lib/auth/authorize";
+-import { getPrincipal } from "@/lib/auth/principal";
++import { getPrincipal, actorIdOrNull } from "@/lib/auth/principal";
+ import {
+   hashPassword,
+   verifyPassword,
+   createClientSession,
+   destroyClientSession,
++  getClientSession,
+ } from "@/lib/auth/client-session";
+ 
++/**
++ * Auth-event audit trail (AUDIT_REPORT.md — High: "no audit trail for
++ * auth/connection events"). Failed attempts against a username that
++ * doesn't exist at all are deliberately NOT logged here — there's no
++ * orgId/workspaceId to attach them to, and it's mostly attacker
++ * fingerprinting rather than something an agency can act on. Every event
++ * below is for a username that DOES resolve to a real client_user.
++ */
++async function logClientAuthEvent(params: {
++  orgId: string;
++  workspaceId: string;
++  clientUserId: string;
++  username: string;
++  action: "client_auth.login_success" | "client_auth.login_failed" | "client_auth.lockout" | "client_auth.logout";
++}): Promise<void> {
++  const db = getDb();
++  await db.insert(auditLog).values({
++    orgId: params.orgId,
++    workspaceId: params.workspaceId,
++    actorId: params.clientUserId,
++    action: params.action,
++    resourceType: "client_user",
++    resourceId: params.clientUserId,
++    after: { username: params.username },
++  });
++}
++
+ /**
+  * Login rate limiting (AUDIT_REPORT.md — Critical: "no rate limiting on
+  * client login"). 5 wrong passwords locks the account for 15 minutes;
+@@ -120,20 +148,35 @@ export async function saveClientLogin(
+ 
+     const passwordHash = hashPassword(password);
+ 
++    let clientUserId = existing?.id ?? null;
+     if (existing) {
+       await db
+         .update(clientUsers)
+         .set({ username: cleanUsername, passwordHash, status: "active", updatedAt: new Date() })
+         .where(eq(clientUsers.id, existing.id));
+     } else {
+-      await db.insert(clientUsers).values({
+-        orgId: principal.orgId,
+-        workspaceId,
+-        username: cleanUsername,
+-        passwordHash,
+-      });
++      const [created] = await db
++        .insert(clientUsers)
++        .values({
++          orgId: principal.orgId,
++          workspaceId,
++          username: cleanUsername,
++          passwordHash,
++        })
++        .returning({ id: clientUsers.id });
++      clientUserId = created.id;
+     }
+ 
++    await db.insert(auditLog).values({
++      orgId: principal.orgId,
++      workspaceId,
++      actorId: actorIdOrNull(principal.userId),
++      action: existing ? "client_user.update" : "client_user.create",
++      resourceType: "client_user",
++      resourceId: clientUserId,
++      after: { username: cleanUsername },
++    });
++
+     revalidatePath("/dashboard/settings");
+     return { ok: true };
+   } catch (e) {
+@@ -158,6 +201,14 @@ export async function setClientLoginStatus(
+       .update(clientUsers)
+       .set({ status, updatedAt: new Date() })
+       .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
++    await db.insert(auditLog).values({
++      orgId: principal.orgId,
++      workspaceId,
++      actorId: actorIdOrNull(principal.userId),
++      action: status === "active" ? "client_user.enable" : "client_user.disable",
++      resourceType: "client_user",
++      resourceId: id,
++    });
+     revalidatePath("/dashboard/settings");
+     return { ok: true };
+   } catch (e) {
+@@ -177,6 +228,14 @@ export async function unlockClientLogin(id: string, workspaceId: string): Promis
+       .update(clientUsers)
+       .set({ failedAttempts: 0, lockedUntil: null, updatedAt: new Date() })
+       .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
++    await db.insert(auditLog).values({
++      orgId: principal.orgId,
++      workspaceId,
++      actorId: actorIdOrNull(principal.userId),
++      action: "client_user.unlock",
++      resourceType: "client_user",
++      resourceId: id,
++    });
+     revalidatePath("/dashboard/settings");
+     return { ok: true };
+   } catch (e) {
+@@ -194,6 +253,14 @@ export async function deleteClientLogin(id: string, workspaceId: string): Promis
+     await db
+       .delete(clientUsers)
+       .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
++    await db.insert(auditLog).values({
++      orgId: principal.orgId,
++      workspaceId,
++      actorId: actorIdOrNull(principal.userId),
++      action: "client_user.delete",
++      resourceType: "client_user",
++      resourceId: id,
++    });
+     revalidatePath("/dashboard/settings");
+     return { ok: true };
+   } catch (e) {
+@@ -263,10 +330,24 @@ export async function clientLogin(username: string, password: string): Promise<A
+         .update(clientUsers)
+         .set({ failedAttempts: 0, lockedUntil: new Date(Date.now() + LOCKOUT_DURATION_MS) })
+         .where(eq(clientUsers.id, user.id));
++      await logClientAuthEvent({
++        orgId: user.orgId,
++        workspaceId: user.workspaceId,
++        clientUserId: user.id,
++        username: user.username,
++        action: "client_auth.lockout",
++      });
+       return {
+         error: `Too many failed attempts. Try again in ${Math.ceil(LOCKOUT_DURATION_MS / 60_000)} minutes, or ask your agency to unlock it.`,
+       };
+     }
++    await logClientAuthEvent({
++      orgId: user.orgId,
++      workspaceId: user.workspaceId,
++      clientUserId: user.id,
++      username: user.username,
++      action: "client_auth.login_failed",
++    });
+     return { error: "Incorrect username or password." };
+   }
+ 
+@@ -275,10 +356,34 @@ export async function clientLogin(username: string, password: string): Promise<A
+     .update(clientUsers)
+     .set({ lastLoginAt: new Date(), failedAttempts: 0, lockedUntil: null })
+     .where(eq(clientUsers.id, user.id));
++  await logClientAuthEvent({
++    orgId: user.orgId,
++    workspaceId: user.workspaceId,
++    clientUserId: user.id,
++    username: user.username,
++    action: "client_auth.login_success",
++  });
+   redirect("/client");
+ }
+ 
+ export async function clientLogoutAction(): Promise<void> {
++  const session = await getClientSession();
+   await destroyClientSession();
++  if (session) {
++    const db = getDb();
++    const user = await db.query.clientUsers.findFirst({
++      where: (u, { eq: eqOp }) => eqOp(u.id, session.clientUserId),
++      columns: { orgId: true },
++    });
++    if (user) {
++      await logClientAuthEvent({
++        orgId: user.orgId,
++        workspaceId: session.workspaceId,
++        clientUserId: session.clientUserId,
++        username: session.username,
++        action: "client_auth.logout",
++      });
++    }
++  }
+   redirect("/client/login");
+ }
+diff --git a/src/features/integrations/actions.ts b/src/features/integrations/actions.ts
+index da8323e..ff03562 100644
+--- a/src/features/integrations/actions.ts
++++ b/src/features/integrations/actions.ts
+@@ -1,6 +1,7 @@
+ "use server";
+ 
+ import { revalidatePath } from "next/cache";
++import { and, eq } from "drizzle-orm";
+ import { env, isDemoMode } from "@/lib/env";
+ import { getDb } from "@/lib/db";
+ import { integrationConnections, integrationSecrets, workspaces, auditLog } from "@/db/schema";
+@@ -12,6 +13,34 @@ import { verifyShopifyCredentials, type ShopifyShopInfo } from "./shopify";
+ import { refreshAccessToken, listLinkedClientAccounts } from "./google-ads";
+ import { fetchAuthorizedAdvertiserIds, fetchAdvertiserInfo } from "./tiktok";
+ 
++/**
++ * Connection lifecycle audit trail (AUDIT_REPORT.md — High: "no audit trail
++ * for auth/connection events"). Every successful connect/disconnect across
++ * all five providers funnels through this one insert so the shape and the
++ * resourceType string stay identical everywhere, instead of each provider's
++ * connect function hand-rolling its own auditLog.values({...}).
++ */
++async function logConnectionEvent(params: {
++  orgId: string;
++  workspaceId: string;
++  actorId: string | null;
++  provider: string;
++  externalAccountId: string;
++  displayName: string;
++  action: "connection.connect" | "connection.disconnect";
++}): Promise<void> {
++  const db = getDb();
++  await db.insert(auditLog).values({
++    orgId: params.orgId,
++    workspaceId: params.workspaceId,
++    actorId: params.actorId,
++    action: params.action,
++    resourceType: "integration_connection",
++    resourceId: params.externalAccountId,
++    after: { provider: params.provider, displayName: params.displayName },
++  });
++}
++
+ /** Same slugify as features/crm/actions.ts's createWorkspace — duplicated
+  *  rather than imported so this file doesn't reach across features for one
+  *  small pure function. Keep the two in sync if the scheme ever changes. */
+@@ -202,6 +231,15 @@ export async function connectMetaAccounts(
+       // Meta reporting is on-demand now (see features/integrations/meta-live.ts)
+       // — no background sync job to enqueue. The Meta Ads page and share
+       // links pull live from Graph the moment someone opens them.
++      await logConnectionEvent({
++        orgId: principal.orgId,
++        workspaceId: sel.workspaceId,
++        actorId: actorIdOrNull(principal.userId),
++        provider: "meta",
++        externalAccountId: sel.accountId,
++        displayName: sel.name,
++        action: "connection.connect",
++      });
+     }
+   } catch (e) {
+     if (e instanceof AuthorizationError) {
+@@ -296,6 +334,16 @@ export async function connectAgencyMetaAccounts(
+           ],
+           set: { status: "active", lastError: null, displayName: sel.name },
+         });
++
++      await logConnectionEvent({
++        orgId: principal.orgId,
++        workspaceId: sel.workspaceId,
++        actorId: actorIdOrNull(principal.userId),
++        provider: "meta",
++        externalAccountId: sel.accountId,
++        displayName: sel.name,
++        action: "connection.connect",
++      });
+     }
+   } catch (e) {
+     if (e instanceof AuthorizationError) {
+@@ -426,6 +474,15 @@ export async function autoProvisionAgencyMetaAccounts(): Promise<AutoProvisionRe
+           ],
+           set: { status: "active", lastError: null, displayName: account.name },
+         });
++      await logConnectionEvent({
++        orgId: principal.orgId,
++        workspaceId: workspace.id,
++        actorId: actorIdOrNull(principal.userId),
++        provider: "meta",
++        externalAccountId: account.accountId,
++        displayName: account.name,
++        action: "connection.connect",
++      });
+       connectedAccounts++;
+     }
+   } catch (e) {
+@@ -574,6 +631,16 @@ export async function connectShopifyStore(
+           rotatedAt: new Date(),
+         },
+       });
++
++    await logConnectionEvent({
++      orgId: principal.orgId,
++      workspaceId,
++      actorId: actorIdOrNull(principal.userId),
++      provider: "shopify",
++      externalAccountId: shopDomain,
++      displayName: shop.name,
++      action: "connection.connect",
++    });
+   } catch (e) {
+     if (e instanceof AuthorizationError) return { error: "Not allowed." };
+     return {
+@@ -713,6 +780,16 @@ export async function connectAgencyGoogleAdsAccounts(
+           ],
+           set: { status: "active", lastError: null, displayName: sel.name },
+         });
++
++      await logConnectionEvent({
++        orgId: principal.orgId,
++        workspaceId: sel.workspaceId,
++        actorId: actorIdOrNull(principal.userId),
++        provider: "google_ads",
++        externalAccountId: sel.customerId,
++        displayName: sel.name,
++        action: "connection.connect",
++      });
+     }
+   } catch (e) {
+     if (e instanceof AuthorizationError) {
+@@ -859,6 +936,16 @@ export async function connectTikTokAccounts(
+             rotatedAt: new Date(),
+           },
+         });
++
++      await logConnectionEvent({
++        orgId: principal.orgId,
++        workspaceId: sel.workspaceId,
++        actorId: actorIdOrNull(principal.userId),
++        provider: "tiktok",
++        externalAccountId: sel.advertiserId,
++        displayName: sel.name,
++        action: "connection.connect",
++      });
+     }
+   } catch (e) {
+     if (e instanceof AuthorizationError) {
+@@ -875,3 +962,58 @@ export async function connectTikTokAccounts(
+   revalidatePath("/dashboard/settings");
+   return { ok: true };
+ }
++
++/**
++ * Disconnects any connected account (any provider) — the counterpart to
++ * every connect* function above, and previously missing entirely (there
++ * was no way to cut a client's Meta/Shopify/Google Ads/TikTok connection
++ * off without deleting rows by hand in the database). Sets status to
++ * "disconnected" rather than removing the row: every live-report/health
++ * function already filters on status = "active" (see meta-live.ts,
++ * shopify-live.ts, google-ads-live.ts, tiktok-live.ts), so this alone stops
++ * it from being read anywhere, immediately — the encrypted secret is left
++ * in place since reconnecting through the normal connect flow overwrites it
++ * anyway, and there's no separate "reactivate without re-entering
++ * credentials" path (a provider may have revoked the token in the
++ * meantime, so re-verifying is the safer default).
++ */
++export async function disconnectConnection(
++  connectionId: string,
++  workspaceId: string,
++): Promise<ActionResult> {
++  if (isDemoMode) return { error: "Demo mode." };
++  try {
++    const principal = await getPrincipal();
++    authorize(principal, "connections.manage", workspaceId);
++
++    const db = getDb();
++    const [row] = await db
++      .update(integrationConnections)
++      .set({ status: "disconnected" })
++      .where(
++        and(
++          eq(integrationConnections.id, connectionId),
++          eq(integrationConnections.workspaceId, workspaceId),
++          eq(integrationConnections.orgId, principal.orgId),
++        ),
++      )
++      .returning();
++    if (!row) return { error: "Connection not found." };
++
++    await logConnectionEvent({
++      orgId: principal.orgId,
++      workspaceId,
++      actorId: actorIdOrNull(principal.userId),
++      provider: row.provider,
++      externalAccountId: row.externalAccountId,
++      displayName: row.displayName,
++      action: "connection.disconnect",
++    });
++
++    revalidatePath("/dashboard/settings");
++    return { ok: true };
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    return { error: "Could not disconnect this account." };
++  }
++}
+diff --git a/src/features/integrations/components/forms.tsx b/src/features/integrations/components/forms.tsx
+index 6d294b2..6986d4a 100644
+--- a/src/features/integrations/components/forms.tsx
++++ b/src/features/integrations/components/forms.tsx
+@@ -14,6 +14,7 @@ import {
+   connectAgencyGoogleAdsAccounts,
+   previewTikTokAccessToken,
+   connectTikTokAccounts,
++  disconnectConnection,
+   type MetaAccountPreview,
+   type GoogleAdsAccountPreview,
+   type TikTokAccountPreview,
+@@ -411,6 +412,50 @@ export function AutoProvisionMetaAccountsButton() {
+   );
+ }
+ 
++/**
++ * Cuts a single connected account off — the counterpart to every connect
++ * flow above. Previously there was no way to do this at all short of
++ * editing the database by hand. Reversible: reconnecting through the
++ * normal flow (with valid credentials) brings it back to active.
++ */
++export function DisconnectConnectionButton({
++  connectionId,
++  workspaceId,
++}: {
++  connectionId: string;
++  workspaceId: string;
++}) {
++  const [pending, startTransition] = useTransition();
++  const [error, setError] = useState<string | null>(null);
++  const [done, setDone] = useState(false);
++
++  function run() {
++    setError(null);
++    startTransition(async () => {
++      const result = await disconnectConnection(connectionId, workspaceId);
++      if (result.error) {
++        setError(result.error);
++        return;
++      }
++      setDone(true);
++    });
++  }
++
++  if (done) return <span className="text-xs text-muted">Disconnected</span>;
++
++  return (
++    <button
++      type="button"
++      disabled={pending}
++      onClick={run}
++      title={error ?? undefined}
++      className="text-xs font-medium text-muted underline-offset-4 hover:text-negative hover:underline disabled:opacity-50"
++    >
++      {pending ? "…" : "Disconnect"}
++    </button>
++  );
++}
++
+ /**
+  * Shopify connect — paste a shop domain + Admin API access token from a
+  * custom app created directly in that store's admin (see the Settings
+-- 
+2.43.0
+

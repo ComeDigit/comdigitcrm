@@ -1,0 +1,24 @@
+Critical bug fix: the clients roster was reading revenue/orders from a dead
+DB table (getShopDaily) even in live mode, so every client silently showed
+$0/0 in production — now branches to the same live Shopify pull every other
+report page already uses.
+
+Also completes the top of the post-audit punch list:
+- Client login rate limiting: 5 failed attempts locks the account for 15
+  minutes (per-account), with an admin "Unlock" override in Settings.
+- Suspend/reactivate a client — blocks their portal login only, admin
+  access and data untouched, reversible with one click.
+- Edit client (rename, set a website) and Delete client (soft-delete via
+  archivedAt, never a hard cascade-delete) with a restore affordance.
+- Search + status filter on the clients list.
+- Suspended/archived workspaces are now also excluded from the admin
+  workspace switcher and from client-portal session validation, so both
+  "suspend" and "delete" actually cut off access everywhere, not just on
+  the roster page.
+
+New migration: supabase/migrations/0005_workspace_status_and_login_lockout.sql
+(run in the Supabase SQL editor — adds workspaces.status and two client_users
+lockout columns, idempotent/safe to run once).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

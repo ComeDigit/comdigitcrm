@@ -1,0 +1,29 @@
+Add Google Ads keyword, search term, device, and location reporting
+
+AUDIT_REPORT.md flagged this as missing (High). New GAQL-based fetchers
+(google-ads-breakdowns.ts) and orchestration layer
+(google-ads-breakdowns-live.ts) mirror the Meta breakdown work — same
+cache/multi-connection-merge/partial-failure pattern, reusing
+google-ads-live.ts's resolveCreds (including its access-token refresh,
+unlike Meta's pure-decrypt version) and a new shared mapGoogleAdsFacts
+helper extracted from google-ads.ts's existing mapMetricsRow. Wired into
+the shared AdsReport component as four new tables — Keywords, Search
+terms, Device, Location — gated to provider === "google_ads" in live
+mode.
+
+Keywords and search terms are capped to the top 50 by spend directly in
+the GAQL query (ORDER BY + LIMIT) rather than paginating everything —
+this Google Ads client has never run against a real large account, so an
+unbounded paginate-everything loop over what can be a very high-
+cardinality report is a real risk, not a hypothetical one.
+
+The location breakdown resolves Google's numeric geo target criterion
+IDs to country codes via a small, hand-verified lookup table (cross-
+checked against Google's published geo targets reference, not guessed)
+covering major markets; an unmapped ID still shows up labeled by its raw
+ID rather than being dropped or mislabeled — a wrong static ID-to-country
+mapping would silently corrupt a client's location data with nothing to
+catch it, so the table only includes entries actually confirmed.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

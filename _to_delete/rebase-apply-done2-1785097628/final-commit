@@ -1,0 +1,25 @@
+Add a full audit trail: auth events, connection lifecycle, and a viewer page
+
+Extends AUDIT_REPORT.md's "no audit trail for auth/connection events"
+finding (High) end to end:
+
+- Every connect action (Meta, Shopify, Google Ads, TikTok — paste-token,
+  agency-token, OAuth, and auto-provision paths) now logs a
+  connection.connect event with the account and client it touched.
+- New disconnectConnection() action + a "Disconnect" control per connected
+  account in Settings — there was previously no way to cut a client's ad
+  account/store connection off short of editing the database by hand.
+  Disconnecting flips status to "disconnected", which every live-report
+  and health-check function already treats as inactive.
+- Client portal auth events are now logged: login success, failed
+  password, lockout triggered, and logout, plus the admin-side login
+  management actions (create/update/enable/disable/unlock/delete).
+- New /dashboard/activity page (audit log had no display UI before this —
+  it was write-only) shows the most recent 200 events with the client name,
+  action, and a compact detail summary. Linked from the sidebar.
+- Connected-accounts list in Settings now labels each connection by client
+  name, not just its raw ad-account/store name — previously indistinguishable
+  which client a given connection belonged to when an agency has several.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

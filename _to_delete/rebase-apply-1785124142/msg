@@ -1,0 +1,17 @@
+AUDIT_REPORT.md flagged both as missing (High). New on-demand Graph API
+fetchers (meta-breakdowns.ts) and orchestration layer
+(meta-breakdowns-live.ts) reuse the existing live-pull cache/multi-
+connection-merge/partial-failure pattern from meta-live.ts. Wired into
+the shared AdsReport component (channel-page.tsx) as four new tables —
+Ad sets, Ads, Audience by age & gender, Audience by country — gated to
+provider === "meta" in live mode, so they automatically show up on the
+internal dashboard, the client portal, and public share links alike.
+
+Ad sets/ads are capped to the top 50 by spend in the UI (not capped
+server-side, unlike the top-25 country breakdown) to avoid an unbounded
+table on large accounts. Entity status (active/paused) is intentionally
+left off ad set/ad rows — Meta's insights endpoint doesn't return it and
+fetching it would mean a second paginated call per level.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

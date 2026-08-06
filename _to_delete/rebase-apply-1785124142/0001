@@ -1,0 +1,838 @@
+From f26f995d96597a4fbd3979851f8455a7925dde4b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 27 Jul 2026 03:48:24 +0000
+Subject: [PATCH] Add Meta ad set/ad level breakdown and age/gender/country
+ audience reporting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+AUDIT_REPORT.md flagged both as missing (High). New on-demand Graph API
+fetchers (meta-breakdowns.ts) and orchestration layer
+(meta-breakdowns-live.ts) reuse the existing live-pull cache/multi-
+connection-merge/partial-failure pattern from meta-live.ts. Wired into
+the shared AdsReport component (channel-page.tsx) as four new tables —
+Ad sets, Ads, Audience by age & gender, Audience by country — gated to
+provider === "meta" in live mode, so they automatically show up on the
+internal dashboard, the client portal, and public share links alike.
+
+Ad sets/ads are capped to the top 50 by spend in the UI (not capped
+server-side, unlike the top-25 country breakdown) to avoid an unbounded
+table on large accounts. Entity status (active/paused) is intentionally
+left off ad set/ad rows — Meta's insights endpoint doesn't return it and
+fetching it would mean a second paginated call per level.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ src/features/ads/channel-page.tsx             | 299 +++++++++++++++++-
+ .../integrations/meta-breakdowns-live.ts      | 160 ++++++++++
+ src/features/integrations/meta-breakdowns.ts  | 156 +++++++++
+ src/features/integrations/meta-live.ts        |  14 +-
+ src/features/integrations/meta.ts             |  28 +-
+ 5 files changed, 639 insertions(+), 18 deletions(-)
+ create mode 100644 src/features/integrations/meta-breakdowns-live.ts
+ create mode 100644 src/features/integrations/meta-breakdowns.ts
+
+diff --git a/src/features/ads/channel-page.tsx b/src/features/ads/channel-page.tsx
+index bf65959..3033cbe 100644
+--- a/src/features/ads/channel-page.tsx
++++ b/src/features/ads/channel-page.tsx
+@@ -14,6 +14,13 @@ import {
+   type CampaignWithFacts,
+ } from "@/features/metrics/queries";
+ import { getLiveMetaReport, getMetaPacing } from "@/features/integrations/meta-live";
++import { getLiveMetaAdSets, getLiveMetaAds, getLiveMetaAudience } from "@/features/integrations/meta-breakdowns-live";
++import type {
++  MetaAdSetInsight,
++  MetaAdInsight,
++  MetaAgeGenderInsight,
++  MetaCountryInsight,
++} from "@/features/integrations/meta-breakdowns";
+ import { getLiveGoogleAdsReport, getGoogleAdsPacing } from "@/features/integrations/google-ads-live";
+ import { getLiveTikTokReport, getTikTokPacing } from "@/features/integrations/tiktok-live";
+ import { adMetrics, sumAdFacts, type AdFacts } from "@/lib/metrics/definitions";
+@@ -56,6 +63,13 @@ export async function AdsReport({
+   let partialFailure = false;
+   let failures: Array<{ displayName: string; reason: string }> = [];
+   let pacing: { activeDailyBudgetMinor: number; spendTodayMinor: number } | null = null;
++  // Meta-only deeper breakdowns (AUDIT_REPORT.md High: ad set/ad level +
++  // audience breakdown) — stay empty for every other provider and for demo
++  // mode, same as `pacing` above.
++  let adSets: MetaAdSetInsight[] = [];
++  let ads: MetaAdInsight[] = [];
++  let byAgeGender: MetaAgeGenderInsight[] = [];
++  let byCountry: MetaCountryInsight[] = [];
+ 
+   // All three ad channels are on-demand/live per client instruction — no
+   // local historical storage for any of them. Two live pulls (current +
+@@ -66,20 +80,42 @@ export async function AdsReport({
+   // fetch. Kept as one block per provider (rather than a generic dispatch
+   // table) so each live-report/pacing pair's types stay concrete.
+   if (provider === "meta" && !isDemoMode) {
+-    const [current, previous, pacingResult] = await Promise.all([
++    const [current, previous, pacingResult, adSetsResult, adsResult, audienceResult] = await Promise.all([
+       getLiveMetaReport(workspaceId, range),
+       getLiveMetaReport(workspaceId, previousPeriod(range)),
+       getMetaPacing(workspaceId),
++      getLiveMetaAdSets(workspaceId, range),
++      getLiveMetaAds(workspaceId, range),
++      getLiveMetaAudience(workspaceId, range),
+     ]);
+     totals = current.totals;
+     prev = previous.totals;
+     trend = current.trend.map((t) => ({ date: t.date, spend: t.spendMinor, revenue: t.revenueMinor }));
+     campaigns = current.campaigns;
+-    partialFailure = current.partialFailure || previous.partialFailure || pacingResult.partialFailure;
+-    // Current-range failures are the most relevant to show — the previous-
+-    // period pull uses the same connections/credentials, so its failures
+-    // would just be duplicates for the same underlying reason.
+-    failures = current.failures;
++    adSets = adSetsResult.adSets;
++    ads = adsResult.ads;
++    byAgeGender = audienceResult.byAgeGender;
++    byCountry = audienceResult.byCountry;
++    partialFailure =
++      current.partialFailure ||
++      previous.partialFailure ||
++      pacingResult.partialFailure ||
++      adSetsResult.partialFailure ||
++      adsResult.partialFailure ||
++      audienceResult.partialFailure;
++    // Every one of these calls shares the same connections/credentials, so
++    // a bad token surfaces in all of them at once — de-duped by display
++    // name so the banner lists each broken account once, not up to 6 times.
++    const seenFailures = new Set<string>();
++    failures = [];
++    for (const list of [current.failures, adSetsResult.failures, adsResult.failures, audienceResult.failures]) {
++      for (const f of list) {
++        if (!seenFailures.has(f.displayName)) {
++          seenFailures.add(f.displayName);
++          failures.push(f);
++        }
++      }
++    }
+     pacing = pacingResult;
+   } else if (provider === "google_ads" && !isDemoMode) {
+     const [current, previous, pacingResult] = await Promise.all([
+@@ -130,6 +166,19 @@ export async function AdsReport({
+   };
+ 
+   campaigns.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++  adSets.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++  ads.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++  // Friendly names in the ad set / ad tables below instead of raw Meta IDs.
++  const campaignNameById = new Map(campaigns.map((c) => [c.id, c.name]));
++  const adSetNameById = new Map(adSets.map((a) => [a.id, a.name]));
++  // Ad sets/ads aren't capped server-side (unlike the top-25 country
++  // breakdown) since a typical account has far fewer of them than
++  // countries — but a handful of large accounts can still return hundreds,
++  // so the table itself caps to the top 50 by spend rather than rendering
++  // an unbounded page.
++  const AD_ENTITY_DISPLAY_CAP = 50;
++  const adSetsShown = adSets.slice(0, AD_ENTITY_DISPLAY_CAP);
++  const adsShown = ads.slice(0, AD_ENTITY_DISPLAY_CAP);
+ 
+   /**
+    * Trimmed to the 4 most-used cards per group (was ~35 cards across 4
+@@ -343,6 +392,244 @@ export async function AdsReport({
+             </table>
+           </div>
+         </Card>
++
++        {provider === "meta" && !isDemoMode ? (
++          <>
++            <Card>
++              <CardHeader
++                title="Ad sets"
++                subtitle={
++                  adSets.length > AD_ENTITY_DISPLAY_CAP
++                    ? `${rangeLabel} · showing top ${AD_ENTITY_DISPLAY_CAP} of ${adSets.length} by spend`
++                    : `${rangeLabel} · all key KPIs per ad set · sorted by spend`
++                }
++              />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Ad set</th>
++                      <th className="px-3 py-2 font-medium">Campaign</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>CPC</th>
++                      <th className={th}>CPM</th>
++                      <th className={th}>CTR</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {adSetsShown.length === 0 ? (
++                      <tr>
++                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No ad sets found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {adSetsShown.map((a) => {
++                      const f = a.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr key={a.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
++                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{a.name}</td>
++                          <td className="max-w-[220px] truncate px-3 py-2.5 text-muted">
++                            {campaignNameById.get(a.campaignId) ?? a.campaignId}
++                          </td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++
++            <Card>
++              <CardHeader
++                title="Ads"
++                subtitle={
++                  ads.length > AD_ENTITY_DISPLAY_CAP
++                    ? `${rangeLabel} · showing top ${AD_ENTITY_DISPLAY_CAP} of ${ads.length} by spend`
++                    : `${rangeLabel} · all key KPIs per ad · sorted by spend`
++                }
++              />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Ad</th>
++                      <th className="px-3 py-2 font-medium">Ad set</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>CPC</th>
++                      <th className={th}>CPM</th>
++                      <th className={th}>CTR</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {adsShown.length === 0 ? (
++                      <tr>
++                        <td colSpan={12} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No ads found for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {adsShown.map((a) => {
++                      const f = a.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr key={a.id} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
++                          <td className="max-w-[220px] truncate px-3 py-2.5 font-medium">{a.name}</td>
++                          <td className="max-w-[220px] truncate px-3 py-2.5 text-muted">
++                            {adSetNameById.get(a.adsetId) ?? a.adsetId}
++                          </td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpc(f))}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpm(f))}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++
++            <Card>
++              <CardHeader title="Audience — age & gender" subtitle={`${rangeLabel} · sorted by spend`} />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Age</th>
++                      <th className="px-3 py-2 font-medium">Gender</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                      <th className={th}>CTR</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {byAgeGender.length === 0 ? (
++                      <tr>
++                        <td colSpan={10} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No audience data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {byAgeGender.map((row) => {
++                      const f = row.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr
++                          key={`${row.age}-${row.gender}`}
++                          className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
++                        >
++                          <td className="px-3 py-2.5 font-medium">{row.age}</td>
++                          <td className="px-3 py-2.5 capitalize text-muted">{row.gender}</td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++
++            <Card>
++              <CardHeader
++                title="Audience — country"
++                subtitle={`${rangeLabel} · sorted by spend${byCountry.length >= 25 ? " · top 25 shown" : ""}`}
++              />
++              <div className="overflow-x-auto px-2 pb-3">
++                <table className="w-full text-[13px]">
++                  <thead>
++                    <tr className="border-b border-border text-left text-xs text-muted">
++                      <th className="px-3 py-2 font-medium">Country</th>
++                      <th className={th}>Spend</th>
++                      <th className={th}>Revenue</th>
++                      <th className={th}>ROAS</th>
++                      <th className={th}>Purchases</th>
++                      <th className={th}>CPA</th>
++                      <th className={th}>Impressions</th>
++                      <th className={th}>Clicks</th>
++                      <th className={th}>CTR</th>
++                    </tr>
++                  </thead>
++                  <tbody>
++                    {byCountry.length === 0 ? (
++                      <tr>
++                        <td colSpan={9} className="px-3 py-6 text-center text-xs text-muted">
++                          {`No audience data for this date range — connect a ${label} account in Settings, or try a wider date range.`}
++                        </td>
++                      </tr>
++                    ) : null}
++                    {byCountry.map((row) => {
++                      const f = row.facts;
++                      const roas = adMetrics.roas(f);
++                      return (
++                        <tr key={row.country} className="border-b border-border/60 last:border-0 hover:bg-surface-2/60">
++                          <td className="px-3 py-2.5 font-medium">{row.country}</td>
++                          <td className={td}>{formatMoney(f.spendMinor)}</td>
++                          <td className={td}>{formatMoney(f.revenueMinor)}</td>
++                          <td className={td}>
++                            <span className={roas >= 2 ? "text-positive" : "text-negative"}>{roas.toFixed(2)}x</span>
++                          </td>
++                          <td className={td}>{formatNumber(f.purchases)}</td>
++                          <td className={td}>{formatMoney(adMetrics.cpa(f))}</td>
++                          <td className={td}>{formatNumber(f.impressions)}</td>
++                          <td className={td}>{formatNumber(f.clicks)}</td>
++                          <td className={td}>{formatPercent(adMetrics.ctr(f), 2)}</td>
++                        </tr>
++                      );
++                    })}
++                  </tbody>
++                </table>
++              </div>
++            </Card>
++          </>
++        ) : null}
+     </main>
+   );
+ }
+diff --git a/src/features/integrations/meta-breakdowns-live.ts b/src/features/integrations/meta-breakdowns-live.ts
+new file mode 100644
+index 0000000..129124e
+--- /dev/null
++++ b/src/features/integrations/meta-breakdowns-live.ts
+@@ -0,0 +1,160 @@
++import "server-only";
++import { getDb } from "@/lib/db";
++import { isDemoMode } from "@/lib/env";
++import { resolveCreds, cached, reasonFor, logMetaFailure, INSIGHTS_TTL_MS } from "./meta-live";
++import {
++  fetchMetaAdSetInsights,
++  fetchMetaAdInsights,
++  fetchMetaAgeGenderBreakdown,
++  fetchMetaCountryBreakdown,
++  type MetaAdSetInsight,
++  type MetaAdInsight,
++  type MetaAgeGenderInsight,
++  type MetaCountryInsight,
++} from "./meta-breakdowns";
++import { sumAdFacts } from "@/lib/metrics/definitions";
++import type { DateRange } from "@/features/metrics/queries";
++import type { MetaFetchFailure } from "./meta-live";
++
++/**
++ * On-demand orchestration for the deeper Meta reports (meta-breakdowns.ts)
++ * — same shape as getLiveMetaReport in meta-live.ts: resolve every active
++ * Meta connection under the workspace, pull each live (cached 60s per
++ * connection+range), merge, and surface partial failures instead of
++ * silently dropping an unreachable account's numbers.
++ *
++ * Ad sets/ads are flat-concatenated across connections (each entity's id is
++ * already unique to its own ad account — same precedent as campaigns in
++ * meta-live.ts). Age/gender and country rows are SUMMED across connections
++ * by their segment key — same precedent as meta-live.ts's daily trend,
++ * which blends multiple ad accounts into one combined series.
++ */
++
++interface Failing {
++  failures: MetaFetchFailure[];
++}
++
++async function forEachConnection<T>(
++  workspaceId: string,
++  fetchOne: (accessToken: string, accountId: string, currency: string) => Promise<T>,
++): Promise<{ results: T[] } & Failing> {
++  if (isDemoMode) return { results: [], failures: [] };
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "meta"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return { results: [], failures: [] };
++
++  const failures: MetaFetchFailure[] = [];
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      const creds = await resolveCreds(connection);
++      if (!creds) {
++        const reason = "No access token available for this account — connect it in Settings or set META_USER_TOKEN.";
++        failures.push({ displayName: connection.displayName, reason });
++        logMetaFailure(connection.displayName, new Error(reason));
++        return null;
++      }
++      try {
++        return await fetchOne(creds.accessToken, connection.externalAccountId, creds.extra?.currency ?? "INR");
++      } catch (e) {
++        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
++        logMetaFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++  // Cast (not a type-predicate filter): for a fully generic, unconstrained
++  // T, TS can't prove Awaited<T> is identical to T, so `r is T` fails to
++  // type-check here even though every non-null branch above is literally
++  // the T that fetchOne resolved to.
++  return { results: perConnection.filter((r) => r !== null) as T[], failures };
++}
++
++export interface LiveMetaAdSets extends Failing {
++  adSets: MetaAdSetInsight[];
++  partialFailure: boolean;
++}
++
++export async function getLiveMetaAdSets(workspaceId: string, range: DateRange): Promise<LiveMetaAdSets> {
++  const { results, failures } = await forEachConnection(workspaceId, (token, accountId, currency) =>
++    cached(`meta-adsets:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++      fetchMetaAdSetInsights(token, accountId, range, currency),
++    ),
++  );
++  return { adSets: results.flat(), partialFailure: failures.length > 0, failures };
++}
++
++export interface LiveMetaAds extends Failing {
++  ads: MetaAdInsight[];
++  partialFailure: boolean;
++}
++
++export async function getLiveMetaAds(workspaceId: string, range: DateRange): Promise<LiveMetaAds> {
++  const { results, failures } = await forEachConnection(workspaceId, (token, accountId, currency) =>
++    cached(`meta-ads:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++      fetchMetaAdInsights(token, accountId, range, currency),
++    ),
++  );
++  return { ads: results.flat(), partialFailure: failures.length > 0, failures };
++}
++
++export interface LiveMetaAudience extends Failing {
++  byAgeGender: MetaAgeGenderInsight[];
++  byCountry: MetaCountryInsight[];
++  partialFailure: boolean;
++}
++
++export async function getLiveMetaAudience(workspaceId: string, range: DateRange): Promise<LiveMetaAudience> {
++  const [ageGenderResult, countryResult] = await Promise.all([
++    forEachConnection(workspaceId, (token, accountId, currency) =>
++      cached(`meta-age-gender:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++        fetchMetaAgeGenderBreakdown(token, accountId, range, currency),
++      ),
++    ),
++    forEachConnection(workspaceId, (token, accountId, currency) =>
++      cached(`meta-country:${workspaceId}:${accountId}:${range.since}:${range.until}`, INSIGHTS_TTL_MS, () =>
++        fetchMetaCountryBreakdown(token, accountId, range, currency),
++      ),
++    ),
++  ]);
++
++  const byAgeGenderMap = new Map<string, { age: string; gender: string; facts: MetaAgeGenderInsight["facts"][] }>();
++  for (const rows of ageGenderResult.results) {
++    for (const row of rows) {
++      const key = `${row.age}|${row.gender}`;
++      const entry = byAgeGenderMap.get(key) ?? { age: row.age, gender: row.gender, facts: [] };
++      entry.facts.push(row.facts);
++      byAgeGenderMap.set(key, entry);
++    }
++  }
++  const byAgeGender = [...byAgeGenderMap.values()]
++    .map((e) => ({ age: e.age, gender: e.gender, facts: sumAdFacts(e.facts) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++
++  const byCountryMap = new Map<string, MetaCountryInsight["facts"][]>();
++  for (const rows of countryResult.results) {
++    for (const row of rows) {
++      const list = byCountryMap.get(row.country) ?? [];
++      list.push(row.facts);
++      byCountryMap.set(row.country, list);
++    }
++  }
++  const byCountry = [...byCountryMap.entries()]
++    .map(([country, facts]) => ({ country, facts: sumAdFacts(facts) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor)
++    .slice(0, 25);
++
++  // Current + previous fetches use the same connections/credentials, so a
++  // failure on one breakdown call almost always means the other failed too
++  // — de-duped by display name so the banner doesn't list the same account
++  // twice (once per breakdown type).
++  const failures = [...ageGenderResult.failures];
++  for (const f of countryResult.failures) {
++    if (!failures.some((existing) => existing.displayName === f.displayName)) failures.push(f);
++  }
++
++  return { byAgeGender, byCountry, partialFailure: failures.length > 0, failures };
++}
+diff --git a/src/features/integrations/meta-breakdowns.ts b/src/features/integrations/meta-breakdowns.ts
+new file mode 100644
+index 0000000..95ec06d
+--- /dev/null
++++ b/src/features/integrations/meta-breakdowns.ts
+@@ -0,0 +1,156 @@
++import "server-only";
++import { graphGet, INSIGHT_FIELDS, mapInsightFacts, type MetaInsightRow } from "./meta";
++import type { AdFacts } from "@/lib/metrics/definitions";
++
++/**
++ * Deeper Meta reporting than the campaign-grain report in meta-live.ts:
++ * ad set / ad level insights (AUDIT_REPORT.md — High: "Meta Ad Sets + Ads
++ * level breakdown missing") and age/gender/country audience breakdowns
++ * (High: "Meta Audience Breakdown missing"). Same on-demand-pull shape as
++ * everything else in this app — nothing here is stored, it hits Graph the
++ * moment the page is opened.
++ *
++ * Deliberately reuses INSIGHT_FIELDS + mapInsightFacts from meta.ts rather
++ * than a slimmer field set: it costs nothing extra (Graph charges the same
++ * either way for one more field in an existing call) and means every table
++ * below gets the exact same ROAS/CPA/CTR/etc. metrics as the campaigns
++ * table, via the same adMetrics helpers — no separate "lite" AdFacts shape
++ * to keep in sync.
++ *
++ * Ad set/ad rows deliberately do NOT include entity status (active/paused)
++ * — Meta's insights endpoint doesn't return it, and fetching it would mean
++ * a second list call (a whole extra paginated request) per level, on top
++ * of an already-heavier page load once these are added to the campaign
++ * report. Spend/performance is the primary thing worth checking at this
++ * granularity; campaign-level status (already shown) is the on/off signal.
++ */
++
++interface GraphPage<T> {
++  data: T[];
++  paging?: { cursors?: { after?: string }; next?: string };
++}
++
++async function fetchAllPages<T>(path: string, token: string): Promise<T[]> {
++  const out: T[] = [];
++  let next: string | undefined;
++  const current = path;
++  do {
++    const sep = current.includes("?") ? "&" : "?";
++    const url = next ? `${current}${sep}after=${encodeURIComponent(next)}` : current;
++    const body = await graphGet<GraphPage<T>>(url, token);
++    out.push(...body.data);
++    next = body.paging?.next ? body.paging.cursors?.after : undefined;
++  } while (next);
++  return out;
++}
++
++/** Every INSIGHT_FIELDS entry except campaign_id/date_start — those are
++ *  either re-added explicitly (campaign_id) or irrelevant (date_start, since
++ *  every fetch below aggregates over the whole range in one row per entity
++ *  rather than a daily trend). */
++const FACT_FIELDS = INSIGHT_FIELDS.split(",").filter((f) => f !== "campaign_id" && f !== "date_start");
++
++export interface MetaAdSetInsight {
++  id: string;
++  name: string;
++  campaignId: string;
++  facts: AdFacts;
++}
++
++export async function fetchMetaAdSetInsights(
++  accessToken: string,
++  accountId: string,
++  range: { since: string; until: string },
++  currency: string,
++): Promise<MetaAdSetInsight[]> {
++  const timeRange = encodeURIComponent(JSON.stringify({ since: range.since, until: range.until }));
++  const fields = ["adset_id", "adset_name", "campaign_id", ...FACT_FIELDS].join(",");
++  const rows = await fetchAllPages<MetaInsightRow & { adset_id: string; adset_name: string }>(
++    `/act_${accountId}/insights?level=adset&time_range=${timeRange}&fields=${fields}&limit=200`,
++    accessToken,
++  );
++  return rows.map((r) => ({
++    id: r.adset_id,
++    name: r.adset_name,
++    campaignId: r.campaign_id,
++    facts: mapInsightFacts(r, currency),
++  }));
++}
++
++export interface MetaAdInsight {
++  id: string;
++  name: string;
++  adsetId: string;
++  campaignId: string;
++  facts: AdFacts;
++}
++
++export async function fetchMetaAdInsights(
++  accessToken: string,
++  accountId: string,
++  range: { since: string; until: string },
++  currency: string,
++): Promise<MetaAdInsight[]> {
++  const timeRange = encodeURIComponent(JSON.stringify({ since: range.since, until: range.until }));
++  const fields = ["ad_id", "ad_name", "adset_id", "campaign_id", ...FACT_FIELDS].join(",");
++  const rows = await fetchAllPages<MetaInsightRow & { ad_id: string; ad_name: string; adset_id: string }>(
++    `/act_${accountId}/insights?level=ad&time_range=${timeRange}&fields=${fields}&limit=200`,
++    accessToken,
++  );
++  return rows.map((r) => ({
++    id: r.ad_id,
++    name: r.ad_name,
++    adsetId: r.adset_id,
++    campaignId: r.campaign_id,
++    facts: mapInsightFacts(r, currency),
++  }));
++}
++
++export interface MetaAgeGenderInsight {
++  age: string;
++  gender: string;
++  facts: AdFacts;
++}
++
++export async function fetchMetaAgeGenderBreakdown(
++  accessToken: string,
++  accountId: string,
++  range: { since: string; until: string },
++  currency: string,
++): Promise<MetaAgeGenderInsight[]> {
++  const timeRange = encodeURIComponent(JSON.stringify({ since: range.since, until: range.until }));
++  const fields = ["age", "gender", ...FACT_FIELDS].join(",");
++  const rows = await fetchAllPages<MetaInsightRow & { age: string; gender: string }>(
++    `/act_${accountId}/insights?level=account&breakdowns=age,gender&time_range=${timeRange}&fields=${fields}&limit=200`,
++    accessToken,
++  );
++  return rows
++    .map((r) => ({ age: r.age, gender: r.gender, facts: mapInsightFacts(r, currency) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++}
++
++export interface MetaCountryInsight {
++  country: string;
++  facts: AdFacts;
++}
++
++export async function fetchMetaCountryBreakdown(
++  accessToken: string,
++  accountId: string,
++  range: { since: string; until: string },
++  currency: string,
++): Promise<MetaCountryInsight[]> {
++  const timeRange = encodeURIComponent(JSON.stringify({ since: range.since, until: range.until }));
++  const fields = ["country", ...FACT_FIELDS].join(",");
++  const rows = await fetchAllPages<MetaInsightRow & { country: string }>(
++    `/act_${accountId}/insights?level=account&breakdowns=country&time_range=${timeRange}&fields=${fields}&limit=200`,
++    accessToken,
++  );
++  // Capped to the top 25 by spend — an account running broad geo-targeting
++  // can return 100+ countries with negligible spend each; nobody needs a
++  // 100-row table for that.
++  return rows
++    .map((r) => ({ country: r.country, facts: mapInsightFacts(r, currency) }))
++    .sort((a, b) => b.facts.spendMinor - a.facts.spendMinor)
++    .slice(0, 25);
++}
+diff --git a/src/features/integrations/meta-live.ts b/src/features/integrations/meta-live.ts
+index 6520558..659eff9 100644
+--- a/src/features/integrations/meta-live.ts
++++ b/src/features/integrations/meta-live.ts
+@@ -14,14 +14,14 @@ import type { DateRange } from "@/features/metrics/queries";
+  * were swallowed silently (just `partialFailure = true`), which made this
+  * exact situation impossible to diagnose without SSH access to Vercel logs.
+  */
+-function reasonFor(e: unknown): string {
++export function reasonFor(e: unknown): string {
+   if (e instanceof ProviderAuthError) return "Meta rejected the token — it's likely expired or was revoked.";
+   if (e instanceof ProviderRateLimitError) return "Meta rate-limited this request — try again in a minute.";
+   if (e instanceof Error) return e.message;
+   return "Unknown error reaching Meta.";
+ }
+ 
+-function logMetaFailure(connectionLabel: string, e: unknown): void {
++export function logMetaFailure(connectionLabel: string, e: unknown): void {
+   // The only signal an operator has when a live Meta pull fails in
+   // production is the Vercel function log — this is deliberate.
+   console.error(`[meta-live] ${connectionLabel}: ${reasonFor(e)}`, e);
+@@ -48,7 +48,11 @@ interface CacheEntry<T> {
+ }
+ const cache = new Map<string, CacheEntry<unknown>>();
+ 
+-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
++/** Exported so meta-breakdowns-live.ts shares this exact cache instance
++ *  (namespaced by key prefix, e.g. "meta-adsets:...") instead of running a
++ *  second independent cache for what's conceptually the same live-pull
++ *  mechanism. */
++export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+   const hit = cache.get(key);
+   const now = Date.now();
+   if (hit && hit.expires > now) return hit.value as T;
+@@ -57,7 +61,7 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
+   return value;
+ }
+ 
+-const INSIGHTS_TTL_MS = 60_000; // 60s — matches "dashboard refreshes within a minute cost zero API calls"
++export const INSIGHTS_TTL_MS = 60_000; // 60s — matches "dashboard refreshes within a minute cost zero API calls"
+ const HEALTH_TTL_MS = 5 * 60_000; // 5min — account health probes every account, so it's checked less often
+ 
+ export interface LiveCampaign {
+@@ -86,7 +90,7 @@ export interface LiveMetaReport {
+   failures: MetaFetchFailure[];
+ }
+ 
+-async function resolveCreds(connection: {
++export async function resolveCreds(connection: {
+   id: string;
+   currencyCode: string | null;
+ }): Promise<ProviderCredentials | null> {
+diff --git a/src/features/integrations/meta.ts b/src/features/integrations/meta.ts
+index 44683ad..edab094 100644
+--- a/src/features/integrations/meta.ts
++++ b/src/features/integrations/meta.ts
+@@ -13,13 +13,13 @@ import { ProviderAuthError, ProviderRateLimitError } from "./types";
+  * decrypted credentials — never from client-facing code.
+  */
+ 
+-const GRAPH = "https://graph.facebook.com/v21.0";
++export const GRAPH = "https://graph.facebook.com/v21.0";
+ 
+ interface MetaError {
+   error?: { code?: number; message?: string };
+ }
+ 
+-async function graphGet<T>(path: string, token: string): Promise<T> {
++export async function graphGet<T>(path: string, token: string): Promise<T> {
+   const sep = path.includes("?") ? "&" : "?";
+   const res = await fetch(`${GRAPH}${path}${sep}access_token=${encodeURIComponent(token)}`);
+   if (res.status === 401 || res.status === 403) throw new ProviderAuthError("Meta auth failed");
+@@ -67,7 +67,7 @@ function actionMoney(list: ActionList, ...types: string[]): number {
+   return 0;
+ }
+ 
+-interface MetaInsightRow {
++export interface MetaInsightRow {
+   campaign_id: string;
+   date_start: string;
+   spend?: string;
+@@ -85,7 +85,7 @@ interface MetaInsightRow {
+   video_p100_watched_actions?: Array<{ action_type: string; value: string }>;
+ }
+ 
+-const INSIGHT_FIELDS = [
++export const INSIGHT_FIELDS = [
+   "campaign_id",
+   "date_start",
+   "spend",
+@@ -103,10 +103,16 @@ const INSIGHT_FIELDS = [
+   "video_p100_watched_actions",
+ ].join(",");
+ 
+-function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord {
++/**
++ * The AdFacts-shaped subset of an insights row — factored out of
++ * mapInsightRow so meta-breakdowns.ts (ad set / ad / audience level
++ * insights, which share this exact metrics shape but aren't keyed by
++ * campaign_id+date_start the way DailyInsightRecord is) can reuse the same
++ * parsing instead of re-deriving it from Meta's actions[]/action_values[]
++ * arrays a second time.
++ */
++export function mapInsightFacts(r: MetaInsightRow, currency: string): Omit<DailyInsightRecord, "campaignExternalId" | "date"> {
+   return {
+-    campaignExternalId: r.campaign_id,
+-    date: r.date_start,
+     currencyCode: currency,
+     spendMinor: toMinor(r.spend),
+     revenueMinor: actionMoney(r.action_values, "omni_purchase", "purchase"),
+@@ -138,6 +144,14 @@ function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord
+   };
+ }
+ 
++function mapInsightRow(r: MetaInsightRow, currency: string): DailyInsightRecord {
++  return {
++    campaignExternalId: r.campaign_id,
++    date: r.date_start,
++    ...mapInsightFacts(r, currency),
++  };
++}
++
+ export interface MetaTokenHealth {
+   valid: boolean;
+   expiresAt: number | null; // unix ms; null = never expires / unknown
+-- 
+2.43.0
+

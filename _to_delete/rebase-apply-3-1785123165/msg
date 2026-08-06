@@ -1,0 +1,9 @@
+The desktop sidebar was "hidden md:flex", so below the md breakpoint it
+just vanished with nothing replacing it (AUDIT_REPORT.md — High: "admin not
+mobile-usable"). Adds a slim mobile top bar with a hamburger trigger and a
+slide-in drawer sharing the exact same nav list (extracted into NavLinks so
+desktop and mobile can never drift apart) — closes on backdrop click or on
+navigating. Desktop layout/behavior is unchanged.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

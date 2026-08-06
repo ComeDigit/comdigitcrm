@@ -61,10 +61,16 @@ export default async function SettingsPage() {
     ...new Set(connections.filter((c) => c.provider === "meta").map((c) => c.workspaceId)),
   ];
   const metaHealthByConnection = new Map<string, AccountHealth>();
+  // Connection ids are unique across providers, so one reason map serves all
+  // four probes. It backs the badge tooltip that explains a "no_access".
+  const healthReasonByConnection = new Map<string, string>();
   if (!isDemoMode) {
     const healthResults = await Promise.all(metaWorkspaceIds.map((wsId) => checkMetaAccountsHealth(wsId)));
     for (const list of healthResults) {
-      for (const r of list) metaHealthByConnection.set(r.connectionId, r.health);
+      for (const r of list) {
+        metaHealthByConnection.set(r.connectionId, r.health);
+        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
+      }
     }
   }
 
@@ -80,7 +86,10 @@ export default async function SettingsPage() {
       shopifyWorkspaceIds.map((wsId) => checkShopifyAccountsHealth(wsId)),
     );
     for (const list of shopifyHealthResults) {
-      for (const r of list) shopifyHealthByConnection.set(r.connectionId, r.health);
+      for (const r of list) {
+        shopifyHealthByConnection.set(r.connectionId, r.health);
+        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
+      }
     }
   }
 
@@ -95,7 +104,10 @@ export default async function SettingsPage() {
       googleAdsWorkspaceIds.map((wsId) => checkGoogleAdsAccountsHealth(wsId)),
     );
     for (const list of googleAdsHealthResults) {
-      for (const r of list) googleAdsHealthByConnection.set(r.connectionId, r.health);
+      for (const r of list) {
+        googleAdsHealthByConnection.set(r.connectionId, r.health);
+        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
+      }
     }
   }
 
@@ -109,7 +121,10 @@ export default async function SettingsPage() {
       tiktokWorkspaceIds.map((wsId) => checkTikTokAccountsHealth(wsId)),
     );
     for (const list of tiktokHealthResults) {
-      for (const r of list) tiktokHealthByConnection.set(r.connectionId, r.health);
+      for (const r of list) {
+        tiktokHealthByConnection.set(r.connectionId, r.health);
+        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
+      }
     }
   }
   const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
@@ -226,9 +241,22 @@ export default async function SettingsPage() {
                           </span>
                         </span>
                         {healthMap ? (
-                          <Badge tone={healthTone(healthMap.get(c.id))}>
-                            {healthLabel(healthMap.get(c.id))}
-                          </Badge>
+                          <>
+                            <Badge
+                              tone={healthTone(healthMap.get(c.id))}
+                              title={healthReasonByConnection.get(c.id)}
+                            >
+                              {healthLabel(healthMap.get(c.id))}
+                            </Badge>
+                            {healthReasonByConnection.get(c.id) ? (
+                              // Shown inline rather than tooltip-only: a
+                              // failing account is exactly the case where
+                              // the operator shouldn't have to go hunting.
+                              <span className="text-negative">
+                                {healthReasonByConnection.get(c.id)}
+                              </span>
+                            ) : null}
+                          </>
                         ) : c.lastSyncAt ? (
                           `· synced ${new Date(c.lastSyncAt).toLocaleString("en-IN")}`
                         ) : null}

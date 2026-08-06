@@ -318,6 +318,18 @@ export interface AccountHealthResult {
   connectionId: string;
   displayName: string;
   health: AccountHealth;
+  /**
+   * Why the probe failed, when it did. "unreachable — check token" on its
+   * own sends an operator to the Vercel function log to find out which of a
+   * dozen causes it was; carrying the reason to the UI answers that in the
+   * place the problem is visible.
+   */
+  reason?: string;
+}
+
+interface HealthProbe {
+  health: AccountHealth;
+  reason?: string;
 }
 
 /** Cheap per-account health probe — mirrors checkMetaAccountsHealth. */
@@ -338,20 +350,30 @@ export async function checkGoogleAdsAccountsHealth(workspaceId: string): Promise
 
   return Promise.all(
     connections.map(async (connection) => {
-      const cacheKey = `google_ads-health:${connection.id}`;
-      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
+      // v2 key: the cached shape changed from a bare string to an object,
+      // so reusing the old key would hand back a string where callers now
+      // read `.health` and every account would read as "checking…".
+      const cacheKey = `google_ads-health2:${connection.id}`;
+      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
         try {
           const creds = await resolveCreds(connection);
-          if (!creds) return "no_access";
+          if (!creds) {
+            return { health: "no_access", reason: "No refresh token — set GOOGLE_ADS_REFRESH_TOKEN or reconnect this account." };
+          }
           const page = await provider.getDailyInsights(creds, connection.externalAccountId, range);
           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
-          return spend > 0 ? "live" : "idle";
+          return { health: spend > 0 ? "live" : "idle" };
         } catch (e) {
           logGoogleAdsFailure(connection.displayName, e);
-          return "no_access";
+          return { health: "no_access", reason: reasonFor(e) };
         }
       });
-      return { connectionId: connection.id, displayName: connection.displayName, health };
+      return {
+        connectionId: connection.id,
+        displayName: connection.displayName,
+        health: probe.health,
+        reason: probe.reason,
+      };
     }),
   );
 }

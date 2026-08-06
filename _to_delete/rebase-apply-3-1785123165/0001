@@ -1,0 +1,226 @@
+From c21dc69e81b0fe742e0b1034c4a6f8eaa68cbf21 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 27 Jul 2026 03:32:24 +0000
+Subject: [PATCH] =?UTF-8?q?Add=20a=20mobile=20nav=20drawer=20=E2=80=94=20t?=
+ =?UTF-8?q?he=20admin=20dashboard=20had=20zero=20navigation=20below=20768p?=
+ =?UTF-8?q?x?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The desktop sidebar was "hidden md:flex", so below the md breakpoint it
+just vanished with nothing replacing it (AUDIT_REPORT.md — High: "admin not
+mobile-usable"). Adds a slim mobile top bar with a hamburger trigger and a
+slide-in drawer sharing the exact same nav list (extracted into NavLinks so
+desktop and mobile can never drift apart) — closes on backdrop click or on
+navigating. Desktop layout/behavior is unchanged.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ src/components/shell/sidebar.tsx | 170 ++++++++++++++++++++++---------
+ 1 file changed, 124 insertions(+), 46 deletions(-)
+
+diff --git a/src/components/shell/sidebar.tsx b/src/components/shell/sidebar.tsx
+index 939ccb7..017b7e8 100644
+--- a/src/components/shell/sidebar.tsx
++++ b/src/components/shell/sidebar.tsx
+@@ -2,6 +2,7 @@
+ 
+ import Link from "next/link";
+ import { usePathname } from "next/navigation";
++import { useState } from "react";
+ import {
+   LayoutDashboard,
+   Users,
+@@ -13,6 +14,8 @@ import {
+   Settings,
+   Sparkles,
+   History,
++  Menu,
++  X,
+   type LucideIcon,
+ } from "lucide-react";
+ import { cn } from "@/lib/utils";
+@@ -52,57 +55,132 @@ const NAV: Array<{ section: string; items: NavItem[] }> = [
+   },
+ ];
+ 
++const Wordmark = () => (
++  <div className="flex items-center gap-2">
++    <div className="flex h-6 w-6 items-center justify-center rounded-md bg-accent text-[11px] font-bold text-accent-foreground">
++      C
++    </div>
++    <span className="text-sm font-semibold tracking-tight">ComeDigit</span>
++  </div>
++);
++
++/** The nav list itself, shared by the desktop rail and the mobile drawer so
++ *  the two can never drift apart. onNavigate fires on every link click —
++ *  the mobile drawer uses it to close itself after navigating. */
++function NavLinks({ pathname, onNavigate }: { pathname: string; onNavigate?: () => void }) {
++  return (
++    <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-3">
++      {NAV.map((group) => (
++        <div key={group.section}>
++          <p className="px-2 pb-1.5 text-[10px] font-medium uppercase tracking-widest text-muted">
++            {group.section}
++          </p>
++          <ul className="space-y-0.5">
++            {group.items.map((item) => {
++              const active =
++                item.href === "/dashboard"
++                  ? pathname === item.href
++                  : pathname.startsWith(item.href);
++              return (
++                <li key={item.href}>
++                  <Link
++                    href={item.href}
++                    onClick={onNavigate}
++                    className={cn(
++                      "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] transition-colors",
++                      active
++                        ? "bg-surface-2 font-medium text-foreground"
++                        : "text-muted hover:bg-surface-2 hover:text-foreground",
++                    )}
++                  >
++                    <item.icon size={15} strokeWidth={1.8} />
++                    {item.label}
++                  </Link>
++                </li>
++              );
++            })}
++          </ul>
++        </div>
++      ))}
++    </nav>
++  );
++}
++
++const statusLine = isDemoMode ? "Demo mode · no keys needed" : "Live · connected to Supabase";
++
+ export function Sidebar() {
+   const pathname = usePathname();
++  const [mobileOpen, setMobileOpen] = useState(false);
++
++  // Belt-and-suspenders: also close on route change (covers back/forward
++  // nav and any link that doesn't go through NavLinks' own onClick). Adjusts
++  // state during render (the documented pattern for "reset state when a
++  // value changes") rather than a useEffect, which would setState after an
++  // extra commit for no benefit here.
++  const [prevPathname, setPrevPathname] = useState(pathname);
++  if (pathname !== prevPathname) {
++    setPrevPathname(pathname);
++    setMobileOpen(false);
++  }
+ 
+   return (
+-    <aside className="fixed inset-y-0 left-0 z-20 hidden w-56 flex-col border-r border-border bg-surface md:flex">
+-      <div className="flex h-14 items-center gap-2 px-5">
+-        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-accent text-[11px] font-bold text-accent-foreground">
+-          C
++    <>
++      {/* Desktop rail — unchanged from before, just the ≥md breakpoint. */}
++      <aside className="fixed inset-y-0 left-0 z-20 hidden w-56 flex-col border-r border-border bg-surface md:flex">
++        <div className="flex h-14 items-center px-5">
++          <Wordmark />
+         </div>
+-        <span className="text-sm font-semibold tracking-tight">
+-          ComeDigit
+-        </span>
+-      </div>
+-      <nav className="flex-1 space-y-5 overflow-y-auto px-3 py-3">
+-        {NAV.map((group) => (
+-          <div key={group.section}>
+-            <p className="px-2 pb-1.5 text-[10px] font-medium uppercase tracking-widest text-muted">
+-              {group.section}
+-            </p>
+-            <ul className="space-y-0.5">
+-              {group.items.map((item) => {
+-                const active =
+-                  item.href === "/dashboard"
+-                    ? pathname === item.href
+-                    : pathname.startsWith(item.href);
+-                return (
+-                  <li key={item.href}>
+-                    <Link
+-                      href={item.href}
+-                      className={cn(
+-                        "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-[13px] transition-colors",
+-                        active
+-                          ? "bg-surface-2 font-medium text-foreground"
+-                          : "text-muted hover:bg-surface-2 hover:text-foreground",
+-                      )}
+-                    >
+-                      <item.icon size={15} strokeWidth={1.8} />
+-                      {item.label}
+-                    </Link>
+-                  </li>
+-                );
+-              })}
+-            </ul>
+-          </div>
+-        ))}
+-      </nav>
+-      <div className="border-t border-border px-5 py-3">
+-        <p className="text-[11px] text-muted">
+-          {isDemoMode ? "Demo mode · no keys needed" : "Live · connected to Supabase"}
+-        </p>
++        <NavLinks pathname={pathname} />
++        <div className="border-t border-border px-5 py-3">
++          <p className="text-[11px] text-muted">{statusLine}</p>
++        </div>
++      </aside>
++
++      {/* Mobile top bar — the admin dashboard previously had NO navigation
++       *  at all below the md breakpoint (the aside above just vanishes).
++       *  This is a normal (non-fixed) bar so it scrolls away naturally and
++       *  lets each page's own sticky Topbar take over the top of the
++       *  viewport, exactly like it does on desktop. */}
++      <div className="flex h-12 items-center justify-between border-b border-border bg-surface px-4 md:hidden">
++        <Wordmark />
++        <button
++          type="button"
++          onClick={() => setMobileOpen(true)}
++          aria-label="Open navigation menu"
++          className="flex h-8 w-8 items-center justify-center rounded-lg text-muted hover:bg-surface-2 hover:text-foreground"
++        >
++          <Menu size={18} />
++        </button>
+       </div>
+-    </aside>
++
++      {/* Mobile drawer + backdrop */}
++      {mobileOpen ? (
++        <div className="fixed inset-0 z-40 md:hidden">
++          <button
++            type="button"
++            aria-label="Close navigation menu"
++            onClick={() => setMobileOpen(false)}
++            className="absolute inset-0 bg-black/40"
++          />
++          <aside className="absolute inset-y-0 left-0 flex w-64 max-w-[80vw] flex-col border-r border-border bg-surface shadow-xl">
++            <div className="flex h-14 items-center justify-between px-5">
++              <Wordmark />
++              <button
++                type="button"
++                onClick={() => setMobileOpen(false)}
++                aria-label="Close navigation menu"
++                className="flex h-8 w-8 items-center justify-center rounded-lg text-muted hover:bg-surface-2 hover:text-foreground"
++              >
++                <X size={16} />
++              </button>
++            </div>
++            <NavLinks pathname={pathname} onNavigate={() => setMobileOpen(false)} />
++            <div className="border-t border-border px-5 py-3">
++              <p className="text-[11px] text-muted">{statusLine}</p>
++            </div>
++          </aside>
++        </div>
++      ) : null}
++    </>
+   );
+ }
+-- 
+2.43.0
+

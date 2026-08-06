@@ -1,0 +1,385 @@
+---
+ src/features/integrations/shopify-live.ts     |  17 ++-
+ .../integrations/shopify-products-live.ts     |  70 +++++++++++
+ src/features/integrations/shopify.ts          | 112 ++++++++++++++++++
+ src/features/shopify/report.tsx               |  83 ++++++++++++-
+ 4 files changed, 272 insertions(+), 10 deletions(-)
+ create mode 100644 src/features/integrations/shopify-products-live.ts
+
+diff --git a/src/features/integrations/shopify-live.ts b/src/features/integrations/shopify-live.ts
+index e169bdb..18d9b0d 100644
+--- a/src/features/integrations/shopify-live.ts
++++ b/src/features/integrations/shopify-live.ts
+@@ -22,7 +22,10 @@ interface CacheEntry<T> {
+ }
+ const cache = new Map<string, CacheEntry<unknown>>();
+ 
+-async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
++/** Exported so shopify-products-live.ts (AUDIT_REPORT.md High: product-
++ *  level data) shares this exact cache instance instead of running a
++ *  second independent one — same reasoning as meta-live.ts's `cached`. */
++export async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>): Promise<T> {
+   const hit = cache.get(key);
+   const now = Date.now();
+   if (hit && hit.expires > now) return hit.value as T;
+@@ -31,17 +34,17 @@ async function cached<T>(key: string, ttlMs: number, compute: () => Promise<T>):
+   return value;
+ }
+ 
+-const FACTS_TTL_MS = 60_000;
++export const FACTS_TTL_MS = 60_000;
+ const HEALTH_TTL_MS = 5 * 60_000;
+ 
+-function reasonFor(e: unknown): string {
++export function reasonFor(e: unknown): string {
+   if (e instanceof ProviderAuthError) return "Shopify rejected the access token — it's likely been revoked. Reconnect in Settings.";
+   if (e instanceof ProviderRateLimitError) return "Shopify rate-limited this request — try again in a minute.";
+   if (e instanceof Error) return e.message;
+   return "Unknown error reaching Shopify.";
+ }
+ 
+-function logShopifyFailure(connectionLabel: string, e: unknown): void {
++export function logShopifyFailure(connectionLabel: string, e: unknown): void {
+   console.error(`[shopify-live] ${connectionLabel}: ${reasonFor(e)}`, e);
+ }
+ 
+@@ -61,12 +64,14 @@ export interface LiveShopifyReport {
+   failures: ShopifyFetchFailure[];
+ }
+ 
+-interface ResolvedShopifyCreds {
++export interface ResolvedShopifyCreds {
+   shopDomain: string;
+   accessToken: string;
+ }
+ 
+-async function resolveCreds(connection: {
++/** Exported so shopify-products-live.ts resolves credentials the exact
++ *  same way rather than duplicating the decrypt step. */
++export async function resolveCreds(connection: {
+   id: string;
+   externalAccountId: string;
+ }): Promise<ResolvedShopifyCreds | null> {
+diff --git a/src/features/integrations/shopify-products-live.ts b/src/features/integrations/shopify-products-live.ts
+new file mode 100644
+index 0000000..f16c445
+--- /dev/null
++++ b/src/features/integrations/shopify-products-live.ts
+@@ -0,0 +1,70 @@
++import "server-only";
++import { getDb } from "@/lib/db";
++import { isDemoMode } from "@/lib/env";
++import { resolveCreds, cached, reasonFor, logShopifyFailure, FACTS_TTL_MS } from "./shopify-live";
++import { fetchShopifyProductFacts, type ShopifyProductFacts } from "./shopify";
++import type { DateRange } from "@/features/metrics/queries";
++import type { ShopifyFetchFailure } from "./shopify-live";
++
++/**
++ * On-demand orchestration for per-product Shopify sales
++ * (AUDIT_REPORT.md — High: "Shopify product-level data missing"). Same
++ * shape as getLiveShopifyReport in shopify-live.ts: resolve every active
++ * Shopify connection under the workspace, pull each live (cached 60s per
++ * connection+range), and surface partial failures instead of silently
++ * dropping an unreachable store's numbers.
++ *
++ * Deliberately NOT merged/summed across connections the way daily
++ * totals are — a Shopify product id is only unique WITHIN one store (it's
++ * a per-shop sequential id, unlike Meta/Google's globally-assigned entity
++ * ids), so two different connected stores could in principle have
++ * unrelated products that happen to share a numeric id. Flat-concatenating
++ * without merging (same as Meta's ad sets/ads) means the worst case for a
++ * multi-store workspace is the same product name appearing twice, not two
++ * unrelated products' revenue silently getting added together.
++ */
++export interface LiveShopifyProducts {
++  products: ShopifyProductFacts[];
++  partialFailure: boolean;
++  failures: ShopifyFetchFailure[];
++}
++
++export async function getLiveShopifyProducts(workspaceId: string, range: DateRange): Promise<LiveShopifyProducts> {
++  const empty: LiveShopifyProducts = { products: [], partialFailure: false, failures: [] };
++  if (isDemoMode) return empty;
++
++  const db = getDb();
++  const connections = await db.query.integrationConnections.findMany({
++    where: (c, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(c.workspaceId, workspaceId), eqOp(c.provider, "shopify"), eqOp(c.status, "active")),
++  });
++  if (connections.length === 0) return empty;
++
++  const failures: ShopifyFetchFailure[] = [];
++  const perConnection = await Promise.all(
++    connections.map(async (connection) => {
++      const creds = await resolveCreds(connection);
++      if (!creds) {
++        const reason = "No access token available for this store — connect it in Settings.";
++        failures.push({ displayName: connection.displayName, reason });
++        logShopifyFailure(connection.displayName, new Error(reason));
++        return null;
++      }
++      const cacheKey = `shopify-products:${connection.id}:${range.since}:${range.until}`;
++      try {
++        return await cached(cacheKey, FACTS_TTL_MS, () =>
++          fetchShopifyProductFacts(creds.shopDomain, creds.accessToken, range),
++        );
++      } catch (e) {
++        failures.push({ displayName: connection.displayName, reason: reasonFor(e) });
++        logShopifyFailure(connection.displayName, e);
++        return null;
++      }
++    }),
++  );
++
++  const lists = perConnection.filter((r): r is ShopifyProductFacts[] => r !== null);
++  const products = lists.flat().sort((a, b) => b.revenueMinor - a.revenueMinor);
++
++  return { products, partialFailure: failures.length > 0, failures };
++}
+diff --git a/src/features/integrations/shopify.ts b/src/features/integrations/shopify.ts
+index 98f04ec..9e3ac9f 100644
+--- a/src/features/integrations/shopify.ts
++++ b/src/features/integrations/shopify.ts
+@@ -188,3 +188,115 @@ export async function fetchShopifyDailyFacts(
+ 
+   return byDate;
+ }
++
++interface ShopifyLineItem {
++  product_id: number | null;
++  title: string;
++  sku: string | null;
++  quantity: number;
++  price: string;
++  total_discount?: string;
++}
++
++interface ShopifyOrderWithLineItems {
++  id: number;
++  created_at: string;
++  cancelled_at: string | null;
++  line_items?: ShopifyLineItem[];
++}
++
++export interface ShopifyProductFacts {
++  productId: number | null;
++  title: string;
++  sku: string | null;
++  quantity: number;
++  revenueMinor: number;
++  orders: number;
++}
++
++/**
++ * Per-product sales, aggregated from order line items (AUDIT_REPORT.md —
++ * High: "Shopify product-level data missing"). Shopify's REST Admin API
++ * has no dedicated "top products" report endpoint on non-Plus plans (the
++ * richer breakdowns need the ShopifyQL Analytics API — same Plus-only wall
++ * as the `sessions` limitation noted above) — so this derives product
++ * performance the way most third-party Shopify apps do: paginate every
++ * order in range and sum up its line_items. A separate pagination pass
++ * from fetchShopifyDailyFacts (not merged into it) — costs one extra
++ * Orders API call per page, but keeps that function's existing, working
++ * contract untouched.
++ *
++ * revenueMinor is gross-of-refunds (line price × quantity, net of that
++ * line's own discount) — refunds ARE captured correctly in the day-level
++ * totals from fetchShopifyDailyFacts, but Shopify attributes refund money
++ * to the refund record itself, and mapping that back down to individual
++ * product lines needs a second field (refund_line_items) deliberately not
++ * fetched here, to keep this a single query shape. A reasonable follow-up,
++ * not a silent gap — "revenue" in the product table should be read as
++ * "sales", not "net revenue after returns".
++ */
++export async function fetchShopifyProductFacts(
++  shopDomain: string,
++  accessToken: string,
++  range: { since: string; until: string },
++): Promise<ShopifyProductFacts[]> {
++  const createdMin = `${range.since}T00:00:00Z`;
++  const createdMax = `${range.until}T23:59:59Z`;
++  let pageInfo: string | null = null;
++  let first = true;
++
++  interface Entry {
++    productId: number | null;
++    title: string;
++    sku: string | null;
++    quantity: number;
++    revenueMinor: number;
++    orderIds: Set<number>;
++  }
++  const byProduct = new Map<string, Entry>();
++
++  do {
++    const query = first
++      ? `status=any&created_at_min=${encodeURIComponent(createdMin)}&created_at_max=${encodeURIComponent(createdMax)}&limit=250&fields=id,created_at,cancelled_at,line_items`
++      : `limit=250&page_info=${encodeURIComponent(pageInfo!)}`;
++    first = false;
++
++    const { body, linkHeader } = await shopifyFetch<{ orders: ShopifyOrderWithLineItems[] }>(
++      shopDomain,
++      `/orders.json?${query}`,
++      accessToken,
++    );
++
++    for (const order of body.orders) {
++      if (order.cancelled_at) continue;
++      for (const item of order.line_items ?? []) {
++        const key = item.product_id != null ? `p:${item.product_id}` : `t:${item.title}`;
++        const entry = byProduct.get(key) ?? {
++          productId: item.product_id ?? null,
++          title: item.title,
++          sku: item.sku ?? null,
++          quantity: 0,
++          revenueMinor: 0,
++          orderIds: new Set<number>(),
++        };
++        entry.quantity += item.quantity;
++        entry.revenueMinor += toMinor(item.price) * item.quantity - toMinor(item.total_discount);
++        entry.orderIds.add(order.id);
++        byProduct.set(key, entry);
++      }
++    }
++
++    pageInfo = nextPageInfo(linkHeader);
++  } while (pageInfo);
++
++  return [...byProduct.values()]
++    .map((e) => ({
++      productId: e.productId,
++      title: e.title,
++      sku: e.sku,
++      quantity: e.quantity,
++      revenueMinor: e.revenueMinor,
++      orders: e.orderIds.size,
++    }))
++    .sort((a, b) => b.revenueMinor - a.revenueMinor);
++}
+diff --git a/src/features/shopify/report.tsx b/src/features/shopify/report.tsx
+index 8070a5c..67b3f03 100644
+--- a/src/features/shopify/report.tsx
++++ b/src/features/shopify/report.tsx
+@@ -9,6 +9,8 @@ import {
+   type RangePreset,
+ } from "@/features/metrics/queries";
+ import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
++import { getLiveShopifyProducts } from "@/features/integrations/shopify-products-live";
++import type { ShopifyProductFacts } from "@/features/integrations/shopify";
+ import { shopMetrics, sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
+ import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
+ import { isDemoMode } from "@/lib/env";
+@@ -40,19 +42,34 @@ export async function ShopifyReport({
+   let prevRows: Array<ShopFacts & { date: string }>;
+   let partialFailure = false;
+   let failures: Array<{ displayName: string; reason: string }> = [];
++  // Live-only, same as Meta/Google's deeper breakdowns — no demo-mode
++  // equivalent exists for per-product data.
++  let products: ShopifyProductFacts[] = [];
+ 
+   if (!isDemoMode) {
+-    const [current, previous] = await Promise.all([
++    const [current, previous, productsResult] = await Promise.all([
+       getLiveShopifyReport(workspaceId, range),
+       getLiveShopifyReport(workspaceId, prevRange),
++      getLiveShopifyProducts(workspaceId, range),
+     ]);
+     rows = current.rows;
+     prevRows = previous.rows;
+-    partialFailure = current.partialFailure || previous.partialFailure;
++    products = productsResult.products;
++    partialFailure = current.partialFailure || previous.partialFailure || productsResult.partialFailure;
+     // Current-range failures are the most relevant to show — the previous-
+     // period pull uses the same connections/credentials, so its failures
+-    // would just be duplicates for the same underlying reason.
+-    failures = current.failures;
++    // would just be duplicates for the same underlying reason. Product
++    // failures use the same connections too, so de-dupe by display name.
++    const seenFailures = new Set<string>();
++    failures = [];
++    for (const list of [current.failures, productsResult.failures]) {
++      for (const f of list) {
++        if (!seenFailures.has(f.displayName)) {
++          seenFailures.add(f.displayName);
++          failures.push(f);
++        }
++      }
++    }
+   } else {
+     [rows, prevRows] = await Promise.all([
+       getShopDaily(workspaceId, range),
+@@ -95,6 +112,14 @@ export async function ShopifyReport({
+     { label: "Revenue / session", value: formatMoney(totals.sessions > 0 ? totals.netSalesMinor / totals.sessions : 0), delta: deltaOf(totals.sessions > 0 ? totals.netSalesMinor / totals.sessions : 0, prev.sessions > 0 ? prev.netSalesMinor / prev.sessions : 0), info: "On average, how much revenue each store visit generated — combines traffic quality and conversion into one number." },
+   ];
+ 
++  const th = "px-3 py-2 text-right font-medium whitespace-nowrap";
++  const td = "px-3 py-2.5 text-right tabular-nums whitespace-nowrap";
++  // Already sorted by sales server-side (fetchShopifyProductFacts) — just
++  // cap the display, same top-50 pattern as the ads channels' entity
++  // tables (Meta ad sets/ads, Google keywords/search terms).
++  const PRODUCT_DISPLAY_CAP = 50;
++  const productsShown = products.slice(0, PRODUCT_DISPLAY_CAP);
++
+   return (
+     <>
+       {partialFailure ? (
+@@ -154,6 +179,56 @@ export async function ShopifyReport({
+           </div>
+         </Card>
+       </div>
++
++      {!isDemoMode ? (
++        <Card>
++          <CardHeader
++            title="Top products"
++            subtitle={
++              products.length > PRODUCT_DISPLAY_CAP
++                ? `${rangeLabel} · showing top ${PRODUCT_DISPLAY_CAP} of ${products.length} by sales`
++                : `${rangeLabel} · sorted by sales`
++            }
++          />
++          <div className="overflow-x-auto px-2 pb-3">
++            <table className="w-full text-[13px]">
++              <thead>
++                <tr className="border-b border-border text-left text-xs text-muted">
++                  <th className="px-3 py-2 font-medium">Product</th>
++                  <th className="px-3 py-2 font-medium">SKU</th>
++                  <th className={th}>Sales</th>
++                  <th className={th}>Units sold</th>
++                  <th className={th}>Orders</th>
++                  <th className={th}>Avg. price</th>
++                </tr>
++              </thead>
++              <tbody>
++                {productsShown.length === 0 ? (
++                  <tr>
++                    <td colSpan={6} className="px-3 py-6 text-center text-xs text-muted">
++                      No product sales for this date range — connect a Shopify store in Settings, or try a wider
++                      date range.
++                    </td>
++                  </tr>
++                ) : null}
++                {productsShown.map((p, i) => (
++                  <tr
++                    key={p.productId ?? `t:${p.title}:${i}`}
++                    className="border-b border-border/60 last:border-0 hover:bg-surface-2/60"
++                  >
++                    <td className="max-w-[260px] truncate px-3 py-2.5 font-medium">{p.title}</td>
++                    <td className="px-3 py-2.5 text-muted">{p.sku ?? "—"}</td>
++                    <td className={td}>{formatMoney(p.revenueMinor)}</td>
++                    <td className={td}>{formatNumber(p.quantity)}</td>
++                    <td className={td}>{formatNumber(p.orders)}</td>
++                    <td className={td}>{formatMoney(p.quantity > 0 ? Math.round(p.revenueMinor / p.quantity) : 0)}</td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        </Card>
++      ) : null}
+     </>
+   );
+ }
+-- 
+2.43.0
+

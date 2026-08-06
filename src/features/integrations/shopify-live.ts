@@ -161,6 +161,14 @@ export interface ShopifyAccountHealthResult {
   connectionId: string;
   displayName: string;
   health: ShopifyAccountHealth;
+  /** Why the probe failed, when it did — surfaced in the UI so an operator
+   * doesn't have to open the Vercel function log to tell causes apart. */
+  reason?: string;
+}
+
+interface HealthProbe {
+  health: ShopifyAccountHealth;
+  reason?: string;
 }
 
 /**
@@ -185,20 +193,28 @@ export async function checkShopifyAccountsHealth(workspaceId: string): Promise<S
 
   return Promise.all(
     connections.map(async (connection) => {
-      const cacheKey = `shopify-health:${connection.id}`;
-      const health = await cached<ShopifyAccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
+      // v2 key: the cached shape changed from a bare string to an object.
+      const cacheKey = `shopify-health2:${connection.id}`;
+      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
         const creds = await resolveCreds(connection);
-        if (!creds) return "no_access";
+        if (!creds) {
+          return { health: "no_access", reason: "No access token stored for this store — reconnect it in Settings." };
+        }
         try {
           const facts = await fetchShopifyDailyFacts(creds.shopDomain, creds.accessToken, range);
           const orders = [...facts.values()].reduce((sum, f) => sum + f.orders, 0);
-          return orders > 0 ? "live" : "idle";
+          return { health: orders > 0 ? "live" : "idle" };
         } catch (e) {
           logShopifyFailure(connection.displayName, e);
-          return "no_access";
+          return { health: "no_access", reason: reasonFor(e) };
         }
       });
-      return { connectionId: connection.id, displayName: connection.displayName, health };
+      return {
+        connectionId: connection.id,
+        displayName: connection.displayName,
+        health: probe.health,
+        reason: probe.reason,
+      };
     }),
   );
 }

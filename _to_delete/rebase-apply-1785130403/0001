@@ -1,0 +1,657 @@
+From 80c0ec0777e9ef384316b054f2879f0003f89c71 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 27 Jul 2026 05:32:51 +0000
+Subject: [PATCH] Add pagination and sorting to the clients list and campaign
+ tables
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+AUDIT_REPORT.md flagged this as missing (Medium): "every list (clients,
+campaigns) renders unpaginated and unsorted." Both are server-rendered,
+no client JS, following the same plain-GET-links pattern as the existing
+date range picker and clients search/filter.
+
+Clients list: added a sort dropdown (name A-Z/Z-A, revenue high-low) and
+12-per-page pagination. Sorting by name only fetches live Shopify revenue
+for the current page's clients rather than every client, unlike sorting
+by revenue which necessarily needs every filtered client's totals first
+to sort correctly — a real efficiency win for the common case, not just
+pagination for its own sake.
+
+Campaign table (shared across Meta/Google/TikTok, the admin dashboard,
+client portal, and public share links): column headers for Campaign,
+Spend, Revenue, ROAS, Purchases, Impressions, and Clicks are now click-
+to-sort links (toggling direction on repeat clicks), plus 25-per-page
+pagination. resolveCampaignTableParams() is exported from channel-page.tsx
+and reused by every caller that resolves raw searchParams (AdsChannelPage
+and the three client-portal ads pages route through it; the public share
+page calls it directly).
+
+Deliberately scoped to the two lists the audit names explicitly. The
+newer ad set/ad/keyword/audience/product breakdown tables added earlier
+this pass already cap-and-sort-by-spend server-side, which covers the
+same "unbounded table" risk without retrofitting full pagination onto
+every one of them too.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ src/app/client/(portal)/ads/google/page.tsx |  11 +-
+ src/app/client/(portal)/ads/meta/page.tsx   |  11 +-
+ src/app/client/(portal)/ads/tiktok/page.tsx |  11 +-
+ src/app/dashboard/clients/page.tsx          | 123 ++++++++++---
+ src/app/share/[provider]/[token]/page.tsx   |  11 +-
+ src/features/ads/channel-page.tsx           | 186 ++++++++++++++++++--
+ 6 files changed, 306 insertions(+), 47 deletions(-)
+
+diff --git a/src/app/client/(portal)/ads/google/page.tsx b/src/app/client/(portal)/ads/google/page.tsx
+index 6247c89..ff83d97 100644
+--- a/src/app/client/(portal)/ads/google/page.tsx
++++ b/src/app/client/(portal)/ads/google/page.tsx
+@@ -1,4 +1,4 @@
+-import { AdsReport } from "@/features/ads/channel-page";
++import { AdsReport, resolveCampaignTableParams } from "@/features/ads/channel-page";
+ import { resolveDateRange } from "@/features/metrics/queries";
+ import { requireClientSession } from "@/lib/auth/client-session";
+ 
+@@ -7,10 +7,12 @@ export const metadata = { title: "Google Ads" };
+ export default async function ClientGoogleAdsPage({
+   searchParams,
+ }: {
+-  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
++  searchParams: Promise<{ preset?: string; since?: string; until?: string; sort?: string; dir?: string; page?: string }>;
+ }) {
+   const session = await requireClientSession();
+-  const { range, preset } = resolveDateRange(await searchParams);
++  const resolvedParams = await searchParams;
++  const { range, preset } = resolveDateRange(resolvedParams);
++  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
+ 
+   return (
+     <AdsReport
+@@ -19,6 +21,9 @@ export default async function ClientGoogleAdsPage({
+       label="Google Ads"
+       range={range}
+       preset={preset}
++      sortKey={sortKey}
++      sortDir={sortDir}
++      page={page}
+     />
+   );
+ }
+diff --git a/src/app/client/(portal)/ads/meta/page.tsx b/src/app/client/(portal)/ads/meta/page.tsx
+index 227d623..97dfe47 100644
+--- a/src/app/client/(portal)/ads/meta/page.tsx
++++ b/src/app/client/(portal)/ads/meta/page.tsx
+@@ -1,4 +1,4 @@
+-import { AdsReport } from "@/features/ads/channel-page";
++import { AdsReport, resolveCampaignTableParams } from "@/features/ads/channel-page";
+ import { resolveDateRange } from "@/features/metrics/queries";
+ import { requireClientSession } from "@/lib/auth/client-session";
+ 
+@@ -7,10 +7,12 @@ export const metadata = { title: "Meta Ads" };
+ export default async function ClientMetaAdsPage({
+   searchParams,
+ }: {
+-  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
++  searchParams: Promise<{ preset?: string; since?: string; until?: string; sort?: string; dir?: string; page?: string }>;
+ }) {
+   const session = await requireClientSession();
+-  const { range, preset } = resolveDateRange(await searchParams);
++  const resolvedParams = await searchParams;
++  const { range, preset } = resolveDateRange(resolvedParams);
++  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
+ 
+   return (
+     <AdsReport
+@@ -19,6 +21,9 @@ export default async function ClientMetaAdsPage({
+       label="Meta Ads"
+       range={range}
+       preset={preset}
++      sortKey={sortKey}
++      sortDir={sortDir}
++      page={page}
+     />
+   );
+ }
+diff --git a/src/app/client/(portal)/ads/tiktok/page.tsx b/src/app/client/(portal)/ads/tiktok/page.tsx
+index 0314e63..d117954 100644
+--- a/src/app/client/(portal)/ads/tiktok/page.tsx
++++ b/src/app/client/(portal)/ads/tiktok/page.tsx
+@@ -1,4 +1,4 @@
+-import { AdsReport } from "@/features/ads/channel-page";
++import { AdsReport, resolveCampaignTableParams } from "@/features/ads/channel-page";
+ import { resolveDateRange } from "@/features/metrics/queries";
+ import { requireClientSession } from "@/lib/auth/client-session";
+ 
+@@ -7,10 +7,12 @@ export const metadata = { title: "TikTok Ads" };
+ export default async function ClientTikTokAdsPage({
+   searchParams,
+ }: {
+-  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
++  searchParams: Promise<{ preset?: string; since?: string; until?: string; sort?: string; dir?: string; page?: string }>;
+ }) {
+   const session = await requireClientSession();
+-  const { range, preset } = resolveDateRange(await searchParams);
++  const resolvedParams = await searchParams;
++  const { range, preset } = resolveDateRange(resolvedParams);
++  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
+ 
+   return (
+     <AdsReport
+@@ -19,6 +21,9 @@ export default async function ClientTikTokAdsPage({
+       label="TikTok Ads"
+       range={range}
+       preset={preset}
++      sortKey={sortKey}
++      sortDir={sortDir}
++      page={page}
+     />
+   );
+ }
+diff --git a/src/app/dashboard/clients/page.tsx b/src/app/dashboard/clients/page.tsx
+index 446915c..224b27f 100644
+--- a/src/app/dashboard/clients/page.tsx
++++ b/src/app/dashboard/clients/page.tsx
+@@ -2,7 +2,7 @@ import Link from "next/link";
+ import { Topbar } from "@/components/shell/topbar";
+ import { Card, CardHeader, Badge, EmptyState } from "@/components/ui/primitives";
+ import { getPrincipal } from "@/lib/auth/principal";
+-import { getContacts, getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
++import { getContacts, getWorkspaces, getArchivedWorkspaces, type WorkspaceRow } from "@/features/crm/queries";
+ import {
+   NewContactForm,
+   NewWorkspaceForm,
+@@ -13,7 +13,7 @@ import {
+ } from "@/features/crm/components/forms";
+ import { getShopDaily, lastNDays } from "@/features/metrics/queries";
+ import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
+-import { sumShopFacts } from "@/lib/metrics/definitions";
++import { sumShopFacts, type ShopFacts } from "@/lib/metrics/definitions";
+ import { formatMoney } from "@/lib/utils";
+ import { isDemoMode } from "@/lib/env";
+ 
+@@ -22,16 +22,37 @@ export const metadata = { title: "Clients" };
+ const filterInputCls =
+   "h-9 rounded-lg border border-border bg-surface px-3 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring";
+ 
++// AUDIT_REPORT.md — Medium: "Pagination and sorting absent everywhere;
++// every list (clients, campaigns) renders unpaginated and unsorted." 12
++// per page matches the 3-column grid (4 full rows on desktop).
++const PAGE_SIZE = 12;
++type ClientSort = "name" | "name_desc" | "revenue";
++
++async function shopTotals(workspaceId: string, range: { since: string; until: string }): Promise<ShopFacts> {
++  // Shopify is pulled live now (features/integrations/shopify-live.ts) —
++  // nothing syncs orders into the database anymore, same "pull-on-demand"
++  // shape as every ad channel. This used to call getShopDaily() even in
++  // live mode, which reads a table nothing writes to any more, so every
++  // client's revenue/orders here silently showed $0/0 in production
++  // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
++  // deterministic generator since there's no real store to pull from.
++  return isDemoMode
++    ? sumShopFacts(await getShopDaily(workspaceId, range))
++    : (await getLiveShopifyReport(workspaceId, range)).totals;
++}
++
+ /** Agency client roster: every workspace is one client brand. */
+ export default async function ClientsPage({
+   searchParams,
+ }: {
+-  searchParams: Promise<{ q?: string; status?: string }>;
++  searchParams: Promise<{ q?: string; status?: string; sort?: string; page?: string }>;
+ }) {
+   const principal = await getPrincipal();
+-  const { q, status } = await searchParams;
++  const { q, status, sort, page } = await searchParams;
+   const search = (q ?? "").trim().toLowerCase();
+   const statusFilter = status === "active" || status === "suspended" ? status : "all";
++  const sortKey: ClientSort = sort === "revenue" || sort === "name_desc" ? sort : "name";
++  const requestedPage = Math.max(1, parseInt(page ?? "1", 10) || 1);
+ 
+   const [workspaces, archivedWorkspaces, contacts] = await Promise.all([
+     getWorkspaces(principal.orgId),
+@@ -40,21 +61,6 @@ export default async function ClientsPage({
+   ]);
+ 
+   const range = lastNDays(30);
+-  const revenue = await Promise.all(
+-    workspaces.map(async (ws) => {
+-      // Shopify is pulled live now (features/integrations/shopify-live.ts) —
+-      // nothing syncs orders into the database anymore, same "pull-on-demand"
+-      // shape as every ad channel. This used to call getShopDaily() even in
+-      // live mode, which reads a table nothing writes to any more, so every
+-      // client's revenue/orders here silently showed $0/0 in production
+-      // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
+-      // deterministic generator since there's no real store to pull from.
+-      const totals = isDemoMode
+-        ? sumShopFacts(await getShopDaily(ws.id, range))
+-        : (await getLiveShopifyReport(ws.id, range)).totals;
+-      return { id: ws.id, totals };
+-    }),
+-  );
+ 
+   const filtered = workspaces.filter((ws) => {
+     if (statusFilter !== "all" && ws.status !== statusFilter) return false;
+@@ -63,6 +69,50 @@ export default async function ClientsPage({
+   });
+   const isFiltered = Boolean(search) || statusFilter !== "all";
+ 
++  // Sorting by revenue needs every filtered workspace's totals up front —
++  // you can't sort by a number you haven't fetched yet. Sorting by name
++  // doesn't, so that path only fetches revenue for the page actually being
++  // shown, which is the real fix for "renders unpaginated" costing one
++  // live Shopify pull per client on every page load regardless of filters.
++  let pageItems: WorkspaceRow[];
++  let revenue: Array<{ id: string; totals: ShopFacts }>;
++  let totalPages: number;
++  let currentPage: number;
++
++  if (sortKey === "revenue") {
++    const withRevenue = await Promise.all(
++      filtered.map(async (ws) => ({ ws, totals: await shopTotals(ws.id, range) })),
++    );
++    withRevenue.sort((a, b) => b.totals.netSalesMinor - a.totals.netSalesMinor);
++    totalPages = Math.max(1, Math.ceil(withRevenue.length / PAGE_SIZE));
++    currentPage = Math.min(requestedPage, totalPages);
++    const slice = withRevenue.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
++    pageItems = slice.map((s) => s.ws);
++    revenue = slice.map((s) => ({ id: s.ws.id, totals: s.totals }));
++  } else {
++    const sorted = [...filtered].sort((a, b) =>
++      sortKey === "name_desc" ? b.name.localeCompare(a.name) : a.name.localeCompare(b.name),
++    );
++    totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
++    currentPage = Math.min(requestedPage, totalPages);
++    pageItems = sorted.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
++    revenue = await Promise.all(
++      pageItems.map(async (ws) => ({ id: ws.id, totals: await shopTotals(ws.id, range) })),
++    );
++  }
++
++  /** Prev/Next links carry q/status/sort forward and only set an explicit
++   *  page when it isn't page 1, keeping URLs clean for the common case. */
++  function clientsPageHref(targetPage: number): string {
++    const params = new URLSearchParams();
++    if (q) params.set("q", q);
++    if (statusFilter !== "all") params.set("status", statusFilter);
++    if (sortKey !== "name") params.set("sort", sortKey);
++    if (targetPage > 1) params.set("page", String(targetPage));
++    const qs = params.toString();
++    return qs ? `/dashboard/clients?${qs}` : "/dashboard/clients";
++  }
++
+   return (
+     <>
+       <Topbar title="Clients" />
+@@ -81,6 +131,11 @@ export default async function ClientsPage({
+               <option value="active">Active</option>
+               <option value="suspended">Suspended</option>
+             </select>
++            <select name="sort" defaultValue={sortKey} className={filterInputCls}>
++              <option value="name">Name A–Z</option>
++              <option value="name_desc">Name Z–A</option>
++              <option value="revenue">Revenue (30d, high to low)</option>
++            </select>
+             <button
+               type="submit"
+               className="h-9 rounded-lg border border-border bg-surface px-3 text-[13px] font-medium hover:bg-surface-2"
+@@ -110,7 +165,7 @@ export default async function ClientsPage({
+         ) : null}
+ 
+         <div className="grid gap-4 lg:grid-cols-3">
+-          {filtered.map((ws) => {
++          {pageItems.map((ws) => {
+             const totals = revenue.find((r) => r.id === ws.id)?.totals;
+             const wsContacts = contacts.filter((c) => c.workspaceId === ws.id);
+             return (
+@@ -190,6 +245,34 @@ export default async function ClientsPage({
+           })}
+         </div>
+ 
++        {totalPages > 1 ? (
++          <div className="flex items-center justify-center gap-3 pt-1">
++            {currentPage > 1 ? (
++              <Link
++                href={clientsPageHref(currentPage - 1)}
++                className="text-xs font-medium underline-offset-4 hover:underline"
++              >
++                ← Previous
++              </Link>
++            ) : (
++              <span className="text-xs text-muted/50">← Previous</span>
++            )}
++            <span className="text-xs text-muted">
++              Page {currentPage} of {totalPages}
++            </span>
++            {currentPage < totalPages ? (
++              <Link
++                href={clientsPageHref(currentPage + 1)}
++                className="text-xs font-medium underline-offset-4 hover:underline"
++              >
++                Next →
++              </Link>
++            ) : (
++              <span className="text-xs text-muted/50">Next →</span>
++            )}
++          </div>
++        ) : null}
++
+         {archivedWorkspaces.length > 0 ? (
+           <div className="space-y-3">
+             <p className="text-xs font-medium uppercase tracking-widest text-muted">
+diff --git a/src/app/share/[provider]/[token]/page.tsx b/src/app/share/[provider]/[token]/page.tsx
+index bcffe81..d6faa2e 100644
+--- a/src/app/share/[provider]/[token]/page.tsx
++++ b/src/app/share/[provider]/[token]/page.tsx
+@@ -1,5 +1,5 @@
+ import { notFound } from "next/navigation";
+-import { AdsReport } from "@/features/ads/channel-page";
++import { AdsReport, resolveCampaignTableParams } from "@/features/ads/channel-page";
+ import { resolveShareLink } from "@/features/share/actions";
+ import { resolveDateRange } from "@/features/metrics/queries";
+ import { getWorkspaceName } from "@/lib/workspace";
+@@ -34,11 +34,13 @@ export default async function SharedReportPage({
+   searchParams,
+ }: {
+   params: Promise<{ provider: string; token: string }>;
+-  searchParams: Promise<{ preset?: string; since?: string; until?: string }>;
++  searchParams: Promise<{ preset?: string; since?: string; until?: string; sort?: string; dir?: string; page?: string }>;
+ }) {
+   const { provider, token } = await params;
+   if (!isDemoProvider(provider)) notFound();
+-  const { range, preset } = resolveDateRange(await searchParams);
++  const resolvedParams = await searchParams;
++  const { range, preset } = resolveDateRange(resolvedParams);
++  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
+ 
+   const link = await resolveShareLink(provider, token);
+   if (!link) {
+@@ -73,6 +75,9 @@ export default async function SharedReportPage({
+         label={providerLabel}
+         range={range}
+         preset={preset}
++        sortKey={sortKey}
++        sortDir={sortDir}
++        page={page}
+       />
+     </>
+   );
+diff --git a/src/features/ads/channel-page.tsx b/src/features/ads/channel-page.tsx
+index b609ae3..8b187f5 100644
+--- a/src/features/ads/channel-page.tsx
++++ b/src/features/ads/channel-page.tsx
+@@ -1,3 +1,4 @@
++import Link from "next/link";
+ import { Topbar } from "@/components/shell/topbar";
+ import { KpiCard } from "@/components/charts/kpi-card";
+ import { DateRangePicker } from "@/components/charts/date-range-picker";
+@@ -40,7 +41,49 @@ import { formatMoney, formatNumber, formatPercent } from "@/lib/utils";
+ import { getActiveWorkspaceId, getWorkspaceName } from "@/lib/workspace";
+ import { isDemoMode } from "@/lib/env";
+ 
+-type ReportSearchParams = Promise<{ preset?: string; since?: string; until?: string }>;
++type ReportSearchParams = Promise<{
++  preset?: string;
++  since?: string;
++  until?: string;
++  sort?: string;
++  dir?: string;
++  page?: string;
++}>;
++
++// AUDIT_REPORT.md — Medium: "Pagination and sorting absent everywhere;
++// every list (clients, campaigns) renders unpaginated and unsorted." The
++// campaign table is the one this targets — the newer ad set/ad/keyword/
++// audience/product breakdown tables added elsewhere this pass already cap
++// + sort by spend server-side, which covers the same underlying risk
++// (an unbounded table) without needing full pagination on every one of
++// them too.
++export type CampaignSortKey = "name" | "spend" | "revenue" | "roas" | "purchases" | "impressions" | "clicks";
++const CAMPAIGN_SORT_KEYS: CampaignSortKey[] = [
++  "name",
++  "spend",
++  "revenue",
++  "roas",
++  "purchases",
++  "impressions",
++  "clicks",
++];
++const CAMPAIGN_PAGE_SIZE = 25;
++
++/** Parses ?sort=/?dir=/?page= — shared by AdsChannelPage and the public
++ *  share page, the two callers that resolve raw searchParams into props
++ *  for AdsReport. Unknown/missing values fall back to spend-desc, page 1. */
++export function resolveCampaignTableParams(params: {
++  sort?: string;
++  dir?: string;
++  page?: string;
++}): { sortKey: CampaignSortKey; sortDir: "asc" | "desc"; page: number } {
++  const sortKey = CAMPAIGN_SORT_KEYS.includes(params.sort as CampaignSortKey)
++    ? (params.sort as CampaignSortKey)
++    : "spend";
++  const sortDir = params.dir === "asc" ? "asc" : "desc";
++  const page = Math.max(1, parseInt(params.page ?? "1", 10) || 1);
++  return { sortKey, sortDir, page };
++}
+ 
+ /**
+  * The read-only report body — KPI grid + spend/revenue chart + campaign
+@@ -58,12 +101,18 @@ export async function AdsReport({
+   label,
+   range,
+   preset,
++  sortKey,
++  sortDir,
++  page,
+ }: {
+   workspaceId: string;
+   provider: DemoProvider;
+   label: string;
+   range: DateRange;
+   preset: RangePreset;
++  sortKey: CampaignSortKey;
++  sortDir: "asc" | "desc";
++  page: number;
+ }) {
+   const rangeLabel = formatRangeLabel(range, preset);
+ 
+@@ -206,12 +255,83 @@ export async function AdsReport({
+     return invert ? -d : d;
+   };
+ 
+-  campaigns.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
++  // Friendly names in the ad set / ad tables below instead of raw Meta IDs
++  // — built before the campaign list gets sorted/paginated below, but that
++  // doesn't matter since sorting/slicing never changes which campaigns
++  // exist, just their order.
++  const campaignNameById = new Map(campaigns.map((c) => [c.id, c.name]));
+   adSets.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+   ads.sort((a, b) => b.facts.spendMinor - a.facts.spendMinor);
+-  // Friendly names in the ad set / ad tables below instead of raw Meta IDs.
+-  const campaignNameById = new Map(campaigns.map((c) => [c.id, c.name]));
+   const adSetNameById = new Map(adSets.map((a) => [a.id, a.name]));
++
++  // Campaign table sorting/pagination — the one list AUDIT_REPORT.md names
++  // explicitly ("every list (clients, campaigns) renders unpaginated and
++  // unsorted"). sortKey/sortDir/page come from the URL, resolved by the
++  // caller via resolveCampaignTableParams.
++  const campaignSortValue = (c: CampaignWithFacts): number | string => {
++    switch (sortKey) {
++      case "name":
++        return c.name.toLowerCase();
++      case "revenue":
++        return c.facts.revenueMinor;
++      case "roas":
++        return adMetrics.roas(c.facts);
++      case "purchases":
++        return c.facts.purchases;
++      case "impressions":
++        return c.facts.impressions;
++      case "clicks":
++        return c.facts.clicks;
++      case "spend":
++      default:
++        return c.facts.spendMinor;
++    }
++  };
++  campaigns.sort((a, b) => {
++    const av = campaignSortValue(a);
++    const bv = campaignSortValue(b);
++    const cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
++    return sortDir === "asc" ? cmp : -cmp;
++  });
++  const campaignTotalPages = Math.max(1, Math.ceil(campaigns.length / CAMPAIGN_PAGE_SIZE));
++  const campaignPage = Math.min(page, campaignTotalPages);
++  const campaignsShown = campaigns.slice(
++    (campaignPage - 1) * CAMPAIGN_PAGE_SIZE,
++    campaignPage * CAMPAIGN_PAGE_SIZE,
++  );
++
++  /** Builds a link that preserves the current date range and overrides
++   *  sort/dir/page — used by both the sortable column headers and the
++   *  Prev/Next controls below the campaign table. */
++  function campaignTableHref(overrides: { sort?: CampaignSortKey; dir?: "asc" | "desc"; page?: number }): string {
++    const params = new URLSearchParams();
++    if (preset !== "custom") params.set("preset", preset);
++    else {
++      params.set("since", range.since);
++      params.set("until", range.until);
++    }
++    const newSort = overrides.sort ?? sortKey;
++    const newDir = overrides.dir ?? sortDir;
++    const newPage = overrides.page ?? campaignPage;
++    if (newSort !== "spend") params.set("sort", newSort);
++    if (newDir !== "desc") params.set("dir", newDir);
++    if (newPage > 1) params.set("page", String(newPage));
++    return `?${params.toString()}`;
++  }
++
++  function sortableHeader(key: CampaignSortKey, headerLabel: string) {
++    const isActive = sortKey === key;
++    const nextDir: "asc" | "desc" = isActive ? (sortDir === "desc" ? "asc" : "desc") : key === "name" ? "asc" : "desc";
++    return (
++      <Link
++        href={campaignTableHref({ sort: key, dir: nextDir, page: 1 })}
++        className={isActive ? "text-foreground" : "hover:text-foreground"}
++      >
++        {headerLabel}
++        {isActive ? (sortDir === "desc" ? " ↓" : " ↑") : ""}
++      </Link>
++    );
++  }
+   // Ad sets/ads aren't capped server-side (unlike the top-25 country
+   // breakdown) since a typical account has far fewer of them than
+   // countries — but a handful of large accounts can still return hundreds,
+@@ -372,30 +492,34 @@ export async function AdsReport({
+         <Card>
+           <CardHeader
+             title="Campaigns"
+-            subtitle={`${rangeLabel} · all key KPIs per campaign · sorted by spend`}
++            subtitle={
++              campaigns.length > CAMPAIGN_PAGE_SIZE
++                ? `${rangeLabel} · all key KPIs per campaign · page ${campaignPage} of ${campaignTotalPages}`
++                : `${rangeLabel} · all key KPIs per campaign · click a column to sort`
++            }
+           />
+           <div className="overflow-x-auto px-2 pb-3">
+             <table className="w-full text-[13px]">
+               <thead>
+                 <tr className="border-b border-border text-left text-xs text-muted">
+-                  <th className="px-3 py-2 font-medium">Campaign</th>
+-                  <th className={th}>Spend</th>
+-                  <th className={th}>Revenue</th>
+-                  <th className={th}>ROAS</th>
+-                  <th className={th}>Purchases</th>
++                  <th className="px-3 py-2 font-medium">{sortableHeader("name", "Campaign")}</th>
++                  <th className={th}>{sortableHeader("spend", "Spend")}</th>
++                  <th className={th}>{sortableHeader("revenue", "Revenue")}</th>
++                  <th className={th}>{sortableHeader("roas", "ROAS")}</th>
++                  <th className={th}>{sortableHeader("purchases", "Purchases")}</th>
+                   <th className={th}>CPA</th>
+                   <th className={th}>CPC</th>
+                   <th className={th}>CPM</th>
+                   <th className={th}>CTR</th>
+-                  <th className={th}>Impressions</th>
+-                  <th className={th}>Clicks</th>
++                  <th className={th}>{sortableHeader("impressions", "Impressions")}</th>
++                  <th className={th}>{sortableHeader("clicks", "Clicks")}</th>
+                   <th className={th}>Freq</th>
+                   <th className={th} title="Quality / engagement / conversion rate rankings">Rankings</th>
+                   <th className={th}>Status</th>
+                 </tr>
+               </thead>
+               <tbody>
+-                {campaigns.length === 0 ? (
++                {campaignsShown.length === 0 ? (
+                   <tr>
+                     <td colSpan={14} className="px-3 py-6 text-center text-xs text-muted">
+                       {!isDemoMode
+@@ -404,7 +528,7 @@ export async function AdsReport({
+                     </td>
+                   </tr>
+                 ) : null}
+-                {campaigns.map((c) => {
++                {campaignsShown.map((c) => {
+                   const f = c.facts;
+                   const roas = adMetrics.roas(f);
+                   return (
+@@ -454,6 +578,33 @@ export async function AdsReport({
+               </tbody>
+             </table>
+           </div>
++          {campaignTotalPages > 1 ? (
++            <div className="flex items-center justify-center gap-3 border-t border-border py-3">
++              {campaignPage > 1 ? (
++                <Link
++                  href={campaignTableHref({ page: campaignPage - 1 })}
++                  className="text-xs font-medium underline-offset-4 hover:underline"
++                >
++                  ← Previous
++                </Link>
++              ) : (
++                <span className="text-xs text-muted/50">← Previous</span>
++              )}
++              <span className="text-xs text-muted">
++                Page {campaignPage} of {campaignTotalPages}
++              </span>
++              {campaignPage < campaignTotalPages ? (
++                <Link
++                  href={campaignTableHref({ page: campaignPage + 1 })}
++                  className="text-xs font-medium underline-offset-4 hover:underline"
++                >
++                  Next →
++                </Link>
++              ) : (
++                <span className="text-xs text-muted/50">Next →</span>
++              )}
++            </div>
++          ) : null}
+         </Card>
+ 
+         {provider === "meta" && !isDemoMode ? (
+@@ -942,7 +1093,9 @@ export async function AdsChannelPage({
+ }) {
+   const workspaceId = await getActiveWorkspaceId();
+   const workspaceName = await getWorkspaceName(workspaceId);
+-  const { range, preset } = resolveDateRange(await searchParams);
++  const resolvedParams = await searchParams;
++  const { range, preset } = resolveDateRange(resolvedParams);
++  const { sortKey, sortDir, page } = resolveCampaignTableParams(resolvedParams);
+   return (
+     <>
+       <Topbar title={`${label} — ${workspaceName}`} />
+@@ -952,6 +1105,9 @@ export async function AdsChannelPage({
+         label={label}
+         range={range}
+         preset={preset}
++        sortKey={sortKey}
++        sortDir={sortDir}
++        page={page}
+       />
+     </>
+   );
+-- 
+2.43.0
+

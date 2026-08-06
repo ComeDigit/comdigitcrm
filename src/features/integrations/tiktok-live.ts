@@ -310,6 +310,14 @@ export interface AccountHealthResult {
   connectionId: string;
   displayName: string;
   health: AccountHealth;
+  /** Why the probe failed, when it did — surfaced in the UI so an operator
+   * doesn't have to open the Vercel function log to tell causes apart. */
+  reason?: string;
+}
+
+interface HealthProbe {
+  health: AccountHealth;
+  reason?: string;
 }
 
 /** Cheap per-account health probe — mirrors checkMetaAccountsHealth. */
@@ -329,20 +337,26 @@ export async function checkTikTokAccountsHealth(workspaceId: string): Promise<Ac
 
   return Promise.all(
     connections.map(async (connection) => {
-      const cacheKey = `tiktok-health:${connection.id}`;
-      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
+      // v2 key: the cached shape changed from a bare string to an object.
+      const cacheKey = `tiktok-health2:${connection.id}`;
+      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
         try {
           const page = await withCreds(connection, (creds) =>
             provider.getDailyInsights(creds, connection.externalAccountId, range),
           );
           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
-          return spend > 0 ? "live" : "idle";
+          return { health: spend > 0 ? "live" : "idle" };
         } catch (e) {
           logTikTokFailure(connection.displayName, e);
-          return "no_access";
+          return { health: "no_access", reason: reasonFor(e) };
         }
       });
-      return { connectionId: connection.id, displayName: connection.displayName, health };
+      return {
+        connectionId: connection.id,
+        displayName: connection.displayName,
+        health: probe.health,
+        reason: probe.reason,
+      };
     }),
   );
 }

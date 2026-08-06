@@ -1,0 +1,29 @@
+Add CSV and PDF export for campaigns, clients, and reports
+
+AUDIT_REPORT.md, Medium: "CSV/PDF export — neither exists anywhere."
+
+PDF is the browser's own Print dialog (PrintButton + @media print CSS)
+rather than a server-rendered file, added to the Ads report (admin,
+client portal, and public share page), Shopify report (admin + client
+portal), and the Clients list (admin).
+
+CSV is Route Handlers, not client-side blobs: /api/export/campaigns
+(admin), /client/export/campaigns (client portal — lives under /client/*
+because the session cookie is path-scoped there), and /api/export/clients
+(admin-only roster). Each surface resolves workspaceId through its own
+existing auth exactly as its page does, never a query param, to keep this
+from becoming a cross-tenant export hole. Public share links get Print
+but not CSV.
+
+An adversarial review pass before shipping caught and fixed two real
+bugs: unvalidated since/until could crash the route via a CRLF-in-header
+error (now rejected with a 400), and campaign/contact names starting
+with =+-@ could execute as spreadsheet formulas on open (CSV/formula
+injection, CWE-1236) — now neutralized with a leading apostrophe.
+
+Extracted clients/page.tsx's page-local shopTotals/inline-filter into
+shared, exported crm/queries.ts functions so the roster page and its CSV
+export can never silently drift apart.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

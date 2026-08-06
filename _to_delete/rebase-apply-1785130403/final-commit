@@ -1,0 +1,31 @@
+Add pagination and sorting to the clients list and campaign tables
+
+AUDIT_REPORT.md flagged this as missing (Medium): "every list (clients,
+campaigns) renders unpaginated and unsorted." Both are server-rendered,
+no client JS, following the same plain-GET-links pattern as the existing
+date range picker and clients search/filter.
+
+Clients list: added a sort dropdown (name A-Z/Z-A, revenue high-low) and
+12-per-page pagination. Sorting by name only fetches live Shopify revenue
+for the current page's clients rather than every client, unlike sorting
+by revenue which necessarily needs every filtered client's totals first
+to sort correctly — a real efficiency win for the common case, not just
+pagination for its own sake.
+
+Campaign table (shared across Meta/Google/TikTok, the admin dashboard,
+client portal, and public share links): column headers for Campaign,
+Spend, Revenue, ROAS, Purchases, Impressions, and Clicks are now click-
+to-sort links (toggling direction on repeat clicks), plus 25-per-page
+pagination. resolveCampaignTableParams() is exported from channel-page.tsx
+and reused by every caller that resolves raw searchParams (AdsChannelPage
+and the three client-portal ads pages route through it; the public share
+page calls it directly).
+
+Deliberately scoped to the two lists the audit names explicitly. The
+newer ad set/ad/keyword/audience/product breakdown tables added earlier
+this pass already cap-and-sort-by-spend server-side, which covers the
+same "unbounded table" risk without retrofitting full pagination onto
+every one of them too.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

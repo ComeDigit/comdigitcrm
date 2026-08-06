@@ -1,0 +1,27 @@
+Add a real Shopify OAuth connect flow, alongside the paste-a-token path
+
+Shopify retired creating custom apps directly in a store's admin — new
+apps now go through the Partner/Dev Dashboard and a real OAuth token
+exchange rather than a static token you copy off a page. Rather than
+leave the existing paste-a-token flow as the only (now partly stale)
+option, this adds a proper "Connect via OAuth" button that mirrors the
+Meta/Google Ads/TikTok pattern:
+
+- /api/integrations/shopify/start takes a shop domain (its consent
+  dialog lives on the store's own domain, unlike the other three
+  providers' single fixed authorize URL) plus the usual signed-state
+  CSRF nonce.
+- /api/integrations/shopify/callback verifies both our own state AND
+  Shopify's own hmac signature on the callback params, exchanges the
+  code for a non-expiring offline access token, then hands off to the
+  EXISTING connectShopifyStore() — the same function the paste-a-token
+  form already calls — so both connect paths always produce an
+  identical connection and can never drift apart.
+- New SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET env vars gate it; the
+  paste-a-token form's copy is updated to stop pointing at the
+  discontinued in-admin flow and point at the new button instead.
+
+tsc, lint, tests (11/11), and production build all pass clean.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

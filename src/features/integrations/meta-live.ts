@@ -312,6 +312,14 @@ export interface AccountHealthResult {
   connectionId: string;
   displayName: string;
   health: AccountHealth;
+  /** Why the probe failed, when it did — surfaced in the UI so an operator
+   * doesn't have to open the Vercel function log to tell causes apart. */
+  reason?: string;
+}
+
+interface HealthProbe {
+  health: AccountHealth;
+  reason?: string;
 }
 
 /**
@@ -337,20 +345,28 @@ export async function checkMetaAccountsHealth(workspaceId: string): Promise<Acco
 
   return Promise.all(
     connections.map(async (connection) => {
-      const cacheKey = `meta-health:${connection.id}`;
-      const health = await cached<AccountHealth>(cacheKey, HEALTH_TTL_MS, async () => {
+      // v2 key: the cached shape changed from a bare string to an object.
+      const cacheKey = `meta-health2:${connection.id}`;
+      const probe = await cached<HealthProbe>(cacheKey, HEALTH_TTL_MS, async () => {
         const creds = await resolveCreds(connection);
-        if (!creds) return "no_access";
+        if (!creds) {
+          return { health: "no_access", reason: "No token for this account — set META_USER_TOKEN or reconnect it." };
+        }
         try {
           const page = await provider.getDailyInsights(creds, connection.externalAccountId, range);
           const spend = page.items.reduce((sum, r) => sum + r.spendMinor, 0);
-          return spend > 0 ? "live" : "idle";
+          return { health: spend > 0 ? "live" : "idle" };
         } catch (e) {
           logMetaFailure(connection.displayName, e);
-          return "no_access";
+          return { health: "no_access", reason: reasonFor(e) };
         }
       });
-      return { connectionId: connection.id, displayName: connection.displayName, health };
+      return {
+        connectionId: connection.id,
+        displayName: connection.displayName,
+        health: probe.health,
+        reason: probe.reason,
+      };
     }),
   );
 }

@@ -1,0 +1,23 @@
+AUDIT_REPORT.md flagged this as missing (High). fetchShopifyProductFacts
+(shopify.ts) does its own paginated pass over orders.json with line_items
+in the field list, aggregating sales/quantity/order-count per product —
+Shopify's REST Admin API has no dedicated top-products report endpoint on
+non-Plus plans, so this derives it the way most third-party apps do,
+mirroring the existing fetchShopifyDailyFacts pagination shape rather
+than touching that function's working contract.
+
+getLiveShopifyProducts (new shopify-products-live.ts) wraps it with the
+same cache/multi-connection/partial-failure pattern as every other live
+report, reusing shopify-live.ts's now-exported resolveCreds/cached/
+reasonFor. Deliberately NOT merged across connections the way daily
+totals are: Shopify product ids are only unique within one store, so
+summing across two different connected stores risked silently combining
+two unrelated products that happen to share a numeric id.
+
+Wired into the Shopify report as a new "Top products" table (top 50 by
+sales), shown on both the internal dashboard and client portal Shopify
+pages, live-mode only — no demo-data equivalent, same as the ads
+channels' deeper breakdowns.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz

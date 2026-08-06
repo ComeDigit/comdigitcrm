@@ -81,6 +81,9 @@ export default async function ClientDetailPage({
   // runs, just scoped to this one workspace instead of every workspace
   // that has a connection for each provider.
   const healthByConnection = new Map<string, AccountHealth>();
+  // Connection ids are unique across providers, so one reason map serves all
+  // four probes. It explains a "no_access" without a trip to the Vercel log.
+  const healthReasonByConnection = new Map<string, string>();
   if (!isDemoMode) {
     const lists = await Promise.all([
       connections.some((c) => c.provider === "meta")
@@ -96,7 +99,11 @@ export default async function ClientDetailPage({
         ? checkTikTokAccountsHealth(workspace.id)
         : Promise.resolve([]),
     ]);
-    for (const list of lists) for (const r of list) healthByConnection.set(r.connectionId, r.health);
+    for (const list of lists)
+      for (const r of list) {
+        healthByConnection.set(r.connectionId, r.health);
+        if (r.reason) healthReasonByConnection.set(r.connectionId, r.reason);
+      }
   }
   const healthTone = (h: AccountHealth | undefined): "positive" | "outline" | "negative" => {
     if (h === "live") return "positive";
@@ -191,9 +198,19 @@ export default async function ClientDetailPage({
                               {c.status}
                             </span>
                           </span>
-                          <Badge tone={healthTone(healthByConnection.get(c.id))}>
-                            {healthLabel(healthByConnection.get(c.id))}
-                          </Badge>
+                          <>
+                            <Badge
+                              tone={healthTone(healthByConnection.get(c.id))}
+                              title={healthReasonByConnection.get(c.id)}
+                            >
+                              {healthLabel(healthByConnection.get(c.id))}
+                            </Badge>
+                            {healthReasonByConnection.get(c.id) ? (
+                              <span className="text-negative">
+                                {healthReasonByConnection.get(c.id)}
+                              </span>
+                            ) : null}
+                          </>
                           {c.status === "active" ? (
                             <DisconnectConnectionButton connectionId={c.id} workspaceId={c.workspaceId} />
                           ) : null}

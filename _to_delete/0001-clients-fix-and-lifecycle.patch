@@ -1,0 +1,1272 @@
+From 6cdf457c308b504f778957bf26f9724cd16a3b6e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 26 Jul 2026 20:14:20 +0000
+Subject: [PATCH] Fix stale Shopify data on the clients page, add client
+ lifecycle management
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Critical bug fix: the clients roster was reading revenue/orders from a dead
+DB table (getShopDaily) even in live mode, so every client silently showed
+$0/0 in production — now branches to the same live Shopify pull every other
+report page already uses.
+
+Also completes the top of the post-audit punch list:
+- Client login rate limiting: 5 failed attempts locks the account for 15
+  minutes (per-account), with an admin "Unlock" override in Settings.
+- Suspend/reactivate a client — blocks their portal login only, admin
+  access and data untouched, reversible with one click.
+- Edit client (rename, set a website) and Delete client (soft-delete via
+  archivedAt, never a hard cascade-delete) with a restore affordance.
+- Search + status filter on the clients list.
+- Suspended/archived workspaces are now also excluded from the admin
+  workspace switcher and from client-portal session validation, so both
+  "suspend" and "delete" actually cut off access everywhere, not just on
+  the roster page.
+
+New migration: supabase/migrations/0005_workspace_status_and_login_lockout.sql
+(run in the Supabase SQL editor — adds workspaces.status and two client_users
+lockout columns, idempotent/safe to run once).
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RByRngyvngbCJ9TiNsChTz
+---
+ AUDIT_REPORT.md                               | 220 ++++++++++++++++++
+ src/app/dashboard/clients/page.tsx            | 142 ++++++++++-
+ src/db/schema/ops.ts                          |  12 +
+ src/db/schema/tenancy.ts                      |  10 +
+ src/features/client-portal/actions.ts         |  87 ++++++-
+ .../client-portal/components/manager.tsx      |  24 +-
+ src/features/crm/actions.ts                   | 200 ++++++++++++++++
+ src/features/crm/components/forms.tsx         | 130 ++++++++++-
+ src/features/crm/queries.ts                   |  35 ++-
+ src/lib/auth/client-session.ts                |  17 ++
+ src/lib/workspace.ts                          |  14 +-
+ ...005_workspace_status_and_login_lockout.sql |  33 +++
+ 12 files changed, 899 insertions(+), 25 deletions(-)
+ create mode 100644 AUDIT_REPORT.md
+ create mode 100644 supabase/migrations/0005_workspace_status_and_login_lockout.sql
+
+diff --git a/AUDIT_REPORT.md b/AUDIT_REPORT.md
+new file mode 100644
+index 0000000..f48783a
+--- /dev/null
++++ b/AUDIT_REPORT.md
+@@ -0,0 +1,220 @@
++# ComeDigit CRM — Independent QA, Product & Security Audit
++
++**Scope:** full source tree at the current `main` branch (commit `88edc52`). Every item below was checked against actual code — file paths and line numbers are cited as evidence. Nothing here is asserted from the product description alone; where something couldn't be verified, it's marked as such rather than assumed.
++
++---
++
++## Overall Completion: ~57%
++
++This is a weighted estimate across every individual line item in your spec (including sub-bullets like Age/Gender/Placement/Country under "Audience Breakdown," counted separately) — Complete = 1 point, Partial = 0.5, Missing = 0, summed across roughly 165 checkable items and divided by the total. It is a methodology, not a precise measurement — treat it as directionally honest, not exact to the point.
++
++The honest shape of that number: the **foundation is unusually solid** for this stage — real tenant isolation, real OAuth against all four ad/commerce platforms, real live data pulls, encrypted passwords, IDOR-safe queries. The score is dragged down by **breadth**, not depth: agency/client lifecycle management (edit, delete, suspend, search a client) and the deeper per-platform reporting surface (keywords, audience breakdowns, product-level Shopify data, ad-set/ad-level Meta data) are the two biggest gaps, plus a handful of commercial-SaaS basics (billing, rate limiting, search/pagination/export) that haven't been started.
++
++---
++
++## Completed Features
++
++**Core architecture**
++✔ Real live data pulls from Meta, Google Ads, TikTok, and Shopify — on-demand per page view, not a stale nightly sync (`src/features/integrations/*-live.ts`)
++✔ OAuth "Connect" flow for all four providers, each with signed-state CSRF protection (`src/app/api/integrations/{meta,shopify,google_ads,tiktok}/{start,callback}/route.ts`)
++✔ Tenant isolation for the client portal — workspace id is resolved server-side from a hashed session token, never from client input, verified across all 8 `/client/**` route files with zero exceptions
++✔ Encrypted, salted client passwords (scrypt, timing-safe comparison — `client-session.ts:29-42`)
++✔ Every mutating server action pairs `authorize()` with a tenant-scoped `WHERE` clause — spot-checked 8 actions, zero exceptions found
++✔ Revoke/disable a client's login — enforced both at next-login and mid-session (`client-portal/actions.ts:191`, `client-session.ts:95`)
++✔ Assign a specific ad account/store to a specific client is required (not optional/auto-guessed) on every connect flow
++✔ Per-client, per-provider API connection health indicator (live/idle/no_access) in Settings
++✔ Dark mode — full token-based theme, cookie-persisted, pre-paint script avoids flash (`theme.tsx`, `globals.css:23-38`)
++✔ Charts/graphs — Recharts-based, rendered on every report page in both the admin and client trees
++✔ Date range picker + comparison-vs-previous-period on every report-style page (Overview, Shopify, all three Ads channels), consistently present in both the admin and client route trees
++✔ CSRF, XSS, and SQL-injection protection all check out clean (see Security Issues for detail)
++✔ Google Ads GAQL date-range values pass through an `assertIsoDate()` guard before interpolation, at both call sites
++
++**Admin**
++✔ Create client, generate client login, view all clients, last-login display, per-connection health status
++
++---
++
++## Partially Completed
++
++⚠ **Reset password** — works, but is the same "save login" form used for initial setup, not a distinct reset flow (no temp password, no forced-change flag, no notification). `client-portal/actions.ts:71-130`.
++
++⚠ **Activity/audit logs** — real table, actively written for CRM actions (contact/task/workspace create, task status), but nothing ever reads it back — there is no admin page that displays the log. Client logins/logouts and every provider connect/disconnect are never logged at all.
++
++⚠ **Role-based access control** — the permission system itself (`authorize.ts`) is fully built (10 roles, 12 actions, an explicit grant map) and every check is wired correctly, but `getPrincipal()` always returns the same fixed `agency_owner` principal with no real login on the admin side — so today it can never actually deny anything. The machinery is complete; the differentiation it's meant to provide is dormant.
++
++⚠ **Global connected-accounts view** — Settings does list every ad account/store across the whole agency in one place, but each row shows only the ad account/store's own name, never which client it belongs to — you can't tell at a glance who owns what once you have more than a couple of clients.
++
++⚠ **Token refresh / automatic reconnect** — Google Ads and TikTok both auto-refresh access tokens with zero human action; Meta has no refresh path (long-lived token only, with an expiry warning) and Shopify's token doesn't expire. Once any token is actually revoked (not just expired), all four require a manual reconnect in Settings — there's no case where a fully-revoked connection heals itself.
++
++⚠ **Webhooks** — the Shopify webhook route genuinely verifies Shopify's HMAC signature and stores the event (not a stub), but nothing anywhere reads those stored rows back out — it writes to a queue no consumer drains. No webhook endpoints exist for Meta, Google Ads, or TikTok.
++
++⚠ **Responsive design / mobile-friendly** — the admin dashboard's navigation is hidden entirely below 768px with no hamburger/drawer replacement, making the agency-owner side unusable on a phone. The client portal's nav is a horizontal scroll strip and works fine on mobile.
++
++⚠ **Loading states / skeleton loaders** — one shared skeleton covers all of `/dashboard/**`; the entire `/client/(portal)/**` tree (where real users — your clients — actually experience live API latency) has no loading state or Suspense fallback at all.
++
++⚠ **Shopify Sessions / Conversion Rate** — both are real, computed fields, but Sessions is hardcoded to 0 (no traffic endpoint exists on non-Plus Shopify plans without ShopifyQL), which makes Conversion Rate always read 0.00% — a technical limitation, not a bug in the code, but nothing in the UI tells a client that's why, see Bugs Found below.
++
++⚠ **New Customer %, Top Performing Channel, Revenue by Platform** (Overview dashboard) — the underlying data exists (new-customer counts, per-channel spend/ROAS, per-channel revenue), but none is surfaced as its own explicitly-labeled % or highlighted "top" callout the way the spec describes.
++
++⚠ **Video Views (TikTok)** — the field exists and renders in the shared ad-report UI, but whether TikTok's actual field mapping populates it with real numbers hasn't been verified against a live TikTok account (no test account has been connected yet).
++
++---
++
++## Missing Features
++
++### Critical
++
++**No rate limiting or lockout on client login**
++- What's missing: any throttle, delay, or lockout after repeated failed password attempts against the client portal.
++- Why it matters: `clientLogin()` runs one DB lookup + password check with nothing else standing between an attacker and unlimited guesses against a known or guessed client username — a real account-takeover vector, not a theoretical one.
++- How it should work: a per-username and per-IP attempt counter with exponential backoff or a hard lockout after ~5-10 failures, ideally paired with the audit-log gap below so a lockout event is visible to the agency.
++- Priority: **Critical**
++
++**Delete client is not implemented**
++- What's missing: any way to permanently remove a client/workspace.
++- Why it matters: there is no offboarding path at all — once a client is added, it exists forever. For a commercial product this is a basic lifecycle requirement, and if it's ever added carelessly, most of the workspace-scoped tables cascade-delete automatically (contacts, tasks, connections, client logins), so it needs to ship with a confirmation step, not be added as an afterthought.
++- How it should work: a confirm-to-delete flow on the client card, ideally soft-delete first (there's already an unused `archivedAt` column ready for this) with hard-delete as a separate, rarer action.
++- Priority: **Critical**
++
++**Edit client is not implemented**
++- What's missing: any way to change a client's name/details after creation.
++- Why it matters: a typo or a client rebrand can never be corrected without going directly into the database.
++- How it should work: a straightforward update form mirroring the existing create form.
++- Priority: **Critical**
++
++**Clients-page revenue preview reads from a table nothing writes to anymore**
++- What's missing: this is a live bug, not an unbuilt feature — see Bugs Found below for detail.
++- Priority: **Critical**
++
++### High
++
++**Suspend a client without deleting them**
++- What's missing: a workspace-level active/suspended status. Today only the *login* can be disabled — the workspace itself has no on/off switch, and the "Active" badge on the clients page is a hardcoded label, not backed by real state.
++- Why it matters: pausing a client relationship (non-payment, offboarding in progress, dispute) currently has no clean middle ground between "fully active" and "delete everything."
++- How it should work: use the already-present but unused `archivedAt`/status column on `workspaces`, gate dashboard access on it the same way client-login status already gates the portal.
++- Priority: **High**
++
++**Search and filter the client list**
++- What's missing: both are entirely absent from the clients page.
++- Why it matters: the product's whole premise is managing *multiple* clients from one dashboard — this stops scaling past a handful of clients.
++- How it should work: a text search on name plus filters for connection status/provider.
++- Priority: **High**
++
++**No audit trail for logins or connection changes**
++- What's missing: client login/logout events and every provider connect/disconnect are never written to the audit log — only the original CRM actions (contact/task/workspace creation) are.
++- Why it matters: if the login-brute-force gap above is ever exploited, or an admin connects the wrong ad account to the wrong client, there's currently no record of it happening.
++- How it should work: add audit rows to `clientLogin`, `clientLogoutAction`, and every `connect*`/OAuth callback, mirroring the pattern already used for CRM writes.
++- Priority: **High**
++
++**Meta: Ad Sets and Ads (only Campaign-level data exists)**
++- What's missing: any breakdown below the campaign level.
++- Why it matters: agencies manage budgets and creative at the ad-set and ad level daily — campaign-only rollups hide exactly where performance problems usually live.
++- How it should work: add `adSetId`/`adId`-scoped queries to the Meta client, with a drill-down from the campaign table.
++- Priority: **High**
++
++**Meta: Audience Breakdown (Age, Gender, Placement, Country) — none implemented**
++- Why it matters: explicitly requested and one of the more commonly-checked reports in any real ad audit.
++- How it should work: Meta's Insights API supports `breakdowns` params for all four dimensions in one additional query per report.
++- Priority: **High**
++
++**Google Ads: Search Terms, Keywords, Negative Keywords, Quality Score, Device/Location breakdown — none implemented**
++- Why it matters: this is a large share of what actually managing a Google Ads account looks like day to day; right now the Google Ads dashboard only shows campaign-level spend/conversion numbers, which is a fraction of the platform's own reporting depth.
++- How it should work: each needs its own GAQL query against `keyword_view`/`search_term_view`/segment-level resources — a meaningfully sized follow-on build, not a quick add.
++- Priority: **High**
++
++**Shopify: no product-level data at all (Top Products, Top Collections, Products Sold, Inventory, Discount Usage)**
++- Why it matters: the Shopify connector currently only reads order totals — no line items, no product references, no discount codes. A commerce dashboard with zero product visibility is a significant gap for a channel this central to the product.
++- How it should work: extend `fetchShopifyDailyFacts` to also request `line_items`/`discount_codes` fields on the existing orders call (no new scope needed) and add product/collection lookups (needs `read_products`).
++- Priority: **High**
++
++**No billing/subscription management**
++- Why it matters: explicitly requested, and relevant specifically because this is being evaluated as a sellable SaaS product — there is currently zero code for plans, payment, or subscription state (`organizations.plan` is a free-text column nothing ever reads or writes).
++- How it should work: a Stripe (or similar) integration gating dashboard access on subscription status.
++- Priority: **High**
++
++**Admin dashboard is not usable on mobile**
++- Why it matters: explicitly requested ("Mobile Friendly"), and the agency-owner side is the one that's actually broken (the client portal is fine).
++- How it should work: a collapsible drawer nav below the `md:` breakpoint.
++- Priority: **High**
++
++### Medium
++
++- **Pagination and sorting** — absent everywhere; every list (clients, campaigns) renders unpaginated and unsorted. Fine at today's scale, will not stay fine.
++- **CSV/PDF export** — neither exists anywhere in the codebase.
++- **TikTok: Average Watch Time, Top Videos, Top Creatives, Audience** — none implemented; TikTok's dashboard is the thinnest of the three ad platforms today.
++- **Meta: Hourly Trend, Creative Performance** — only daily granularity exists; no creative-level (image/video asset) performance anywhere.
++- **Reset-password UX** — functions today (see Partially Completed) but deserves its own explicit flow rather than reusing the create-login form.
++- **Session idle timeout** — client sessions are a flat 30-day absolute expiry with no inactivity-based shortening.
++- **Loading states on the client portal** — see Partially Completed; the tree most exposed to live-API latency has the least loading-state coverage.
++- **Marketing Funnel visualization, Profit/COGS calculation** — funnel-stage *numbers* exist per ad channel, but no unified funnel diagram blending all channels + store exists, and no profit calculation exists anywhere (net-after-ad-spend is explicitly documented as "before COGS/shipping").
++- **Global connected-accounts view isn't labeled by client** — see Partially Completed.
++
++### Low
++
++- **Toast/notification system** — only inline per-form success/error text exists; no app-wide notification system.
++- **GA4, Google Tag Manager, Meta Conversions API, Shopify Storefront API** — none implemented. None of these were part of the original "4 live connectors" scope, but they were in your spec, so flagged here for completeness.
++- **System/error logs UI** — no admin-facing view of application-level logs or errors (distinct from the business audit log).
++- **Lazy loading, bundle-size configuration** — no `next/dynamic` usage, no bundle analyzer configured. Image optimization is moot — the app currently renders no raster images at all (icons are SVG components), so there's nothing to optimize yet.
++
++---
++
++## Bugs Found
++
++**1. Clients-page revenue/order preview always shows stale data in production — Severity: Critical**
++- Steps to reproduce: connect a real Shopify store to any client (non-demo mode), let a few real orders come in, then open `/dashboard/clients`.
++- Expected behavior: each client card's "Net revenue (30d)" / "Orders (30d)" reflects real recent sales, the same live numbers the client's own Shopify page shows.
++- Actual behavior: it will show ₹0 / 0 orders for every client, always. `clients/page.tsx:24` calls `getShopDaily()`, which in non-demo mode reads the `shop_sales_daily` database table (`queries.ts:96-106`) — a table nothing has written to since Shopify moved to on-demand live pulls this session. This is the exact same class of bug I found and fixed in the AI Copilot page earlier in this project; this instance in the clients roster was never updated and still has it.
++- Fix: swap in `getLiveShopifyReport` the same way `shopify/report.tsx` and `overview/report.tsx` already do — I can make this change now if you'd like.
++
++**2. Shopify Conversion Rate reads a misleading 0.00% with no explanation — Severity: High**
++- Steps to reproduce: connect any real Shopify store and open its dashboard.
++- Expected behavior: either a real conversion rate, or a clear indicator that this number isn't available on the store's current Shopify plan.
++- Actual behavior: it silently shows 0.00%, identical to what a genuinely broken store would show. The KPI card's hover tooltip describes the metric normally, with no caveat that Sessions data isn't available without a ShopifyQL Plus-tier connection. A client glancing at this could reasonably think their store's conversion has completely collapsed.
++- Fix: either suppress this card when sessions data is unavailable, or add an explicit "not available on this plan" state instead of a bare 0%. The same applies to Google Ads' Reach/funnel fields and TikTok's Revenue/funnel fields, which have the identical silent-zero pattern.
++
++**3. "Active" badge on the clients page is not backed by real data — Severity: Low**
++- Steps to reproduce: open `/dashboard/clients`.
++- Expected behavior: a status badge reflects actual client state.
++- Actual behavior: every client card shows a hardcoded "Active" badge (`clients/page.tsx:46`) regardless of any real status, because no workspace-level status field is ever set. Not exploitable, but it visually implies a status system that doesn't exist yet.
++
++**4. Clients-page N+1 query pattern — Severity: Low (performance, not correctness)**
++- Steps to reproduce: add ~30+ clients and load `/dashboard/clients`.
++- Expected behavior: one batched query for all clients' revenue previews.
++- Actual behavior: `clients/page.tsx:22-27` fires one separate `getShopDaily` call per workspace in a `Promise.all(map(...))` rather than a single `IN`-clause query — page load time will scale linearly with client count. Compounds with bug #1 above once that's fixed and real queries start running.
++
++---
++
++## Security Issues
++
++| Issue | Risk Level | Recommendation |
++|---|---|---|
++| No rate limiting/lockout on client login | **Critical** | Add attempt throttling before this touches a real client's credentials — see Missing Features. |
++| No audit trail for auth events or connection changes | **High** | Extend the existing audit-log pattern to `clientLogin`/`clientLogoutAction`/every connect action. |
++| RBAC is fully built but dormant (single fixed principal) | **Medium** | Not exploitable today since the admin side has no external access by design, but any future feature that trusts `authorize()` to filter by a *different* per-user principal should be built and tested knowing today's principal is always `agency_owner`/unrestricted. |
++| Client session: 30-day absolute expiry, no idle timeout | **Low-Medium** | Consider shortening, or adding inactivity-based expiry, especially since there's no lockout to fall back on if a session cookie is ever exposed. |
++| JWTs are not used (opaque DB-backed tokens instead) | **Informational, not a finding** | Your spec asked for JWTs; the actual mechanism (random token, SHA-256 hashed, looked up server-side, deletable on logout) is arguably *better* than a JWT here, since it's instantly revocable rather than valid-until-expiry. Flagged only because it doesn't literally match the spec's wording. |
++
++Everything else checked — tenant isolation, IDOR protection, CSRF, XSS, SQL injection, encrypted passwords, secure cookie flags — came back clean with no findings. This is a genuinely strong security baseline for the pieces it covers; the gaps above are about breadth (auth logging, brute-force protection) rather than the core isolation model being weak.
++
++---
++
++## UX Improvements
++
++- Add a mobile nav drawer for the admin dashboard — right now it's the one surface in the whole app that doesn't work on a phone.
++- Extend loading states/skeletons to the client portal, which is where live-API latency is actually felt by real users.
++- Add search and pagination to the clients list before it's tested with more than a handful of real clients.
++- Label the global connected-accounts view in Settings by client name, not just by ad-account name.
++- Add an explicit "data not available on this plan/setup" state for the handful of metrics that can silently read zero (Shopify sessions, Google Ads reach, TikTok revenue) instead of letting them look like a real zero.
++- A lightweight toast system for action feedback (connect/disconnect/save) would read as more polished than inline-only messages, though inline messages do already work.
++
++---
++
++## Final Verdict
++
++**Beta Ready**
++
++The parts that are genuinely hard to get right — real live data from four separate ad/commerce platforms, tenant isolation that actually holds up under inspection, encrypted credentials, IDOR-safe queries, working OAuth against Meta/Google/TikTok/Shopify — are all done, and done well. That's not a small thing; a lot of products at this stage fake the integrations or hand-wave the isolation model, and this one doesn't.
++
++What keeps it from "Ready for Production" as a commercial, sell-to-other-agencies SaaS: you can't yet edit or delete a client, there's no rate limiting on the one real login system in the app, there's a live bug currently showing every client's revenue as zero on the roster page, and the two most detail-hungry integrations (Google Ads, Shopify) are missing the specific data agencies actually go looking for (keywords, audience breakdowns, product-level sales). None of these are architecturally hard to fix — they're straightforwardly buildable — but they're real gaps between "works for me running my own agency's clients through it" and "safe to charge strangers money for."
++
++For your own agency's internal use with clients you're actively managing yourself, this is solid enough to run real clients through today, with the Critical items above addressed first — especially the login rate-limiting and the clients-page revenue bug.
+diff --git a/src/app/dashboard/clients/page.tsx b/src/app/dashboard/clients/page.tsx
+index ab2dae3..446915c 100644
+--- a/src/app/dashboard/clients/page.tsx
++++ b/src/app/dashboard/clients/page.tsx
+@@ -1,41 +1,116 @@
+ import Link from "next/link";
+ import { Topbar } from "@/components/shell/topbar";
+-import { Card, CardHeader, Badge } from "@/components/ui/primitives";
++import { Card, CardHeader, Badge, EmptyState } from "@/components/ui/primitives";
+ import { getPrincipal } from "@/lib/auth/principal";
+-import { getContacts, getWorkspaces } from "@/features/crm/queries";
+-import { NewContactForm, NewWorkspaceForm } from "@/features/crm/components/forms";
++import { getContacts, getWorkspaces, getArchivedWorkspaces } from "@/features/crm/queries";
++import {
++  NewContactForm,
++  NewWorkspaceForm,
++  EditWorkspaceForm,
++  WorkspaceStatusToggle,
++  ArchiveWorkspaceForm,
++  RestoreWorkspaceForm,
++} from "@/features/crm/components/forms";
+ import { getShopDaily, lastNDays } from "@/features/metrics/queries";
++import { getLiveShopifyReport } from "@/features/integrations/shopify-live";
+ import { sumShopFacts } from "@/lib/metrics/definitions";
+ import { formatMoney } from "@/lib/utils";
++import { isDemoMode } from "@/lib/env";
+ 
+ export const metadata = { title: "Clients" };
+ 
++const filterInputCls =
++  "h-9 rounded-lg border border-border bg-surface px-3 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring";
++
+ /** Agency client roster: every workspace is one client brand. */
+-export default async function ClientsPage() {
++export default async function ClientsPage({
++  searchParams,
++}: {
++  searchParams: Promise<{ q?: string; status?: string }>;
++}) {
+   const principal = await getPrincipal();
++  const { q, status } = await searchParams;
++  const search = (q ?? "").trim().toLowerCase();
++  const statusFilter = status === "active" || status === "suspended" ? status : "all";
+ 
+-  const [workspaces, contacts] = await Promise.all([
++  const [workspaces, archivedWorkspaces, contacts] = await Promise.all([
+     getWorkspaces(principal.orgId),
++    getArchivedWorkspaces(principal.orgId),
+     getContacts(principal.orgId),
+   ]);
+ 
++  const range = lastNDays(30);
+   const revenue = await Promise.all(
+     workspaces.map(async (ws) => {
+-      const totals = sumShopFacts(await getShopDaily(ws.id, lastNDays(30)));
++      // Shopify is pulled live now (features/integrations/shopify-live.ts) —
++      // nothing syncs orders into the database anymore, same "pull-on-demand"
++      // shape as every ad channel. This used to call getShopDaily() even in
++      // live mode, which reads a table nothing writes to any more, so every
++      // client's revenue/orders here silently showed $0/0 in production
++      // (AUDIT_REPORT.md, Bug #1 — Critical). Demo mode keeps using the
++      // deterministic generator since there's no real store to pull from.
++      const totals = isDemoMode
++        ? sumShopFacts(await getShopDaily(ws.id, range))
++        : (await getLiveShopifyReport(ws.id, range)).totals;
+       return { id: ws.id, totals };
+     }),
+   );
+ 
++  const filtered = workspaces.filter((ws) => {
++    if (statusFilter !== "all" && ws.status !== statusFilter) return false;
++    if (search && !ws.name.toLowerCase().includes(search)) return false;
++    return true;
++  });
++  const isFiltered = Boolean(search) || statusFilter !== "all";
++
+   return (
+     <>
+       <Topbar title="Clients" />
+       <main className="space-y-6 px-6 py-6">
+-        <div className="flex justify-end gap-2">
+-          <NewWorkspaceForm />
+-          <NewContactForm workspaces={workspaces} />
++        <div className="flex flex-wrap items-center justify-between gap-3">
++          <form method="GET" className="flex flex-wrap items-center gap-2">
++            <input
++              type="search"
++              name="q"
++              defaultValue={q ?? ""}
++              placeholder="Search clients…"
++              className={`${filterInputCls} w-52`}
++            />
++            <select name="status" defaultValue={statusFilter} className={filterInputCls}>
++              <option value="all">All statuses</option>
++              <option value="active">Active</option>
++              <option value="suspended">Suspended</option>
++            </select>
++            <button
++              type="submit"
++              className="h-9 rounded-lg border border-border bg-surface px-3 text-[13px] font-medium hover:bg-surface-2"
++            >
++              Filter
++            </button>
++            {isFiltered ? (
++              <Link
++                href="/dashboard/clients"
++                className="text-xs font-medium text-muted underline-offset-4 hover:underline"
++              >
++                Clear
++              </Link>
++            ) : null}
++          </form>
++          <div className="flex gap-2">
++            <NewWorkspaceForm />
++            <NewContactForm workspaces={workspaces} />
++          </div>
+         </div>
++
++        {isFiltered && filtered.length === 0 ? (
++          <EmptyState
++            title="No clients match this search"
++            hint="Try a different name, or clear the status filter."
++          />
++        ) : null}
++
+         <div className="grid gap-4 lg:grid-cols-3">
+-          {workspaces.map((ws) => {
++          {filtered.map((ws) => {
+             const totals = revenue.find((r) => r.id === ws.id)?.totals;
+             const wsContacts = contacts.filter((c) => c.workspaceId === ws.id);
+             return (
+@@ -43,7 +118,11 @@ export default async function ClientsPage() {
+                 <CardHeader
+                   title={ws.name}
+                   subtitle={ws.vertical ?? "Client brand"}
+-                  action={<Badge tone="positive">Active</Badge>}
++                  action={
++                    <Badge tone={ws.status === "active" ? "positive" : "outline"}>
++                      {ws.status === "active" ? "Active" : "Suspended"}
++                    </Badge>
++                  }
+                 />
+                 <div className="flex-1 space-y-3 px-5 pb-5 pt-2">
+                   <div className="flex items-baseline justify-between">
+@@ -80,6 +159,16 @@ export default async function ClientsPage() {
+                       </ul>
+                     )}
+                   </div>
++                  {ws.website ? (
++                    <a
++                      href={ws.website}
++                      target="_blank"
++                      rel="noopener noreferrer"
++                      className="block truncate text-xs text-muted underline-offset-4 hover:underline"
++                    >
++                      {ws.website}
++                    </a>
++                  ) : null}
+                   <Link
+                     href="/dashboard"
+                     className="inline-block text-xs font-medium underline-offset-4 hover:underline"
+@@ -87,10 +176,41 @@ export default async function ClientsPage() {
+                     Open dashboard →
+                   </Link>
+                 </div>
++                {!isDemoMode ? (
++                  <div className="flex flex-wrap items-center gap-2 border-t border-border px-5 py-3">
++                    <EditWorkspaceForm
++                      workspace={{ id: ws.id, name: ws.name, website: ws.website }}
++                    />
++                    <WorkspaceStatusToggle workspaceId={ws.id} status={ws.status} />
++                    <ArchiveWorkspaceForm workspaceId={ws.id} name={ws.name} />
++                  </div>
++                ) : null}
+               </Card>
+             );
+           })}
+         </div>
++
++        {archivedWorkspaces.length > 0 ? (
++          <div className="space-y-3">
++            <p className="text-xs font-medium uppercase tracking-widest text-muted">
++              Archived clients
++            </p>
++            <div className="grid gap-3 lg:grid-cols-3">
++              {archivedWorkspaces.map((ws) => (
++                <Card key={ws.id} className="flex items-center justify-between px-4 py-3">
++                  <div>
++                    <p className="text-[13px] font-medium">{ws.name}</p>
++                    <p className="text-xs text-muted">
++                      Archived{" "}
++                      {ws.archivedAt ? new Date(ws.archivedAt).toLocaleDateString("en-IN") : ""}
++                    </p>
++                  </div>
++                  <RestoreWorkspaceForm workspaceId={ws.id} />
++                </Card>
++              ))}
++            </div>
++          </div>
++        ) : null}
+       </main>
+     </>
+   );
+diff --git a/src/db/schema/ops.ts b/src/db/schema/ops.ts
+index 3a23210..bc492a6 100644
+--- a/src/db/schema/ops.ts
++++ b/src/db/schema/ops.ts
+@@ -244,6 +244,18 @@ export const clientUsers = pgTable(
+     username: text("username").notNull(),
+     passwordHash: text("password_hash").notNull(),
+     status: clientUserStatusEnum("status").notNull().default("active"),
++    /**
++     * Login rate limiting: failedAttempts increments on each bad password
++     * and resets to 0 on a successful login. Once it crosses the threshold
++     * (see client-portal/actions.ts), lockedUntil is set to a future
++     * timestamp and login is refused — even with the correct password —
++     * until that time passes, at which point the next attempt is allowed
++     * again and the counters reset. This is a per-account lock (not IP-based)
++     * matching what a single client login form can enforce without extra
++     * infra.
++     */
++    failedAttempts: integer("failed_attempts").notNull().default(0),
++    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+diff --git a/src/db/schema/tenancy.ts b/src/db/schema/tenancy.ts
+index 843683e..e319419 100644
+--- a/src/db/schema/tenancy.ts
++++ b/src/db/schema/tenancy.ts
+@@ -44,6 +44,15 @@ export const organizations = pgTable("organizations", {
+   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+ });
+ 
++/**
++ * Suspend ≠ delete: "suspended" is a normal, reversible, admin-toggled
++ * pause (client access blocked, data untouched) — distinct from
++ * `archivedAt` below, which is the soft-delete path. A workspace can be
++ * suspended without being archived, and vice versa isn't meaningful (an
++ * archived workspace is already hidden everywhere).
++ */
++export const workspaceStatusEnum = pgEnum("workspace_status", ["active", "suspended"]);
++
+ export const workspaces = pgTable(
+   "workspaces",
+   {
+@@ -58,6 +67,7 @@ export const workspaces = pgTable(
+     website: text("website"),
+     currencyCode: text("currency_code").notNull().default("INR"),
+     timezone: text("timezone").notNull().default("Asia/Kolkata"),
++    status: workspaceStatusEnum("status").notNull().default("active"),
+     /** Soft archive keeps history queryable. */
+     archivedAt: timestamp("archived_at", { withTimezone: true }),
+     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+diff --git a/src/features/client-portal/actions.ts b/src/features/client-portal/actions.ts
+index 3de2eab..262fc0a 100644
+--- a/src/features/client-portal/actions.ts
++++ b/src/features/client-portal/actions.ts
+@@ -1,6 +1,6 @@
+ "use server";
+ 
+-import { eq, and } from "drizzle-orm";
++import { eq, and, sql } from "drizzle-orm";
+ import { redirect } from "next/navigation";
+ import { revalidatePath } from "next/cache";
+ import { isDemoMode } from "@/lib/env";
+@@ -15,6 +15,19 @@ import {
+   destroyClientSession,
+ } from "@/lib/auth/client-session";
+ 
++/**
++ * Login rate limiting (AUDIT_REPORT.md — Critical: "no rate limiting on
++ * client login"). 5 wrong passwords locks the account for 15 minutes;
++ * the counter resets on the next successful login. Per-account, not
++ * IP-based — the client login form has no other identity to key off of.
++ */
++const MAX_FAILED_ATTEMPTS = 5;
++const LOCKOUT_DURATION_MS = 15 * 60 * 1000;
++
++function minutesLeft(until: Date): number {
++  return Math.max(1, Math.ceil((until.getTime() - Date.now()) / 60_000));
++}
++
+ /**
+  * Client portal — admin-managed logins (Settings page) plus the public
+  * login/logout flow. One client_user per workspace via this UI (the table
+@@ -33,6 +46,7 @@ export interface ClientLoginSummary {
+   status: "active" | "disabled";
+   lastLoginAt: string | null;
+   createdAt: string;
++  lockedUntil: string | null;
+ }
+ 
+ /** Admin: fetch the client login for a workspace, if one exists. */
+@@ -57,6 +71,7 @@ export async function getClientLogin(workspaceId: string): Promise<ClientLoginSu
+     status: row.status,
+     lastLoginAt: row.lastLoginAt ? row.lastLoginAt.toISOString() : null,
+     createdAt: row.createdAt.toISOString(),
++    lockedUntil: row.lockedUntil ? row.lockedUntil.toISOString() : null,
+   };
+ }
+ 
+@@ -151,6 +166,25 @@ export async function setClientLoginStatus(
+   }
+ }
+ 
++/** Admin override: clears a lockout early (e.g. the client mistyped their password 5 times legitimately). */
++export async function unlockClientLogin(id: string, workspaceId: string): Promise<ActionResult> {
++  if (isDemoMode) return { error: "Demo mode." };
++  try {
++    const principal = await getPrincipal();
++    authorize(principal, "client_users.manage", workspaceId);
++    const db = getDb();
++    await db
++      .update(clientUsers)
++      .set({ failedAttempts: 0, lockedUntil: null, updatedAt: new Date() })
++      .where(and(eq(clientUsers.id, id), eq(clientUsers.workspaceId, workspaceId)));
++    revalidatePath("/dashboard/settings");
++    return { ok: true };
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    return { error: "Could not clear the lockout." };
++  }
++}
++
+ export async function deleteClientLogin(id: string, workspaceId: string): Promise<ActionResult> {
+   if (isDemoMode) return { error: "Demo mode." };
+   try {
+@@ -188,12 +222,59 @@ export async function clientLogin(username: string, password: string): Promise<A
+     where: (u, { eq: eqOp }) => eqOp(u.username, cleanUsername),
+   });
+ 
+-  if (!user || user.status !== "active" || !verifyPassword(password, user.passwordHash)) {
++  // Same generic error for "no such username", a disabled login, and a
++  // wrong password — never reveal which one to whoever's typing.
++  if (!user || user.status !== "active") {
++    return { error: "Incorrect username or password." };
++  }
++
++  // Locked accounts are rejected before touching the password at all —
++  // this DOES reveal "this username exists and is currently locked", but
++  // that's the accepted cost of showing a legitimate client (who just
++  // mistyped their password 5 times) something more useful than an
++  // endlessly repeating "wrong password".
++  if (user.lockedUntil && user.lockedUntil > new Date()) {
++    return {
++      error: `Too many failed attempts. Try again in ${minutesLeft(user.lockedUntil)} minute(s), or ask your agency to unlock it.`,
++    };
++  }
++
++  const workspace = await db.query.workspaces.findFirst({
++    where: (w, { eq: eqOp }) => eqOp(w.id, user.workspaceId),
++    columns: { status: true, archivedAt: true },
++  });
++  if (!workspace || workspace.status === "suspended" || workspace.archivedAt !== null) {
++    return { error: "Access to this dashboard has been paused by your agency." };
++  }
++
++  if (!verifyPassword(password, user.passwordHash)) {
++    // Atomic increment so concurrent bad attempts can't undercount each
++    // other; the "did we just cross the threshold" check and the lock
++    // write are a second statement, which only risks a benign one-attempt
++    // race under heavy concurrency, never a lost lockout.
++    const [updated] = await db
++      .update(clientUsers)
++      .set({ failedAttempts: sql`${clientUsers.failedAttempts} + 1` })
++      .where(eq(clientUsers.id, user.id))
++      .returning({ failedAttempts: clientUsers.failedAttempts });
++
++    if (updated.failedAttempts >= MAX_FAILED_ATTEMPTS) {
++      await db
++        .update(clientUsers)
++        .set({ failedAttempts: 0, lockedUntil: new Date(Date.now() + LOCKOUT_DURATION_MS) })
++        .where(eq(clientUsers.id, user.id));
++      return {
++        error: `Too many failed attempts. Try again in ${Math.ceil(LOCKOUT_DURATION_MS / 60_000)} minutes, or ask your agency to unlock it.`,
++      };
++    }
+     return { error: "Incorrect username or password." };
+   }
+ 
+   await createClientSession(user.id);
+-  await db.update(clientUsers).set({ lastLoginAt: new Date() }).where(eq(clientUsers.id, user.id));
++  await db
++    .update(clientUsers)
++    .set({ lastLoginAt: new Date(), failedAttempts: 0, lockedUntil: null })
++    .where(eq(clientUsers.id, user.id));
+   redirect("/client");
+ }
+ 
+diff --git a/src/features/client-portal/components/manager.tsx b/src/features/client-portal/components/manager.tsx
+index 2f5b1e3..7db7d78 100644
+--- a/src/features/client-portal/components/manager.tsx
++++ b/src/features/client-portal/components/manager.tsx
+@@ -1,11 +1,12 @@
+ "use client";
+ 
+ import { useEffect, useState, useTransition } from "react";
+-import { KeyRound, Power, Trash2 } from "lucide-react";
++import { KeyRound, Power, Trash2, LockOpen } from "lucide-react";
+ import {
+   getClientLogin,
+   saveClientLogin,
+   setClientLoginStatus,
++  unlockClientLogin,
+   deleteClientLogin,
+   type ClientLoginSummary,
+ } from "@/features/client-portal/actions";
+@@ -79,6 +80,16 @@ export function ClientPortalManager({
+     });
+   }
+ 
++  function unlock() {
++    if (!login) return;
++    startTransition(async () => {
++      const result = await unlockClientLogin(login.id, workspaceId);
++      if (!result.error) refresh(workspaceId);
++    });
++  }
++
++  const isLocked = Boolean(login?.lockedUntil && new Date(login.lockedUntil) > new Date());
++
+   if (workspaces.length === 0) {
+     return (
+       <p className="text-xs text-muted">Add a client workspace first to create a client login.</p>
+@@ -111,11 +122,22 @@ export function ClientPortalManager({
+                 ? `Last login ${new Date(login.lastLoginAt).toLocaleString("en-IN")}`
+                 : "Never logged in"}
+             </p>
++            {isLocked ? (
++              <p className="text-xs text-negative">
++                Locked until {new Date(login.lockedUntil as string).toLocaleTimeString("en-IN")}{" "}
++                after too many failed sign-ins.
++              </p>
++            ) : null}
+           </div>
+           <div className="flex items-center gap-2">
+             <Badge tone={login.status === "active" ? "positive" : "outline"}>
+               {login.status === "active" ? "Active" : "Disabled"}
+             </Badge>
++            {isLocked ? (
++              <Button variant="outline" disabled={pending} onClick={unlock}>
++                <LockOpen size={13} /> Unlock
++              </Button>
++            ) : null}
+             <Button variant="outline" disabled={pending} onClick={toggleStatus}>
+               <Power size={13} /> {login.status === "active" ? "Disable" : "Enable"}
+             </Button>
+diff --git a/src/features/crm/actions.ts b/src/features/crm/actions.ts
+index 44e8f09..058b98f 100644
+--- a/src/features/crm/actions.ts
++++ b/src/features/crm/actions.ts
+@@ -152,6 +152,206 @@ export async function createWorkspace(
+   return { ok: true };
+ }
+ 
++const updateWorkspaceSchema = z.object({
++  workspaceId: z.string().uuid(),
++  name: z.string().trim().min(2, "Client name is too short").max(80),
++  website: z.string().trim().max(200).optional().or(z.literal("")),
++});
++
++/** Renames a client brand and/or sets its website — the "Edit client" action. */
++export async function updateWorkspace(
++  _prev: ActionResult,
++  formData: FormData,
++): Promise<ActionResult> {
++  if (isDemoMode) return { error: DEMO_ERROR };
++
++  const parsed = updateWorkspaceSchema.safeParse({
++    workspaceId: formData.get("workspaceId"),
++    name: formData.get("name"),
++    website: formData.get("website"),
++  });
++  if (!parsed.success) {
++    return { error: parsed.error.issues[0]?.message ?? "Invalid input" };
++  }
++
++  const principal = await getPrincipal();
++  try {
++    authorize(principal, "workspace.manage", parsed.data.workspaceId);
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    throw e;
++  }
++
++  const db = getDb();
++  const existing = await db.query.workspaces.findFirst({
++    where: (w, { and: andOp, eq: eqOp }) =>
++      andOp(eqOp(w.id, parsed.data.workspaceId), eqOp(w.orgId, principal.orgId)),
++    columns: { name: true, website: true },
++  });
++  if (!existing) return { error: "Client not found." };
++
++  let website = parsed.data.website?.trim() || "";
++  if (website && !/^https?:\/\//i.test(website)) website = `https://${website}`;
++
++  await db
++    .update(workspaces)
++    .set({ name: parsed.data.name, website: website || null, updatedAt: new Date() })
++    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)));
++
++  await db.insert(auditLog).values({
++    orgId: principal.orgId,
++    workspaceId: parsed.data.workspaceId,
++    actorId: actorIdOrNull(principal.userId),
++    action: "workspace.update",
++    resourceType: "workspace",
++    resourceId: parsed.data.workspaceId,
++    before: existing,
++    after: { name: parsed.data.name, website: website || null },
++  });
++
++  revalidatePath("/dashboard/clients");
++  return { ok: true };
++}
++
++const workspaceStatusSchema = z.object({
++  workspaceId: z.string().uuid(),
++  status: z.enum(["active", "suspended"]),
++});
++
++/**
++ * Suspend ≠ delete: blocks that client's portal login (checked in
++ * getClientSession/clientLogin) while leaving every row untouched and
++ * reversible with one click. This is what "Suspend client" means in the
++ * clients-page UI.
++ */
++export async function setWorkspaceStatus(
++  _prev: ActionResult,
++  formData: FormData,
++): Promise<ActionResult> {
++  if (isDemoMode) return { error: DEMO_ERROR };
++
++  const parsed = workspaceStatusSchema.safeParse({
++    workspaceId: formData.get("workspaceId"),
++    status: formData.get("status"),
++  });
++  if (!parsed.success) return { error: "Invalid input" };
++
++  const principal = await getPrincipal();
++  try {
++    authorize(principal, "workspace.manage", parsed.data.workspaceId);
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    throw e;
++  }
++
++  const db = getDb();
++  const [row] = await db
++    .update(workspaces)
++    .set({ status: parsed.data.status, updatedAt: new Date() })
++    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)))
++    .returning({ id: workspaces.id });
++  if (!row) return { error: "Client not found." };
++
++  await db.insert(auditLog).values({
++    orgId: principal.orgId,
++    workspaceId: parsed.data.workspaceId,
++    actorId: actorIdOrNull(principal.userId),
++    action: parsed.data.status === "suspended" ? "workspace.suspend" : "workspace.reactivate",
++    resourceType: "workspace",
++    resourceId: parsed.data.workspaceId,
++    after: { status: parsed.data.status },
++  });
++
++  revalidatePath("/dashboard/clients");
++  return { ok: true };
++}
++
++const workspaceIdSchema = z.object({ workspaceId: z.string().uuid() });
++
++/**
++ * "Delete client" — a soft delete (archivedAt), never a hard delete. A hard
++ * delete would cascade-wipe contacts/tasks/notes/invoices/connections/
++ * client logins in one irreversible shot; archiving hides the workspace
++ * from the roster and blocks its client login (same check as suspend) while
++ * keeping every row recoverable via restoreWorkspace below.
++ */
++export async function archiveWorkspace(
++  _prev: ActionResult,
++  formData: FormData,
++): Promise<ActionResult> {
++  if (isDemoMode) return { error: DEMO_ERROR };
++
++  const parsed = workspaceIdSchema.safeParse({ workspaceId: formData.get("workspaceId") });
++  if (!parsed.success) return { error: "Invalid input" };
++
++  const principal = await getPrincipal();
++  try {
++    authorize(principal, "workspace.manage", parsed.data.workspaceId);
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    throw e;
++  }
++
++  const db = getDb();
++  const [row] = await db
++    .update(workspaces)
++    .set({ archivedAt: new Date(), updatedAt: new Date() })
++    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)))
++    .returning({ id: workspaces.id });
++  if (!row) return { error: "Client not found." };
++
++  await db.insert(auditLog).values({
++    orgId: principal.orgId,
++    workspaceId: parsed.data.workspaceId,
++    actorId: actorIdOrNull(principal.userId),
++    action: "workspace.archive",
++    resourceType: "workspace",
++    resourceId: parsed.data.workspaceId,
++  });
++
++  revalidatePath("/dashboard/clients");
++  return { ok: true };
++}
++
++/** Undoes archiveWorkspace — brings a client back onto the active roster. */
++export async function restoreWorkspace(
++  _prev: ActionResult,
++  formData: FormData,
++): Promise<ActionResult> {
++  if (isDemoMode) return { error: DEMO_ERROR };
++
++  const parsed = workspaceIdSchema.safeParse({ workspaceId: formData.get("workspaceId") });
++  if (!parsed.success) return { error: "Invalid input" };
++
++  const principal = await getPrincipal();
++  try {
++    authorize(principal, "workspace.manage", parsed.data.workspaceId);
++  } catch (e) {
++    if (e instanceof AuthorizationError) return { error: "Not allowed." };
++    throw e;
++  }
++
++  const db = getDb();
++  const [row] = await db
++    .update(workspaces)
++    .set({ archivedAt: null, updatedAt: new Date() })
++    .where(and(eq(workspaces.id, parsed.data.workspaceId), eq(workspaces.orgId, principal.orgId)))
++    .returning({ id: workspaces.id });
++  if (!row) return { error: "Client not found." };
++
++  await db.insert(auditLog).values({
++    orgId: principal.orgId,
++    workspaceId: parsed.data.workspaceId,
++    actorId: actorIdOrNull(principal.userId),
++    action: "workspace.restore",
++    resourceType: "workspace",
++    resourceId: parsed.data.workspaceId,
++  });
++
++  revalidatePath("/dashboard/clients");
++  return { ok: true };
++}
++
+ const taskSchema = z.object({
+   workspaceId: z.string().uuid("Pick a client workspace"),
+   title: z.string().trim().min(2, "Title is too short").max(200),
+diff --git a/src/features/crm/components/forms.tsx b/src/features/crm/components/forms.tsx
+index 4389d95..0e5836a 100644
+--- a/src/features/crm/components/forms.tsx
++++ b/src/features/crm/components/forms.tsx
+@@ -1,12 +1,16 @@
+ "use client";
+ 
+-import { useActionState, useState } from "react";
+-import { Plus, X } from "lucide-react";
++import { useActionState, useState, type ReactNode } from "react";
++import { Plus, X, Pencil, Pause, Play, RotateCcw } from "lucide-react";
+ import {
+   createContact,
+   createTask,
+   createWorkspace,
+   updateTaskStatus,
++  updateWorkspace,
++  setWorkspaceStatus,
++  archiveWorkspace,
++  restoreWorkspace,
+   type ActionResult,
+ } from "@/features/crm/actions";
+ import { Button } from "@/components/ui/primitives";
+@@ -20,19 +24,27 @@ const inputCls =
+ 
+ function Popover({
+   label,
++  icon,
++  align = "right",
+   children,
+ }: {
+   label: string;
++  icon?: ReactNode;
++  align?: "left" | "right";
+   children: (close: () => void) => React.ReactNode;
+ }) {
+   const [open, setOpen] = useState(false);
+   return (
+     <div className="relative">
+       <Button variant="outline" onClick={() => setOpen((v) => !v)}>
+-        {open ? <X size={13} /> : <Plus size={13} />} {label}
++        {open ? <X size={13} /> : (icon ?? <Plus size={13} />)} {label}
+       </Button>
+       {open ? (
+-        <div className="absolute right-0 z-30 mt-2 w-80 rounded-xl border border-border bg-surface p-4 shadow-xl">
++        <div
++          className={`absolute z-30 mt-2 w-80 rounded-xl border border-border bg-surface p-4 shadow-xl ${
++            align === "right" ? "right-0" : "left-0"
++          }`}
++        >
+           {children(() => setOpen(false))}
+         </div>
+       ) : null}
+@@ -58,6 +70,116 @@ export function NewWorkspaceForm() {
+   );
+ }
+ 
++/** Rename a client / set its website — the popover behind each card's "Edit". */
++export function EditWorkspaceForm({
++  workspace,
++}: {
++  workspace: { id: string; name: string; website: string | null };
++}) {
++  const [state, formAction, pending] = useActionState(updateWorkspace, initial);
++  return (
++    <Popover label="Edit" icon={<Pencil size={13} />} align="left">
++      {() => (
++        <form action={formAction} className="space-y-2.5">
++          <input type="hidden" name="workspaceId" value={workspace.id} />
++          <input
++            name="name"
++            required
++            defaultValue={workspace.name}
++            placeholder="Client / brand name"
++            className={inputCls}
++          />
++          <input
++            name="website"
++            defaultValue={workspace.website ?? ""}
++            placeholder="Website (optional)"
++            className={inputCls}
++          />
++          {state.error ? <p className="text-xs text-negative">{state.error}</p> : null}
++          {state.ok ? <p className="text-xs text-positive">Saved.</p> : null}
++          <Button type="submit" className="w-full" disabled={pending}>
++            {pending ? "Saving…" : "Save changes"}
++          </Button>
++        </form>
++      )}
++    </Popover>
++  );
++}
++
++/** Suspend blocks that client's own portal login only — admin access, data, and every record are untouched. Reversible with one click. */
++export function WorkspaceStatusToggle({
++  workspaceId,
++  status,
++}: {
++  workspaceId: string;
++  status: "active" | "suspended";
++}) {
++  const [state, formAction, pending] = useActionState(setWorkspaceStatus, initial);
++  const next = status === "active" ? "suspended" : "active";
++  return (
++    <form action={formAction} className="inline" title={state.error}>
++      <input type="hidden" name="workspaceId" value={workspaceId} />
++      <input type="hidden" name="status" value={next} />
++      <Button type="submit" variant="outline" disabled={pending}>
++        {pending ? (
++          "…"
++        ) : status === "active" ? (
++          <>
++            <Pause size={13} /> Suspend
++          </>
++        ) : (
++          <>
++            <Play size={13} /> Reactivate
++          </>
++        )}
++      </Button>
++    </form>
++  );
++}
++
++/** "Delete client" — archives (soft-delete), never hard-deletes. A confirm
++ * step inside the popover explains that, so nobody assumes it's permanent. */
++export function ArchiveWorkspaceForm({
++  workspaceId,
++  name,
++}: {
++  workspaceId: string;
++  name: string;
++}) {
++  const [state, formAction, pending] = useActionState(archiveWorkspace, initial);
++  return (
++    <Popover label="Delete" icon={<X size={13} />}>
++      {() => (
++        <form action={formAction} className="space-y-2.5">
++          <input type="hidden" name="workspaceId" value={workspaceId} />
++          <p className="text-[13px]">
++            Archive <span className="font-medium">{name}</span>? This removes it from your
++            active roster and blocks its client login, but keeps every contact, task, and
++            connection on file — restore it any time from Archived clients below.
++          </p>
++          {state.error ? <p className="text-xs text-negative">{state.error}</p> : null}
++          <Button type="submit" variant="outline" className="w-full" disabled={pending}>
++            {pending ? "Archiving…" : "Archive client"}
++          </Button>
++        </form>
++      )}
++    </Popover>
++  );
++}
++
++/** Undoes ArchiveWorkspaceForm — brings a client back onto the active roster. */
++export function RestoreWorkspaceForm({ workspaceId }: { workspaceId: string }) {
++  const [state, formAction, pending] = useActionState(restoreWorkspace, initial);
++  return (
++    <form action={formAction} className="inline" title={state.error}>
++      <input type="hidden" name="workspaceId" value={workspaceId} />
++      <Button type="submit" variant="outline" disabled={pending}>
++        <RotateCcw size={13} /> {pending ? "Restoring…" : "Restore"}
++      </Button>
++    </form>
++  );
++}
++
+ export function NewContactForm({
+   workspaces,
+ }: {
+diff --git a/src/features/crm/queries.ts b/src/features/crm/queries.ts
+index 57f4a4d..3b39676 100644
+--- a/src/features/crm/queries.ts
++++ b/src/features/crm/queries.ts
+@@ -34,19 +34,48 @@ export interface WorkspaceRow {
+   id: string;
+   name: string;
+   vertical?: string;
++  status: "active" | "suspended";
++  website: string | null;
++  archivedAt: string | null;
+ }
+ 
+ export async function getWorkspaces(orgId: string): Promise<WorkspaceRow[]> {
+   if (isDemoMode) {
+-    return demoWorkspaces.map((w) => ({ id: w.id, name: w.name, vertical: w.vertical }));
++    return demoWorkspaces.map((w) => ({
++      id: w.id,
++      name: w.name,
++      vertical: w.vertical,
++      status: "active",
++      website: null,
++      archivedAt: null,
++    }));
+   }
+   const db = getDb();
+   const rows = await db.query.workspaces.findMany({
+     where: (w, { eq, and, isNull }) => and(eq(w.orgId, orgId), isNull(w.archivedAt)),
+-    columns: { id: true, name: true },
++    columns: { id: true, name: true, status: true, website: true, archivedAt: true },
+     orderBy: (w, { asc }) => asc(w.createdAt),
+   });
+-  return rows;
++  return rows.map((r) => ({ ...r, archivedAt: r.archivedAt ? r.archivedAt.toISOString() : null }));
++}
++
++/**
++ * Archived (soft-deleted) clients only — the "Delete client" action never
++ * hard-deletes (that would cascade-wipe contacts/tasks/invoices/connections/
++ * client logins with zero recovery path); it sets archivedAt instead, and
++ * this is how the clients page renders a separate "Archived" section with
++ * a Restore action, matching how getWorkspaces already hides them from the
++ * main roster.
++ */
++export async function getArchivedWorkspaces(orgId: string): Promise<WorkspaceRow[]> {
++  if (isDemoMode) return [];
++  const db = getDb();
++  const rows = await db.query.workspaces.findMany({
++    where: (w, { eq, and, isNotNull }) => and(eq(w.orgId, orgId), isNotNull(w.archivedAt)),
++    columns: { id: true, name: true, status: true, website: true, archivedAt: true },
++    orderBy: (w, { desc }) => desc(w.archivedAt),
++  });
++  return rows.map((r) => ({ ...r, archivedAt: r.archivedAt ? r.archivedAt.toISOString() : null }));
+ }
+ 
+ export async function getContacts(orgId: string): Promise<ContactRow[]> {
+diff --git a/src/lib/auth/client-session.ts b/src/lib/auth/client-session.ts
+index 999c370..ef0d09c 100644
+--- a/src/lib/auth/client-session.ts
++++ b/src/lib/auth/client-session.ts
+@@ -6,6 +6,22 @@ import { getDb } from "@/lib/db";
+ import { clientSessions } from "@/db/schema";
+ import { eq } from "drizzle-orm";
+ 
++/**
++ * A session that resolves to a suspended or archived workspace is treated
++ * as invalid — this is what makes "Suspend client" / "Delete client" in the
++ * admin clients page actually cut off portal access, rather than just
++ * hiding the workspace from the admin's own roster while the client stays
++ * logged in indefinitely on their existing session.
++ */
++async function workspaceBlocksAccess(workspaceId: string): Promise<boolean> {
++  const db = getDb();
++  const workspace = await db.query.workspaces.findFirst({
++    where: (w, { eq: eqOp }) => eqOp(w.id, workspaceId),
++    columns: { status: true, archivedAt: true },
++  });
++  return !workspace || workspace.status === "suspended" || workspace.archivedAt !== null;
++}
++
+ /**
+  * Client portal auth — a second, separate login system from the internal
+  * agency dashboard (which has none, by design). A client_user is tied to
+@@ -93,6 +109,7 @@ export async function getClientSession(): Promise<ClientSession | null> {
+     where: (u, { eq: eqOp }) => eqOp(u.id, session.clientUserId),
+   });
+   if (!user || user.status !== "active") return null;
++  if (await workspaceBlocksAccess(user.workspaceId)) return null;
+ 
+   return {
+     clientUserId: user.id,
+diff --git a/src/lib/workspace.ts b/src/lib/workspace.ts
+index bcfb650..e2e1ac5 100644
+--- a/src/lib/workspace.ts
++++ b/src/lib/workspace.ts
+@@ -18,8 +18,14 @@ async function liveWorkspaceList(): Promise<Array<{ id: string; name: string }>>
+   const principal = await getPrincipal();
+   if (!principal) return [];
+   const db = getDb();
++  // Archived (soft-deleted) clients must disappear from the switcher too —
++  // otherwise "delete client" only hides a workspace from the roster page
++  // while every other dashboard route stays fully reachable for it via this
++  // dropdown. Suspended clients are NOT filtered here: suspend only blocks
++  // that client's own portal login: the agency's internal dashboard access
++  // to a suspended client's data is untouched by design.
+   const rows = await db.query.workspaces.findMany({
+-    where: (w, { eq }) => eq(w.orgId, principal.orgId),
++    where: (w, { eq, and, isNull }) => and(eq(w.orgId, principal.orgId), isNull(w.archivedAt)),
+   });
+   if (rows.length > 0) return rows.map((w) => ({ id: w.id, name: w.name }));
+ 
+@@ -30,9 +36,11 @@ async function liveWorkspaceList(): Promise<Array<{ id: string; name: string }>>
+     .returning();
+   if (created) return [{ id: created.id, name: created.name }];
+ 
+-  // Race with another concurrent bootstrap request — re-read.
++  // Race with another concurrent bootstrap request — re-read. Same
++  // archived-filter as above; onConflictDoNothing can no-op against an
++  // archived workspace that happens to share the bootstrap slug.
+   const retry = await db.query.workspaces.findMany({
+-    where: (w, { eq }) => eq(w.orgId, principal.orgId),
++    where: (w, { eq, and, isNull }) => and(eq(w.orgId, principal.orgId), isNull(w.archivedAt)),
+   });
+   return retry.map((w) => ({ id: w.id, name: w.name }));
+ }
+diff --git a/supabase/migrations/0005_workspace_status_and_login_lockout.sql b/supabase/migrations/0005_workspace_status_and_login_lockout.sql
+new file mode 100644
+index 0000000..53d70a9
+--- /dev/null
++++ b/supabase/migrations/0005_workspace_status_and_login_lockout.sql
+@@ -0,0 +1,33 @@
++-- ============================================================
++-- ComeDigit CRM — Workspace suspend/reactivate + client-login lockout
++-- Run this in the Supabase SQL editor against the already-provisioned
++-- database (0002_rls.sql / 0003_meta_expansion_and_share_links.sql /
++-- 0004_client_portal.sql already applied). Safe to run once; every
++-- ADD COLUMN below is additive and defaults existing rows sanely.
++-- ============================================================
++
++-- ---------- workspaces: suspend ≠ delete ----------
++-- "suspended" is a normal, reversible, admin-toggled pause (client access
++-- blocked, data untouched) — distinct from archived_at (soft-delete). A
++-- workspace can be suspended without being archived; existing rows default
++-- to 'active' so nothing already provisioned is affected.
++
++do $$ begin
++  create type "workspace_status" as enum ('active', 'suspended');
++exception
++  when duplicate_object then null;
++end $$;
++
++alter table "workspaces"
++  add column if not exists "status" "workspace_status" default 'active' not null;
++
++-- ---------- client_users: login rate limiting ----------
++-- failed_attempts increments on each bad password and resets to 0 on a
++-- successful login. Once it crosses the threshold (see
++-- src/features/client-portal/actions.ts), locked_until is set to a future
++-- timestamp and login is refused — even with the correct password — until
++-- that time passes. Per-account lock, not IP-based.
++
++alter table "client_users"
++  add column if not exists "failed_attempts" integer default 0 not null,
++  add column if not exists "locked_until" timestamp with time zone;
+-- 
+2.43.0
+
